@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import re
 import uuid
 import time
@@ -192,13 +193,27 @@ def log_http_status(status_code: int, context: str = ""):
 def debug_print(*args, **kwargs):
     """Print debug messages only if DEBUG is True"""
     if DEBUG:
-        print(*args, **kwargs)
+        try:
+            print(*args, **kwargs)
+        except UnicodeEncodeError:
+            import sys
+
+            encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+            safe_args = []
+            for arg in args:
+                text = str(arg)
+                safe_text = text.encode(encoding, errors="replace").decode(encoding, errors="replace")
+                safe_args.append(safe_text)
+            print(*safe_args, **kwargs)
 
 # --- New reCAPTCHA Functions ---
 
 # Updated constants from gpt4free/g4f/Provider/needs_auth/LMArena.py
 RECAPTCHA_SITEKEY = "6Led_uYrAAAAAKjxDIF58fgFtX3t8loNAK85bW9I"
 RECAPTCHA_ACTION = "chat_submit"
+# Extracted from LMArena's client bundle (reCAPTCHA v2 fallback widget).
+RECAPTCHA_V2_SITEKEY = "6Ld7ePYrAAAAAB34ovoFoDau1fqCJ6IyOjFEQaMn"
+RECAPTCHA_V2_CONTAINER_ID = "recaptcha-v2-container"
 
 async def click_turnstile(page):
     """
@@ -236,7 +251,38 @@ def _is_execution_context_destroyed_error(error: Exception) -> bool:
     return "execution context was destroyed" in message.lower()
 
 
-async def _safe_page_evaluate(page, script: str, retries: int = 3, sleep_seconds: float = 0.5):
+async def _safe_page_evaluate(
+    page,
+    script: str,
+    retries: int = 3,
+    sleep_seconds: float = 0.5,
+    max_wait_seconds: Optional[float] = None,
+):
+    """
+    Run page.evaluate() with protection against transient Playwright navigation races.
+
+    When Playwright navigates mid-evaluate it can throw:
+      "Execution context was destroyed, most likely because of a navigation."
+    which is safe to retry.
+    """
+    if max_wait_seconds is not None:
+        deadline = time.monotonic() + max_wait_seconds
+        last_error = None
+        while True:
+            try:
+                return await page.evaluate(script)
+            except Exception as e:
+                last_error = e
+                if _is_execution_context_destroyed_error(e) and time.monotonic() < deadline:
+                    debug_print("Retrying page.evaluate after navigation...")
+                    try:
+                        await page.wait_for_load_state("domcontentloaded")
+                    except Exception:
+                        pass
+                    await asyncio.sleep(sleep_seconds)
+                    continue
+                raise
+
     last_error = None
     for attempt in range(retries):
         try:
@@ -255,6 +301,24 @@ async def _safe_page_evaluate(page, script: str, retries: int = 3, sleep_seconds
     raise last_error
 
 
+async def _inject_main_world_script(page, script_source: str):
+    """
+    Execute JavaScript in the page's MAIN world by injecting a <script> tag.
+
+    Playwright's page.evaluate() runs in an isolated world; some libraries (like reCAPTCHA)
+    attach globals only in the main world. This helper bridges the gap by running code via
+    a DOM-inserted script tag and communicating back via shared DOM state.
+    """
+    script_json = json.dumps(script_source)
+    inject_script = f"""() => {{
+        const script = document.createElement('script');
+        script.textContent = {script_json};
+        document.documentElement.appendChild(script);
+        script.remove();
+    }}"""
+    await _safe_page_evaluate(page, inject_script, retries=3, max_wait_seconds=10)
+
+
 async def _get_recaptcha_v3_token_from_page(page) -> Optional[str]:
     """
     Extract a reCAPTCHA v3 token from a page that has already loaded lmarena.ai.
@@ -269,66 +333,74 @@ async def _get_recaptcha_v3_token_from_page(page) -> Optional[str]:
         pass
     await asyncio.sleep(2)
 
-    # 2. Check for Library
-    debug_print("  Checking for library...")
-    lib_script = "mw:() => !!(window.grecaptcha && window.grecaptcha.enterprise)"
-    try:
-        lib_ready = await _safe_page_evaluate(page, lib_script, retries=5)
-    except Exception as e:
-        if _is_execution_context_destroyed_error(e):
-            lib_ready = await _safe_page_evaluate(page, lib_script, retries=5)
-        else:
-            raise
+    attr_name = "data-lmabridge-recaptcha-result"
+    attr_js = json.dumps(attr_name)
+    sitekey_js = json.dumps(RECAPTCHA_SITEKEY)
+    action_js = json.dumps(RECAPTCHA_ACTION)
 
-    if not lib_ready:
-        debug_print("  Library not found immediately. Waiting...")
-        await asyncio.sleep(3)
-        lib_ready = await _safe_page_evaluate(page, lib_script, retries=5)
-        if not lib_ready:
-            debug_print("reCAPTCHA library never loaded.")
-            return None
+    # Ensure a clean slate on this page.
+    await _safe_page_evaluate(
+        page,
+        f"() => document.documentElement.removeAttribute({attr_js})",
+        retries=3,
+        max_wait_seconds=10,
+    )
 
-    # 3. SETUP: Initialize our global result variable
-    await _safe_page_evaluate(page, "mw:window.__token_result = 'PENDING'", retries=5)
+    debug_print("  Triggering reCAPTCHA execution (main-world bridge)...")
+    main_world_script = f"""
+(async () => {{
+  const attr = {attr_js};
+  const sitekey = {sitekey_js};
+  const action = {action_js};
 
-    # 4. TRIGGER: Execute reCAPTCHA and write to the variable
-    debug_print("  Triggering reCAPTCHA execution...")
-    trigger_script = f"""mw:() => {{
-        try {{
-            window.grecaptcha.enterprise.ready(async () => {{
-                try {{
-                    const token = await window.grecaptcha.enterprise.execute(
-                        '{RECAPTCHA_SITEKEY}',
-                        {{ action: '{RECAPTCHA_ACTION}' }}
-                    );
-                    window.__token_result = token;
-                }} catch (err) {{
-                    window.__token_result = 'ERROR: ' + err.toString();
-                }}
-            }});
-        }} catch (e) {{
-            window.__token_result = 'SYNC_ERROR: ' + e.toString();
-        }}
-    }}"""
-    await _safe_page_evaluate(page, trigger_script, retries=5)
+  const setResult = (value) => {{
+    try {{
+      document.documentElement.setAttribute(attr, String(value));
+    }} catch (e) {{}}
+  }};
 
-    # 5. POLL: Watch the variable for changes
+  setResult('PENDING');
+
+  try {{
+    const deadline = Date.now() + 30000;
+    while (!(window.grecaptcha && window.grecaptcha.enterprise) && Date.now() < deadline) {{
+      await new Promise((r) => setTimeout(r, 250));
+    }}
+
+    const gre = window.grecaptcha && window.grecaptcha.enterprise;
+    if (!gre) {{
+      setResult('ERROR: grecaptcha_missing');
+      return;
+    }}
+
+    await new Promise((resolve) => gre.ready(resolve));
+    const token = await gre.execute(sitekey, {{ action }});
+    setResult(token);
+  }} catch (err) {{
+    setResult('ERROR: ' + String(err));
+  }}
+}})();
+"""
+    await _inject_main_world_script(page, main_world_script)
+
     debug_print("  Polling for result...")
-    for i in range(20):
+    for i in range(40):
         try:
-            result = await _safe_page_evaluate(page, "mw:window.__token_result", retries=5)
+            result = await _safe_page_evaluate(
+                page,
+                f"() => document.documentElement.getAttribute({attr_js})",
+                retries=3,
+                max_wait_seconds=10,
+            )
         except Exception as e:
             if _is_execution_context_destroyed_error(e):
                 await asyncio.sleep(1)
                 continue
             raise
 
-        if result != "PENDING":
-            if isinstance(result, str) and result.startswith("ERROR"):
-                debug_print(f"JS Execution Error: {result}")
-                return None
-            if isinstance(result, str) and result.startswith("SYNC_ERROR"):
-                debug_print(f"JS Sync Error: {result}")
+        if result and result != "PENDING":
+            if isinstance(result, str) and result.startswith("ERROR:"):
+                debug_print(f"reCAPTCHA error: {result}")
                 return None
             if isinstance(result, str):
                 debug_print(f"Token captured! ({len(result)} chars)")
@@ -339,31 +411,52 @@ async def _get_recaptcha_v3_token_from_page(page) -> Optional[str]:
             debug_print(f"    ... waiting ({i}s)")
         await asyncio.sleep(1)
 
-    debug_print("Timed out waiting for token variable to update.")
+    debug_print("Timed out waiting for token to update.")
     return None
 
 
 async def get_recaptcha_v3_token() -> Optional[str]:
     """
-    Retrieves reCAPTCHA v3 token using a 'Side-Channel' approach.
-    We write the token to a global window variable and poll for it, 
-    bypassing Promise serialization issues in the Main World bridge.
+    Retrieves a reCAPTCHA v3 token using a DOM-bridge approach.
+
+    A <script> tag runs in the page's main world (where reCAPTCHA attaches globals)
+    and writes the token into a DOM attribute. We poll that attribute from Playwright.
     """
-    debug_print("🔐 Starting reCAPTCHA v3 token retrieval (Side-Channel Mode)...")
+    global RECAPTCHA_USER_AGENT
+    debug_print("🔐 Starting reCAPTCHA v3 token retrieval (DOM Bridge Mode)...")
     
     config = get_config()
     cf_clearance = config.get("cf_clearance", "")
+    auth_tokens = config.get("auth_tokens", [])
+    arena_auth_token = auth_tokens[0] if auth_tokens else config.get("auth_token", "").strip()
     
     try:
         async with AsyncCamoufox(headless=True, main_world_eval=True) as browser:
-            context = await browser.new_context()
+            context_kwargs = {}
+            if RECAPTCHA_USER_AGENT:
+                context_kwargs["user_agent"] = RECAPTCHA_USER_AGENT
+            context = await browser.new_context(**context_kwargs)
+            cookies = []
             if cf_clearance:
-                await context.add_cookies([{
-                    "name": "cf_clearance",
-                    "value": cf_clearance,
-                    "domain": ".lmarena.ai",
-                    "path": "/"
-                }])
+                cookies.append(
+                    {
+                        "name": "cf_clearance",
+                        "value": cf_clearance,
+                        "domain": ".lmarena.ai",
+                        "path": "/",
+                    }
+                )
+            if arena_auth_token:
+                cookies.append(
+                    {
+                        "name": "arena-auth-prod-v1",
+                        "value": arena_auth_token,
+                        "domain": ".lmarena.ai",
+                        "path": "/",
+                    }
+                )
+            if cookies:
+                await context.add_cookies(cookies)
 
             page = await context.new_page()
             
@@ -397,6 +490,15 @@ async def get_recaptcha_v3_token() -> Optional[str]:
                 debug_print(f"  ⚠️ Error handling Turnstile: {e}")
             # ----------------------------------------------
 
+            # Capture the browser UA used to generate the reCAPTCHA token so we can
+            # mirror it on subsequent HTTP requests (some backends validate UA/token).
+            try:
+                ua = await _safe_page_evaluate(page, "() => navigator.userAgent", retries=3, max_wait_seconds=10)
+                if isinstance(ua, str) and ua.strip():
+                    RECAPTCHA_USER_AGENT = ua
+            except Exception:
+                pass
+
             token = await _get_recaptcha_v3_token_from_page(page)
             if token:
                 global RECAPTCHA_TOKEN, RECAPTCHA_EXPIRY
@@ -413,6 +515,24 @@ def _is_recaptcha_validation_failed(body_text: str) -> bool:
     """Best-effort detection of LMArena's reCAPTCHA failure response."""
     lowered = (body_text or "").lower()
     return "recaptcha" in lowered and "validation failed" in lowered
+
+
+def _is_prompt_failed(body_text: str) -> bool:
+    """LMArena sometimes returns: {"error":"prompt failed"} and triggers a reCAPTCHA v2 flow."""
+    lowered = (body_text or "").lower()
+    return "prompt failed" in lowered
+
+
+def _apply_recaptcha_v3_to_payload(payload: dict, token: str) -> None:
+    """Ensure payload uses ONLY reCAPTCHA v3 (omit v2, match browser behavior)."""
+    payload["recaptchaV3Token"] = token
+    payload.pop("recaptchaV2Token", None)
+
+
+def _apply_recaptcha_v2_to_payload(payload: dict, token: str) -> None:
+    """Ensure payload uses ONLY reCAPTCHA v2 (omit v3, match browser behavior)."""
+    payload["recaptchaV2Token"] = token
+    payload.pop("recaptchaV3Token", None)
 
 
 async def refresh_recaptcha_token(force: bool = False):
@@ -441,6 +561,201 @@ async def refresh_recaptcha_token(force: bool = False):
             return None
     
     return RECAPTCHA_TOKEN
+
+
+def _get_recaptcha_v2_mode() -> str:
+    """
+    Configure how reCAPTCHA v2 fallback is attempted.
+
+    - "off": never attempt v2 (default)
+    - "auto": headless attempt + best-effort auto-click
+    - "interactive": open a visible browser and wait for the user to solve
+    """
+    mode = os.environ.get("LMABRIDGE_RECAPTCHA_V2_MODE", "off").strip().lower()
+    if mode in {"off", "auto", "interactive"}:
+        return mode
+    return "off"
+
+
+async def _get_recaptcha_v2_token_from_page(page, max_wait_seconds: int = 120) -> Optional[str]:
+    """
+    Render LMArena's reCAPTCHA v2 widget and return its token.
+
+    This is a fallback used when reCAPTCHA v3 is rejected with a low score.
+    In many cases, a user will need to complete the checkbox/challenge.
+    """
+    attr_name = "data-lmabridge-recaptcha-v2-result"
+    attr_js = json.dumps(attr_name)
+    container_id_js = json.dumps(RECAPTCHA_V2_CONTAINER_ID)
+    v2_sitekey_js = json.dumps(RECAPTCHA_V2_SITEKEY)
+
+    # Ensure the container exists and is visible.
+    await _safe_page_evaluate(
+        page,
+        f"""() => {{
+            if (document.getElementById({container_id_js})) return;
+            const d = document.createElement('div');
+            d.id = {container_id_js};
+            d.className = 'recaptcha-v2-container';
+            d.style.position = 'fixed';
+            d.style.left = '10px';
+            d.style.top = '10px';
+            d.style.zIndex = '2147483647';
+            document.body.appendChild(d);
+        }}""",
+        retries=3,
+        max_wait_seconds=10,
+    )
+
+    await _safe_page_evaluate(
+        page,
+        f"() => document.documentElement.setAttribute({attr_js}, 'PENDING')",
+        retries=3,
+        max_wait_seconds=10,
+    )
+
+    debug_print("🧩 Rendering reCAPTCHA v2 fallback widget...")
+    render_script = f"""
+(async () => {{
+  const attr = {attr_js};
+  const containerId = {container_id_js};
+  const sitekey = {v2_sitekey_js};
+  const set = (v) => document.documentElement.setAttribute(attr, String(v));
+
+  set('WAITING_RENDER');
+  const deadline = Date.now() + 30000;
+  while (!(window.grecaptcha && window.grecaptcha.enterprise && typeof window.grecaptcha.enterprise.render === 'function') && Date.now() < deadline) {{
+    await new Promise(r => setTimeout(r, 250));
+  }}
+  const gre = window.grecaptcha && window.grecaptcha.enterprise;
+  if (!gre || typeof gre.render !== 'function') {{ set('ERROR: render_missing'); return; }}
+
+  const container = document.getElementById(containerId);
+  if (!container) {{ set('ERROR: container_missing'); return; }}
+
+  try {{
+    gre.render(container, {{
+      sitekey,
+      callback: (token) => set(token),
+      'error-callback': () => set('ERROR: render_failed'),
+      theme: 'light',
+    }});
+    set('RENDERED');
+  }} catch (e) {{
+    set('ERROR: ' + String(e));
+  }}
+}})();
+"""
+    await _inject_main_world_script(page, render_script)
+
+    # Best-effort auto-click (may still require manual solve).
+    try:
+        frame = page.frame_locator(
+            f"iframe[src*='recaptcha/enterprise/anchor'][src*='{RECAPTCHA_V2_SITEKEY}']"
+        )
+        anchor = frame.locator("#recaptcha-anchor")
+        await anchor.wait_for(timeout=15000)
+        await anchor.click(timeout=15000)
+    except Exception as e:
+        debug_print(f"⚠️ reCAPTCHA v2 auto-click failed: {e}")
+
+    debug_print("🧩 Waiting for reCAPTCHA v2 completion...")
+    for i in range(max_wait_seconds):
+        result = await _safe_page_evaluate(
+            page,
+            f"() => document.documentElement.getAttribute({attr_js})",
+            retries=3,
+            max_wait_seconds=10,
+        )
+
+        if result and result not in {"PENDING", "WAITING_RENDER", "RENDERED"}:
+            if isinstance(result, str) and result.startswith("ERROR:"):
+                debug_print(f"reCAPTCHA v2 error: {result}")
+                return None
+            if isinstance(result, str):
+                debug_print(f"reCAPTCHA v2 token captured! ({len(result)} chars)")
+                return result
+            return None
+
+        if i % 10 == 0:
+            debug_print(f"    ... waiting ({i}s)")
+        await asyncio.sleep(1)
+
+    debug_print("Timed out waiting for reCAPTCHA v2 token.")
+    return None
+
+
+async def get_recaptcha_v2_token() -> Optional[str]:
+    mode = _get_recaptcha_v2_mode()
+    if mode == "off":
+        return None
+
+    config = get_config()
+    cf_clearance = config.get("cf_clearance", "")
+    auth_tokens = config.get("auth_tokens", [])
+    arena_auth_token = auth_tokens[0] if auth_tokens else config.get("auth_token", "").strip()
+
+    headless = mode != "interactive"
+    max_wait_seconds = 30 if mode == "auto" else 300
+    if mode == "interactive":
+        debug_print("🧩 reCAPTCHA v2 requires manual verification; opening an interactive browser window...")
+
+    try:
+        async with AsyncCamoufox(headless=headless, main_world_eval=True) as browser:
+            context_kwargs = {}
+            if RECAPTCHA_USER_AGENT:
+                context_kwargs["user_agent"] = RECAPTCHA_USER_AGENT
+            context = await browser.new_context(**context_kwargs)
+
+            cookies = []
+            if cf_clearance:
+                cookies.append(
+                    {
+                        "name": "cf_clearance",
+                        "value": cf_clearance,
+                        "domain": ".lmarena.ai",
+                        "path": "/",
+                    }
+                )
+            if arena_auth_token:
+                cookies.append(
+                    {
+                        "name": "arena-auth-prod-v1",
+                        "value": arena_auth_token,
+                        "domain": ".lmarena.ai",
+                        "path": "/",
+                    }
+                )
+            if cookies:
+                await context.add_cookies(cookies)
+
+            page = await context.new_page()
+            debug_print("🌐 Navigating to lmarena.ai for reCAPTCHA v2...")
+            await page.goto("https://lmarena.ai/", wait_until="domcontentloaded")
+            return await _get_recaptcha_v2_token_from_page(page, max_wait_seconds=max_wait_seconds)
+
+    except Exception as e:
+        debug_print(f"❌ Unexpected error getting reCAPTCHA v2 token: {e}")
+        return None
+
+
+async def refresh_recaptcha_v2_token(force: bool = False):
+    global RECAPTCHA_V2_TOKEN, RECAPTCHA_V2_EXPIRY
+
+    current_time = datetime.now(timezone.utc)
+    if force or RECAPTCHA_V2_TOKEN is None or current_time > RECAPTCHA_V2_EXPIRY - timedelta(seconds=10):
+        debug_print("🔄 reCAPTCHA v2 token missing/expired. Refreshing...")
+        token = await get_recaptcha_v2_token()
+        if token:
+            RECAPTCHA_V2_TOKEN = token
+            RECAPTCHA_V2_EXPIRY = current_time + timedelta(seconds=120)
+            return token
+
+        # Short retry delay to avoid tight loops.
+        RECAPTCHA_V2_EXPIRY = current_time + timedelta(seconds=10)
+        return None
+
+    return RECAPTCHA_V2_TOKEN
 
 # --- End New reCAPTCHA Functions ---
 
@@ -739,6 +1054,9 @@ request_failed_tokens: Dict[str, set] = {}
 RECAPTCHA_TOKEN: Optional[str] = None
 # Initialize expiry far in the past to force a refresh on startup
 RECAPTCHA_EXPIRY: datetime = datetime.now(timezone.utc) - timedelta(days=365)
+RECAPTCHA_USER_AGENT: Optional[str] = None
+RECAPTCHA_V2_TOKEN: Optional[str] = None
+RECAPTCHA_V2_EXPIRY: datetime = datetime.now(timezone.utc) - timedelta(days=365)
 # --------------------------------------
 
 # --- Helper Functions ---
@@ -820,9 +1138,20 @@ def get_request_headers_with_token(token: str):
     """Get request headers with a specific auth token"""
     config = get_config()
     cf_clearance = config.get("cf_clearance", "").strip()
+    global RECAPTCHA_USER_AGENT
+    user_agent = RECAPTCHA_USER_AGENT or (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/131.0.0.0 Safari/537.36"
+    )
     return {
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
         "Content-Type": "text/plain;charset=UTF-8",
         "Cookie": f"cf_clearance={cf_clearance}; arena-auth-prod-v1={token}",
+        "Origin": "https://lmarena.ai",
+        "Referer": "https://lmarena.ai/",
+        "User-Agent": user_agent,
     }
 
 def get_next_auth_token(exclude_tokens: set = None):
@@ -2290,6 +2619,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
         async def make_request_with_retry(url, payload, http_method, max_retries=3):
             """Make request with automatic retry on 429/401 errors"""
             nonlocal current_token, headers, failed_tokens
+            attempted_recaptcha_v2 = False
             
             for attempt in range(max_retries):
                 try:
@@ -2301,6 +2631,39 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                         
                         # Log status with human-readable message
                         log_http_status(response.status_code, "LMArena API")
+
+                        # reCAPTCHA handling (browser parity):
+                        # If LMArena responds with "recaptcha validation failed" or "prompt failed",
+                        # attempt a reCAPTCHA v2 token and retry with ONLY recaptchaV2Token.
+                        if response.status_code in {
+                            HTTPStatus.TOO_MANY_REQUESTS,
+                            HTTPStatus.BAD_REQUEST,
+                            HTTPStatus.FORBIDDEN,
+                        }:
+                            body_text = response.text
+                            if _is_recaptcha_validation_failed(body_text) or _is_prompt_failed(body_text):
+                                v2_mode = _get_recaptcha_v2_mode()
+                                if not attempted_recaptcha_v2 and v2_mode != "off":
+                                    attempted_recaptcha_v2 = True
+                                    debug_print(
+                                        f"🔄 Upstream rejected reCAPTCHA v3 ({body_text.strip()[:60]}...). "
+                                        f"Attempting v2 fallback (mode={v2_mode})..."
+                                    )
+                                    v2_token = await refresh_recaptcha_v2_token(force=True)
+                                    if v2_token:
+                                        _apply_recaptcha_v2_to_payload(payload, v2_token)
+                                        await asyncio.sleep(1)  # Brief delay
+                                        continue
+                                    debug_print("❌ Failed to acquire reCAPTCHA v2 token.")
+
+                                # Fallback: refresh v3 and retry (may still fail if score remains low).
+                                debug_print("🔄 Refreshing reCAPTCHA v3 token and retrying...")
+                                new_token = await refresh_recaptcha_token(force=True)
+                                if not new_token:
+                                    response.raise_for_status()
+                                _apply_recaptcha_v3_to_payload(payload, new_token)
+                                await asyncio.sleep(1)  # Brief delay
+                                continue
                         
                         # Check for retry-able errors
                         if response.status_code == HTTPStatus.TOO_MANY_REQUESTS:
@@ -2341,17 +2704,6 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                     debug_print(f"❌ No more tokens available: {e.detail}")
                                     break
                         
-                        elif response.status_code in [HTTPStatus.BAD_REQUEST, HTTPStatus.FORBIDDEN]:
-                            # LMArena sometimes returns: {"error":"recaptcha validation failed"}
-                            if _is_recaptcha_validation_failed(response.text):
-                                debug_print("🔄 Upstream rejected reCAPTCHA token. Refreshing and retrying...")
-                                new_token = await refresh_recaptcha_token(force=True)
-                                if not new_token:
-                                    response.raise_for_status()
-                                payload["recaptchaV3Token"] = new_token
-                                await asyncio.sleep(1)  # Brief delay
-                                continue
-
                         # If we get here, return the response (success or non-retryable error)
                         response.raise_for_status()
                         return response
@@ -2375,6 +2727,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                 
                 # Retry logic for streaming
                 max_retries = 3
+                attempted_recaptcha_v2 = False
                 for attempt in range(max_retries):
                     # Reset response data for each attempt
                     response_text = ""
@@ -2392,6 +2745,35 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                             async with stream_context as response:
                                 # Log status with human-readable message
                                 log_http_status(response.status_code, "LMArena API Stream")
+
+                                # LMArena can return HTTP 429 with a JSON body: {"error":"prompt failed"}.
+                                # The browser retries this case using a reCAPTCHA v2 token.
+                                if response.status_code == HTTPStatus.TOO_MANY_REQUESTS:
+                                    body_bytes = await response.aread()
+                                    body_text = body_bytes.decode("utf-8", errors="replace")
+                                    if (
+                                        (_is_recaptcha_validation_failed(body_text) or _is_prompt_failed(body_text))
+                                        and attempt < max_retries - 1
+                                    ):
+                                        v2_mode = _get_recaptcha_v2_mode()
+                                        if not attempted_recaptcha_v2 and v2_mode != "off":
+                                            attempted_recaptcha_v2 = True
+                                            debug_print(
+                                                f"🔄 Upstream rejected reCAPTCHA v3 (HTTP 429). Attempting v2 fallback (mode={v2_mode})..."
+                                            )
+                                            v2_token = await refresh_recaptcha_v2_token(force=True)
+                                            if v2_token:
+                                                _apply_recaptcha_v2_to_payload(payload, v2_token)
+                                                await asyncio.sleep(1)
+                                                continue
+                                            debug_print("❌ Failed to acquire reCAPTCHA v2 token (HTTP 429).")
+
+                                        debug_print("🔄 Refreshing reCAPTCHA v3 token and retrying (HTTP 429)...")
+                                        new_token = await refresh_recaptcha_token(force=True)
+                                        if new_token:
+                                            _apply_recaptcha_v3_to_payload(payload, new_token)
+                                            await asyncio.sleep(1)
+                                            continue
                                 
                                 # Check for retry-able errors before processing stream
                                 if response.status_code == HTTPStatus.TOO_MANY_REQUESTS:
@@ -2421,11 +2803,27 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                     # For non-200 responses, LMArena may return JSON instead of a stream.
                                     body_bytes = await response.aread()
                                     body_text = body_bytes.decode("utf-8", errors="replace")
-                                    if _is_recaptcha_validation_failed(body_text) and attempt < max_retries - 1:
-                                        debug_print("🔄 Upstream rejected reCAPTCHA token (stream). Refreshing and retrying...")
+                                    if (
+                                        (_is_recaptcha_validation_failed(body_text) or _is_prompt_failed(body_text))
+                                        and attempt < max_retries - 1
+                                    ):
+                                        v2_mode = _get_recaptcha_v2_mode()
+                                        if not attempted_recaptcha_v2 and v2_mode != "off":
+                                            attempted_recaptcha_v2 = True
+                                            debug_print(
+                                                f"🔄 Upstream rejected reCAPTCHA v3 (stream). Attempting v2 fallback (mode={v2_mode})..."
+                                            )
+                                            v2_token = await refresh_recaptcha_v2_token(force=True)
+                                            if v2_token:
+                                                _apply_recaptcha_v2_to_payload(payload, v2_token)
+                                                await asyncio.sleep(1)
+                                                continue
+                                            debug_print("❌ Failed to acquire reCAPTCHA v2 token (stream).")
+
+                                        debug_print("🔄 Refreshing reCAPTCHA v3 token and retrying (stream)...")
                                         new_token = await refresh_recaptcha_token(force=True)
                                         if new_token:
-                                            payload["recaptchaV3Token"] = new_token
+                                            _apply_recaptcha_v3_to_payload(payload, new_token)
                                             await asyncio.sleep(1)
                                             continue
 
@@ -2544,7 +2942,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                         error_data = line[3:]
                                         try:
                                             error_message = json.loads(error_data)
-                                            print(f"  ❌ Error in stream: {error_message}")
+                                            debug_print(f"  ❌ Error in stream: {error_message}")
                                         except json.JSONDecodeError:
                                             pass
                                     
@@ -2629,7 +3027,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                             error_msg = f"LMArena API error: {e.response.status_code}"
                             error_type = "api_error"
                         
-                        print(f"❌ {error_msg}")
+                        debug_print(f"❌ {error_msg}")
                         error_chunk = {
                             "error": {
                                 "message": error_msg,
@@ -2640,7 +3038,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                         yield f"data: {json.dumps(error_chunk)}\n\n"
                         return
                     except Exception as e:
-                        print(f"❌ Stream error: {str(e)}")
+                        debug_print(f"❌ Stream error: {str(e)}")
                         error_chunk = {
                             "error": {
                                 "message": str(e),
@@ -2791,7 +3189,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                 debug_print(f"📄 Full raw response:\n{response.text}")
                 if error_message:
                     error_detail = f"LMArena API error: {error_message}"
-                    print(f"❌ {error_detail}")
+                    debug_print(f"❌ {error_detail}")
                     # Return OpenAI-compatible error response
                     return {
                         "error": {
@@ -2967,12 +3365,12 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                         error_detail += f" - {e.response.text[:200]}"
                 error_type = "upstream_error"
             
-            print(f"\n❌ HTTP STATUS ERROR")
-            print(f"📛 Error detail: {error_detail}")
-            print(f"📤 Request URL: {url}")
+            debug_print(f"\n❌ HTTP STATUS ERROR")
+            debug_print(f"📛 Error detail: {error_detail}")
+            debug_print(f"📤 Request URL: {url}")
             debug_print(f"📤 Request payload (truncated): {json.dumps(payload, indent=2)[:500]}")
             debug_print(f"📥 Response text: {e.response.text[:500]}")
-            print("="*80 + "\n")
+            debug_print("="*80 + "\n")
             
             # Return OpenAI-compatible error response
             return {
@@ -2984,10 +3382,10 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
             }
         
         except httpx.TimeoutException as e:
-            print(f"\n⏱️  TIMEOUT ERROR")
-            print(f"📛 Request timed out after 120 seconds")
-            print(f"📤 Request URL: {url}")
-            print("="*80 + "\n")
+            debug_print(f"\n⏱️  TIMEOUT ERROR")
+            debug_print(f"📛 Request timed out after 120 seconds")
+            debug_print(f"📤 Request URL: {url}")
+            debug_print("="*80 + "\n")
             # Return OpenAI-compatible error response
             return {
                 "error": {
@@ -2998,11 +3396,11 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
             }
         
         except Exception as e:
-            print(f"\n❌ UNEXPECTED ERROR IN HTTP CLIENT")
-            print(f"📛 Error type: {type(e).__name__}")
-            print(f"📛 Error message: {str(e)}")
-            print(f"📤 Request URL: {url}")
-            print("="*80 + "\n")
+            debug_print(f"\n❌ UNEXPECTED ERROR IN HTTP CLIENT")
+            debug_print(f"📛 Error type: {type(e).__name__}")
+            debug_print(f"📛 Error message: {str(e)}")
+            debug_print(f"📤 Request URL: {url}")
+            debug_print("="*80 + "\n")
             # Return OpenAI-compatible error response
             return {
                 "error": {
@@ -3015,18 +3413,18 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
     except HTTPException:
         raise
     except Exception as e:
-        print(f"\n❌ TOP-LEVEL EXCEPTION")
-        print(f"📛 Error type: {type(e).__name__}")
-        print(f"📛 Error message: {str(e)}")
-        print("="*80 + "\n")
+        debug_print(f"\n❌ TOP-LEVEL EXCEPTION")
+        debug_print(f"📛 Error type: {type(e).__name__}")
+        debug_print(f"📛 Error message: {str(e)}")
+        debug_print("="*80 + "\n")
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 if __name__ == "__main__":
-    print("=" * 60)
-    print("🚀 LMArena Bridge Server Starting...")
-    print("=" * 60)
-    print(f"📍 Dashboard: http://localhost:{PORT}/dashboard")
-    print(f"🔐 Login: http://localhost:{PORT}/login")
-    print(f"📚 API Base URL: http://localhost:{PORT}/api/v1")
-    print("=" * 60)
+    debug_print("=" * 60)
+    debug_print("🚀 LMArena Bridge Server Starting...")
+    debug_print("=" * 60)
+    debug_print(f"📍 Dashboard: http://localhost:{PORT}/dashboard")
+    debug_print(f"🔐 Login: http://localhost:{PORT}/login")
+    debug_print(f"📚 API Base URL: http://localhost:{PORT}/api/v1")
+    debug_print("=" * 60)
     uvicorn.run(app, host="0.0.0.0", port=PORT)

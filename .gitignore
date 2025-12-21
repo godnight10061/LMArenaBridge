@@ -2,3 +2,7 @@ venv/
 *webui_secret_key
 *cache_ggshield
 config.json
+.pytest_cache/
+*.log
+tmp_*.js
+recaptcha_storage_state.json
