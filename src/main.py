@@ -233,7 +233,7 @@ async def click_turnstile(page):
 
 def _is_execution_context_destroyed_error(error: Exception) -> bool:
     message = str(error)
-    return "Execution context was destroyed" in message and "navigation" in message
+    return "execution context was destroyed" in message.lower()
 
 
 async def _safe_page_evaluate(page, script: str, retries: int = 3, sleep_seconds: float = 0.5):
