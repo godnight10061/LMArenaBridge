@@ -12,6 +12,12 @@ def test_issue_27_recaptcha_validation_failed_triggers_retry(monkeypatch):
 
     import src.main as main
 
+    # Avoid running real startup tasks (network/browser + file writes) in unit tests.
+    original_startup_handlers = list(main.app.router.on_startup)
+    original_shutdown_handlers = list(main.app.router.on_shutdown)
+    main.app.router.on_startup.clear()
+    main.app.router.on_shutdown.clear()
+
     main.app.dependency_overrides[main.rate_limit_api_key] = lambda: {"key": "test-api-key", "rpm": 60}
 
     monkeypatch.setattr(
@@ -78,4 +84,6 @@ def test_issue_27_recaptcha_validation_failed_triggers_retry(monkeypatch):
     assert data["choices"][0]["message"]["content"] == "Hello"
     assert request_count["n"] == 2
 
+    main.app.router.on_startup[:] = original_startup_handlers
+    main.app.router.on_shutdown[:] = original_shutdown_handlers
     main.app.dependency_overrides.clear()
