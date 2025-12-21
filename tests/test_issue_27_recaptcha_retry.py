@@ -18,6 +18,9 @@ def test_issue_27_recaptcha_validation_failed_triggers_retry(monkeypatch):
     main.app.router.on_startup.clear()
     main.app.router.on_shutdown.clear()
 
+    # Keep this unit test non-interactive/deterministic: exercise the v3-refresh retry path only.
+    monkeypatch.setenv("LMABRIDGE_RECAPTCHA_V2_MODE", "off")
+
     main.app.dependency_overrides[main.rate_limit_api_key] = lambda: {"key": "test-api-key", "rpm": 60}
 
     monkeypatch.setattr(

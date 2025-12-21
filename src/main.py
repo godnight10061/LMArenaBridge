@@ -12,7 +12,6 @@ from typing import Optional, Dict, List
 from datetime import datetime, timezone, timedelta
 
 import uvicorn
-from camoufox.async_api import AsyncCamoufox
 from fastapi import FastAPI, HTTPException, Depends, status, Form, Request, Response
 from starlette.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.security import APIKeyHeader
@@ -27,6 +26,22 @@ DEBUG = True
 
 # Port to run the server on
 PORT = 8000
+
+# Camoufox is heavy and may download model definition files on import.
+# To keep unit tests fast/deterministic, resolve it lazily when needed.
+AsyncCamoufox = None
+
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+RECAPTCHA_STORAGE_STATE_FILE = os.path.join(REPO_ROOT, "recaptcha_storage_state.json")
+
+
+def _get_async_camoufox():
+    global AsyncCamoufox
+    if AsyncCamoufox is None:
+        from camoufox.async_api import AsyncCamoufox as _AsyncCamoufox
+
+        AsyncCamoufox = _AsyncCamoufox
+    return AsyncCamoufox
 
 # HTTP Status Codes
 class HTTPStatus:
@@ -205,6 +220,30 @@ def debug_print(*args, **kwargs):
                 safe_text = text.encode(encoding, errors="replace").decode(encoding, errors="replace")
                 safe_args.append(safe_text)
             print(*safe_args, **kwargs)
+
+
+def _redact_secret(value: object, keep_start: int = 12, keep_end: int = 4) -> object:
+    if not isinstance(value, str):
+        return value
+    secret = value.strip()
+    if not secret:
+        return value
+    if len(secret) <= keep_start + keep_end + 3:
+        return "***"
+    return f"{secret[:keep_start]}...{secret[-keep_end:]}"
+
+
+def _redact_payload(payload: dict) -> dict:
+    try:
+        redacted = json.loads(json.dumps(payload))
+    except Exception:
+        redacted = dict(payload)
+
+    for key in ("recaptchaV3Token", "recaptchaV2Token"):
+        if key in redacted:
+            redacted[key] = _redact_secret(redacted.get(key))
+
+    return redacted
 
 # --- New reCAPTCHA Functions ---
 
@@ -431,11 +470,21 @@ async def get_recaptcha_v3_token() -> Optional[str]:
     arena_auth_token = auth_tokens[0] if auth_tokens else config.get("auth_token", "").strip()
     
     try:
-        async with AsyncCamoufox(headless=True, main_world_eval=True) as browser:
+        async with _get_async_camoufox()(headless=True, main_world_eval=True) as browser:
             context_kwargs = {}
             if RECAPTCHA_USER_AGENT:
                 context_kwargs["user_agent"] = RECAPTCHA_USER_AGENT
-            context = await browser.new_context(**context_kwargs)
+            if os.path.exists(RECAPTCHA_STORAGE_STATE_FILE):
+                context_kwargs["storage_state"] = RECAPTCHA_STORAGE_STATE_FILE
+            try:
+                context = await browser.new_context(**context_kwargs)
+            except TypeError as e:
+                # Some Camoufox/playwright shims (and unit test fakes) may not accept storage_state.
+                if "storage_state" in context_kwargs and "storage_state" in str(e):
+                    context_kwargs.pop("storage_state", None)
+                    context = await browser.new_context(**context_kwargs)
+                else:
+                    raise
             cookies = []
             if cf_clearance:
                 cookies.append(
@@ -504,6 +553,10 @@ async def get_recaptcha_v3_token() -> Optional[str]:
                 global RECAPTCHA_TOKEN, RECAPTCHA_EXPIRY
                 RECAPTCHA_TOKEN = token
                 RECAPTCHA_EXPIRY = datetime.now(timezone.utc) + timedelta(seconds=110)
+                try:
+                    await context.storage_state(path=RECAPTCHA_STORAGE_STATE_FILE)
+                except Exception:
+                    pass
                 return token
             return None
 
@@ -567,17 +620,29 @@ def _get_recaptcha_v2_mode() -> str:
     """
     Configure how reCAPTCHA v2 fallback is attempted.
 
-    - "off": never attempt v2 (default)
+    - "off": never attempt v2
     - "auto": headless attempt + best-effort auto-click
     - "interactive": open a visible browser and wait for the user to solve
     """
-    mode = os.environ.get("LMABRIDGE_RECAPTCHA_V2_MODE", "off").strip().lower()
+    raw_mode = os.environ.get("LMABRIDGE_RECAPTCHA_V2_MODE")
+    if raw_mode is None or not raw_mode.strip():
+        # Default behavior:
+        # LMArena frequently rejects reCAPTCHA v3 tokens with "recaptcha validation failed"
+        # and requires a reCAPTCHA v2 checkbox/challenge. On Windows (common local usage),
+        # default to an interactive fallback so users can solve the challenge once prompted.
+        return "interactive" if os.name == "nt" else "off"
+
+    mode = raw_mode.strip().lower()
     if mode in {"off", "auto", "interactive"}:
         return mode
     return "off"
 
 
-async def _get_recaptcha_v2_token_from_page(page, max_wait_seconds: int = 120) -> Optional[str]:
+async def _get_recaptcha_v2_token_from_page(
+    page,
+    max_wait_seconds: int = 120,
+    interactive: bool = False,
+) -> Optional[str]:
     """
     Render LMArena's reCAPTCHA v2 widget and return its token.
 
@@ -615,11 +680,13 @@ async def _get_recaptcha_v2_token_from_page(page, max_wait_seconds: int = 120) -
     )
 
     debug_print("🧩 Rendering reCAPTCHA v2 fallback widget...")
+    interactive_js = "true" if interactive else "false"
     render_script = f"""
 (async () => {{
   const attr = {attr_js};
   const containerId = {container_id_js};
   const sitekey = {v2_sitekey_js};
+  const interactive = {interactive_js};
   const set = (v) => document.documentElement.setAttribute(attr, String(v));
 
   set('WAITING_RENDER');
@@ -629,18 +696,32 @@ async def _get_recaptcha_v2_token_from_page(page, max_wait_seconds: int = 120) -
   }}
   const gre = window.grecaptcha && window.grecaptcha.enterprise;
   if (!gre || typeof gre.render !== 'function') {{ set('ERROR: render_missing'); return; }}
+  await new Promise((resolve) => gre.ready(resolve));
 
   const container = document.getElementById(containerId);
   if (!container) {{ set('ERROR: container_missing'); return; }}
 
   try {{
-    gre.render(container, {{
+    const widgetId = gre.render(container, {{
       sitekey,
       callback: (token) => set(token),
       'error-callback': () => set('ERROR: render_failed'),
+      size: interactive ? 'normal' : 'invisible',
       theme: 'light',
     }});
     set('RENDERED');
+
+    // For invisible widgets, trigger execution automatically.
+    if (!interactive) {{
+      try {{
+        const maybe = gre.execute(widgetId);
+        if (maybe && typeof maybe.then === 'function') {{
+          maybe.catch((e) => set('ERROR: ' + String(e)));
+        }}
+      }} catch (e) {{
+        // ignore; callback should still fire if/when solved
+      }}
+    }}
   }} catch (e) {{
     set('ERROR: ' + String(e));
   }}
@@ -696,16 +777,26 @@ async def get_recaptcha_v2_token() -> Optional[str]:
     arena_auth_token = auth_tokens[0] if auth_tokens else config.get("auth_token", "").strip()
 
     headless = mode != "interactive"
-    max_wait_seconds = 30 if mode == "auto" else 300
+    max_wait_seconds = 30 if mode == "auto" else 600
     if mode == "interactive":
         debug_print("🧩 reCAPTCHA v2 requires manual verification; opening an interactive browser window...")
+        debug_print(f"🧩 Solve the checkbox/challenge in that window (waiting up to {max_wait_seconds}s).")
 
     try:
-        async with AsyncCamoufox(headless=headless, main_world_eval=True) as browser:
+        async with _get_async_camoufox()(headless=headless, main_world_eval=True) as browser:
             context_kwargs = {}
             if RECAPTCHA_USER_AGENT:
                 context_kwargs["user_agent"] = RECAPTCHA_USER_AGENT
-            context = await browser.new_context(**context_kwargs)
+            if os.path.exists(RECAPTCHA_STORAGE_STATE_FILE):
+                context_kwargs["storage_state"] = RECAPTCHA_STORAGE_STATE_FILE
+            try:
+                context = await browser.new_context(**context_kwargs)
+            except TypeError as e:
+                if "storage_state" in context_kwargs and "storage_state" in str(e):
+                    context_kwargs.pop("storage_state", None)
+                    context = await browser.new_context(**context_kwargs)
+                else:
+                    raise
 
             cookies = []
             if cf_clearance:
@@ -732,7 +823,17 @@ async def get_recaptcha_v2_token() -> Optional[str]:
             page = await context.new_page()
             debug_print("🌐 Navigating to lmarena.ai for reCAPTCHA v2...")
             await page.goto("https://lmarena.ai/", wait_until="domcontentloaded")
-            return await _get_recaptcha_v2_token_from_page(page, max_wait_seconds=max_wait_seconds)
+            token = await _get_recaptcha_v2_token_from_page(
+                page,
+                max_wait_seconds=max_wait_seconds,
+                interactive=(mode == "interactive"),
+            )
+            if token:
+                try:
+                    await context.storage_state(path=RECAPTCHA_STORAGE_STATE_FILE)
+                except Exception:
+                    pass
+            return token
 
     except Exception as e:
         debug_print(f"❌ Unexpected error getting reCAPTCHA v2 token: {e}")
@@ -1247,7 +1348,7 @@ async def rate_limit_api_key(key: str = Depends(API_KEY_HEADER)):
 async def get_initial_data():
     debug_print("Starting initial data retrieval...")
     try:
-        async with AsyncCamoufox(headless=True, main_world_eval=True) as browser:
+        async with _get_async_camoufox()(headless=True, main_world_eval=True) as browser:
             page = await browser.new_page()
             
             # Set up route interceptor BEFORE navigating
@@ -1298,9 +1399,14 @@ async def get_initial_data():
             # Give it time to capture all JS responses
             await asyncio.sleep(5)
 
-            # Extract cf_clearance
-            cookies = await page.context.cookies()
-            cf_clearance_cookie = next((c for c in cookies if c["name"] == "cf_clearance"), None)
+            # Extract cf_clearance (may appear a few seconds after challenge passes)
+            cf_clearance_cookie = None
+            for _ in range(20):
+                cookies = await page.context.cookies("https://lmarena.ai/")
+                cf_clearance_cookie = next((c for c in cookies if c.get("name") == "cf_clearance"), None)
+                if cf_clearance_cookie:
+                    break
+                await asyncio.sleep(1)
             
             config = get_config()
             if cf_clearance_cookie:
@@ -2574,7 +2680,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
             url = "https://lmarena.ai/nextjs-api/stream/create-evaluation"
             debug_print(f"📤 Target URL: {url}")
             debug_print(f"📦 Payload structure: Simple userMessage format")
-            debug_print(f"🔍 Full payload: {json.dumps(payload, indent=2)}")
+            debug_print(f"🔍 Full payload: {json.dumps(_redact_payload(payload), indent=2)}")
             http_method = "POST"
         else:
             debug_print("🔄 Using EXISTING conversation session")
@@ -2600,7 +2706,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
             url = f"https://lmarena.ai/nextjs-api/stream/post-to-evaluation/{session['conversation_id']}"
             debug_print(f"📤 Target URL: {url}")
             debug_print(f"📦 Payload structure: Simple userMessage format")
-            debug_print(f"🔍 Full payload: {json.dumps(payload, indent=2)}")
+            debug_print(f"🔍 Full payload: {json.dumps(_redact_payload(payload), indent=2)}")
             http_method = "POST"
 
         debug_print(f"\n🚀 Making API request to LMArena...")
@@ -3368,7 +3474,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
             debug_print(f"\n❌ HTTP STATUS ERROR")
             debug_print(f"📛 Error detail: {error_detail}")
             debug_print(f"📤 Request URL: {url}")
-            debug_print(f"📤 Request payload (truncated): {json.dumps(payload, indent=2)[:500]}")
+            debug_print(f"📤 Request payload (truncated): {json.dumps(_redact_payload(payload), indent=2)[:500]}")
             debug_print(f"📥 Response text: {e.response.text[:500]}")
             debug_print("="*80 + "\n")
             
