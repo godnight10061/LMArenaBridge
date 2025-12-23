@@ -231,159 +231,249 @@ async def click_turnstile(page):
         debug_print(f"  ⚠️ Error clicking turnstile: {e}")
         return False
 
-async def get_recaptcha_v3_token() -> Optional[str]:
+async def get_recaptcha_v3_token(auth_token: Optional[str] = None) -> Optional[str]:
     """
-    Retrieves reCAPTCHA v3 token using a 'Side-Channel' approach.
-    We write the token to a global window variable and poll for it, 
-    bypassing Promise serialization issues in the Main World bridge.
+    Retrieves a reCAPTCHA v3 token.
+
+    We intentionally avoid Camoufox's `main_world_eval` mode and instead inject a
+    `<script>` tag that runs in the page's main world and writes the result into
+    a DOM dataset attribute that we can poll.
     """
-    debug_print("🔐 Starting reCAPTCHA v3 token retrieval (Side-Channel Mode)...")
+    debug_print("🔐 Starting reCAPTCHA v3 token retrieval (Injected Script Mode)...")
     
     config = get_config()
-    cf_clearance = config.get("cf_clearance", "")
+    cf_clearance = config.get("cf_clearance", "").strip()
+
+    # If not explicitly provided, try to use the first configured auth token.
+    # This helps align the reCAPTCHA session with the same user token used for API calls.
+    if not auth_token:
+        auth_tokens = config.get("auth_tokens", [])
+        if auth_tokens:
+            auth_token = auth_tokens[0]
+        else:
+            auth_token = config.get("auth_token", "").strip() or None
+
+    # Prefer headful mode for better reCAPTCHA scores unless explicitly overridden.
+    recaptcha_headless = bool(config.get("recaptcha_headless", False))
     
     try:
-        async with AsyncCamoufox(headless=True, main_world_eval=True) as browser:
+        async with AsyncCamoufox(headless=recaptcha_headless, humanize=True) as browser:
             context = await browser.new_context()
+            cookies = []
             if cf_clearance:
-                await context.add_cookies([{
+                cookies.append({
                     "name": "cf_clearance",
                     "value": cf_clearance,
                     "domain": ".lmarena.ai",
-                    "path": "/"
-                }])
+                    "path": "/",
+                })
+            if auth_token:
+                cookies.append({
+                    "name": "arena-auth-prod-v1",
+                    "value": auth_token,
+                    "domain": ".lmarena.ai",
+                    "path": "/",
+                })
+            if cookies:
+                await context.add_cookies(cookies)
 
             page = await context.new_page()
             
             debug_print("  🌐 Navigating to lmarena.ai...")
             await page.goto("https://lmarena.ai/", wait_until="domcontentloaded")
 
-            # --- NEW: Cloudflare/Turnstile Pass-Through ---
-            debug_print("  🛡️  Checking for Cloudflare Turnstile...")
-            
-            # Allow time for the widget to render if it's going to
+            # --- Cloudflare/Turnstile Pass-Through ---
+            debug_print("  🛡️  Waiting for Cloudflare challenge to clear...")
             try:
-                # Check for challenge title or widget presence
-                for _ in range(5):
+                for _ in range(60):  # ~120s
                     title = await page.title()
-                    if "Just a moment" in title:
-                        debug_print("  🔒 Cloudflare challenge active. Attempting to click...")
-                        clicked = await click_turnstile(page)
-                        if clicked:
-                            debug_print("  ✅ Clicked Turnstile.")
-                            # Give it time to verify
-                            await asyncio.sleep(3)
-                    else:
-                        # If title is normal, we might still have a widget on the page
-                        await click_turnstile(page)
+                    if "Just a moment" not in title and "Attention Required" not in title:
                         break
-                    await asyncio.sleep(1)
-                
-                # Wait for the page to actually settle into the main app
-                await page.wait_for_load_state("domcontentloaded")
+                    await click_turnstile(page)
+                    await asyncio.sleep(2)
             except Exception as e:
-                debug_print(f"  ⚠️ Error handling Turnstile: {e}")
-            # ----------------------------------------------
+                debug_print(f"  ⚠️ Error handling Cloudflare challenge: {e}")
+            # -----------------------------------------
+
+            # Refresh cookies/user-agent in config (these often affect anti-bot checks).
+            try:
+                latest_cookies = await page.context.cookies()
+                cf_clearance_cookie = next(
+                    (c for c in latest_cookies if c.get("name") == "cf_clearance"), None
+                )
+                cf_bm_cookie = next(
+                    (c for c in latest_cookies if c.get("name") == "__cf_bm"), None
+                )
+                cfuvid_cookie = next(
+                    (c for c in latest_cookies if c.get("name") == "_cfuvid"), None
+                )
+                provisional_cookie = next(
+                    (c for c in latest_cookies if c.get("name") == "provisional_user_id"),
+                    None,
+                )
+                latest_user_agent = await page.evaluate("() => navigator.userAgent")
+
+                config_update = get_config()
+                updated = False
+                try:
+                    config_update["browser_cookies"] = {
+                        c.get("name"): c.get("value")
+                        for c in latest_cookies
+                        if c.get("name") and c.get("value")
+                    }
+                    updated = True
+                except Exception:
+                    pass
+                if cf_clearance_cookie and cf_clearance_cookie.get("value"):
+                    config_update["cf_clearance"] = cf_clearance_cookie["value"]
+                    updated = True
+                if cf_bm_cookie and cf_bm_cookie.get("value"):
+                    config_update["cf_bm"] = cf_bm_cookie["value"]
+                    updated = True
+                if cfuvid_cookie and cfuvid_cookie.get("value"):
+                    config_update["cfuvid"] = cfuvid_cookie["value"]
+                    updated = True
+                if provisional_cookie and provisional_cookie.get("value"):
+                    config_update["provisional_user_id"] = provisional_cookie["value"]
+                    updated = True
+                if latest_user_agent:
+                    config_update["user_agent"] = latest_user_agent
+                    updated = True
+                if updated:
+                    save_config(config_update)
+            except Exception as e:
+                debug_print(f"  ⚠️ Failed to refresh cookie/user-agent state: {e}")
 
             # 1. Wake up the page (Humanize)
             debug_print("  🖱️  Waking up page...")
-            await page.mouse.move(100, 100)
-            await page.mouse.wheel(0, 200)
-            await asyncio.sleep(2) # Vital "Human" pause
+            try:
+                # Wait for the main app UI to render (helps reCAPTCHA score vs. firing immediately).
+                await page.wait_for_selector("textarea", timeout=30000)
 
-            # 2. Check for Library
-            debug_print("  ⏳ Checking for library...")
-            lib_ready = await page.evaluate("mw:() => !!(window.grecaptcha && window.grecaptcha.enterprise)")
-            if not lib_ready:
-                debug_print("  ⚠️ Library not found immediately. Waiting...")
-                await asyncio.sleep(3)
-                lib_ready = await page.evaluate("mw:() => !!(window.grecaptcha && window.grecaptcha.enterprise)")
-                if not lib_ready:
-                    debug_print("❌ reCAPTCHA library never loaded.")
-                    return None
-
-            # 3. SETUP: Initialize our global result variable
-            # We use a unique name to avoid conflicts
-            await page.evaluate("mw:window.__token_result = 'PENDING'")
-
-            # 4. TRIGGER: Execute reCAPTCHA and write to the variable
-            # We do NOT await the result here. We just fire the process.
-            debug_print("  🚀 Triggering reCAPTCHA execution...")
-            trigger_script = f"""mw:() => {{
-                try {{
-                    window.grecaptcha.enterprise.execute('{RECAPTCHA_SITEKEY}', {{ action: '{RECAPTCHA_ACTION}' }})
-                    .then(token => {{
-                        window.__token_result = token;
-                    }})
-                    .catch(err => {{
-                        window.__token_result = 'ERROR: ' + err.toString();
-                    }});
-                }} catch (e) {{
-                    window.__token_result = 'SYNC_ERROR: ' + e.toString();
-                }}
-            }}"""
-            
-            await page.evaluate(trigger_script)
-
-            # 5. POLL: Watch the variable for changes
-            debug_print("  👀 Polling for result...")
-            token = None
-            
-            for i in range(20): # Wait up to 20 seconds
-                # Read the global variable
-                result = await page.evaluate("mw:window.__token_result")
-                
-                if result != 'PENDING':
-                    if result and result.startswith('ERROR'):
-                        debug_print(f"❌ JS Execution Error: {result}")
-                        return None
-                    elif result and result.startswith('SYNC_ERROR'):
-                        debug_print(f"❌ JS Sync Error: {result}")
-                        return None
-                    else:
-                        token = result
-                        debug_print(f"✅ Token captured! ({len(token)} chars)")
-                        break
-                
-                if i % 2 == 0:
-                    debug_print(f"    ... waiting ({i}s)")
+                await page.mouse.move(100, 100)
+                await asyncio.sleep(0.5)
+                await page.mouse.wheel(0, 300)
                 await asyncio.sleep(1)
 
-            if token:
-                global RECAPTCHA_TOKEN, RECAPTCHA_EXPIRY
-                RECAPTCHA_TOKEN = token
-                RECAPTCHA_EXPIRY = datetime.now(timezone.utc) + timedelta(seconds=110)
-                return token
-            else:
-                debug_print("❌ Timed out waiting for token variable to update.")
-                return None
+                # Light interaction without actually submitting anything.
+                await page.click("textarea")
+                await page.type("textarea", "hi")
+                await asyncio.sleep(1)
+                await page.keyboard.press("Backspace")
+                await page.keyboard.press("Backspace")
+                await asyncio.sleep(4)
+            except Exception as e:
+                debug_print(f"  ⚠️ Humanize step failed: {e}")
+
+            # 2. Trigger reCAPTCHA from the page's main world via script injection
+            debug_print("  🚀 Triggering reCAPTCHA execution...")
+            token_dataset_key = "__lm_bridge_recaptcha"
+            err_dataset_key = "__lm_bridge_recaptcha_err"
+
+            injection = f"""
+(() => {{
+  const root = document.documentElement;
+  root.dataset.{token_dataset_key} = '';
+  root.dataset.{err_dataset_key} = '';
+
+  const getGrecaptcha = () => window.grecaptcha?.enterprise || window.grecaptcha;
+
+  const exec = () => {{
+    const grecaptcha = getGrecaptcha();
+    if (!grecaptcha) return;
+    try {{
+      grecaptcha.ready(() => {{
+        grecaptcha.execute('{RECAPTCHA_SITEKEY}', {{ action: '{RECAPTCHA_ACTION}' }})
+          .then((token) => {{ root.dataset.{token_dataset_key} = token; }})
+          .catch((err) => {{ root.dataset.{err_dataset_key} = String(err); }});
+      }});
+    }} catch (e) {{
+      root.dataset.{err_dataset_key} = 'SYNC_ERROR: ' + String(e);
+    }}
+  }};
+
+  const start = Date.now();
+  const timer = setInterval(() => {{
+    if (getGrecaptcha()) {{
+      clearInterval(timer);
+      exec();
+      return;
+    }}
+    if (Date.now() - start > 20000) {{
+      clearInterval(timer);
+      root.dataset.{err_dataset_key} = 'TIMEOUT_WAITING_FOR_GRECAPTCHA';
+    }}
+  }}, 250);
+}})();
+"""
+
+            await page.evaluate(
+                """(code) => {
+                  const s = document.createElement('script');
+                  s.textContent = code;
+                  document.documentElement.appendChild(s);
+                  s.remove();
+                }""",
+                injection,
+            )
+
+            # 3. Poll for token written into DOM
+            debug_print("  👀 Polling for result...")
+            deadline = time.time() + 30
+            while time.time() < deadline:
+                result = await page.evaluate(
+                    f"() => document.documentElement.dataset.{token_dataset_key}"
+                )
+                err = await page.evaluate(
+                    f"() => document.documentElement.dataset.{err_dataset_key}"
+                )
+
+                if err:
+                    debug_print(f"❌ reCAPTCHA error: {err}")
+                    return None
+                if result:
+                    debug_print(f"✅ Token captured! ({len(result)} chars)")
+                    return result
+                await asyncio.sleep(0.25)
+
+            debug_print("❌ Timed out waiting for token variable to update.")
+            return None
 
     except Exception as e:
         debug_print(f"❌ Unexpected error: {e}")
         return None
 
-async def refresh_recaptcha_token():
-    """Checks if the global reCAPTCHA token is expired and refreshes it if necessary."""
-    global RECAPTCHA_TOKEN, RECAPTCHA_EXPIRY
+async def refresh_recaptcha_token(auth_token: Optional[str] = None, force_new: bool = False):
+    """Refreshes the cached reCAPTCHA token for a given auth token if necessary."""
+    global RECAPTCHA_TOKENS, RECAPTCHA_EXPIRIES
     
     current_time = datetime.now(timezone.utc)
+    cache_key = auth_token or "__default__"
+
+    expiry = RECAPTCHA_EXPIRIES.get(
+        cache_key, datetime.now(timezone.utc) - timedelta(days=365)
+    )
+    token = RECAPTCHA_TOKENS.get(cache_key)
+
     # Check if token is expired (set a refresh margin of 10 seconds)
-    if RECAPTCHA_TOKEN is None or current_time > RECAPTCHA_EXPIRY - timedelta(seconds=10):
+    if force_new or token is None or current_time > expiry - timedelta(seconds=10):
         debug_print("🔄 Recaptcha token expired or missing. Refreshing...")
-        new_token = await get_recaptcha_v3_token()
+        new_token = await get_recaptcha_v3_token(auth_token=auth_token)
         if new_token:
-            RECAPTCHA_TOKEN = new_token
+            RECAPTCHA_TOKENS[cache_key] = new_token
             # reCAPTCHA v3 tokens typically last 120 seconds (2 minutes)
-            RECAPTCHA_EXPIRY = current_time + timedelta(seconds=120)
-            debug_print(f"✅ Recaptcha token refreshed, expires at {RECAPTCHA_EXPIRY.isoformat()}")
+            RECAPTCHA_EXPIRIES[cache_key] = current_time + timedelta(seconds=120)
+            debug_print(
+                f"✅ Recaptcha token refreshed, expires at {RECAPTCHA_EXPIRIES[cache_key].isoformat()}"
+            )
             return new_token
-        else:
-            debug_print("❌ Failed to refresh recaptcha token.")
-            # Set a short retry delay if refresh fails
-            RECAPTCHA_EXPIRY = current_time + timedelta(seconds=10)
-            return None
-    
-    return RECAPTCHA_TOKEN
+
+        debug_print("❌ Failed to refresh recaptcha token.")
+        # Set a short retry delay if refresh fails
+        RECAPTCHA_EXPIRIES[cache_key] = current_time + timedelta(seconds=10)
+        return None
+
+    return token
 
 # --- End New reCAPTCHA Functions ---
 
@@ -679,9 +769,9 @@ conversation_tokens: Dict[str, str] = {}
 request_failed_tokens: Dict[str, set] = {}
 
 # --- New Global State for reCAPTCHA ---
-RECAPTCHA_TOKEN: Optional[str] = None
+RECAPTCHA_TOKENS: Dict[str, str] = {}
 # Initialize expiry far in the past to force a refresh on startup
-RECAPTCHA_EXPIRY: datetime = datetime.now(timezone.utc) - timedelta(days=365)
+RECAPTCHA_EXPIRIES: Dict[str, datetime] = {}
 # --------------------------------------
 
 # --- Helper Functions ---
@@ -703,6 +793,12 @@ def get_config():
         config.setdefault("auth_token", "")
         config.setdefault("auth_tokens", [])  # Multiple auth tokens
         config.setdefault("cf_clearance", "")
+        config.setdefault("cf_bm", "")
+        config.setdefault("cfuvid", "")
+        config.setdefault("provisional_user_id", "")
+        config.setdefault("user_agent", "")
+        config.setdefault("browser_cookies", {})
+        config.setdefault("recaptcha_headless", False)
         config.setdefault("api_keys", [])
         config.setdefault("usage_stats", {})
     except Exception as e:
@@ -762,11 +858,49 @@ def get_request_headers():
 def get_request_headers_with_token(token: str):
     """Get request headers with a specific auth token"""
     config = get_config()
-    cf_clearance = config.get("cf_clearance", "").strip()
-    return {
+    user_agent = config.get("user_agent", "").strip()
+
+    cookie_parts = []
+    cookie_store = config.get("browser_cookies", {})
+    if isinstance(cookie_store, dict):
+        for name, value in cookie_store.items():
+            if not name or not value or name == "arena-auth-prod-v1":
+                continue
+            cookie_parts.append(f"{name}={value}")
+    else:
+        # Fallback to the minimal cookie set
+        cf_bm = config.get("cf_bm", "").strip()
+        cfuvid = config.get("cfuvid", "").strip()
+        cf_clearance = config.get("cf_clearance", "").strip()
+        provisional_user_id = config.get("provisional_user_id", "").strip()
+        if cf_bm:
+            cookie_parts.append(f"__cf_bm={cf_bm}")
+        if cfuvid:
+            cookie_parts.append(f"_cfuvid={cfuvid}")
+        if cf_clearance:
+            cookie_parts.append(f"cf_clearance={cf_clearance}")
+        if provisional_user_id:
+            cookie_parts.append(f"provisional_user_id={provisional_user_id}")
+
+    cookie_parts.append(f"arena-auth-prod-v1={token}")
+
+    headers = {
         "Content-Type": "text/plain;charset=UTF-8",
-        "Cookie": f"cf_clearance={cf_clearance}; arena-auth-prod-v1={token}",
+        "Cookie": "; ".join(cookie_parts),
+        # Browser-like request headers (helps with anti-bot checks).
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Origin": "https://lmarena.ai",
+        "Referer": "https://lmarena.ai/",
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Dest": "empty",
     }
+    if user_agent:
+        headers["User-Agent"] = user_agent
+
+    return headers
 
 def get_next_auth_token(exclude_tokens: set = None):
     """Get next auth token using round-robin selection
@@ -912,17 +1046,63 @@ async def get_initial_data():
             # Give it time to capture all JS responses
             await asyncio.sleep(5)
 
-            # Extract cf_clearance
+            # Extract Cloudflare/browser cookies used for API calls
             cookies = await page.context.cookies()
             cf_clearance_cookie = next((c for c in cookies if c["name"] == "cf_clearance"), None)
-            
+            cf_bm_cookie = next((c for c in cookies if c["name"] == "__cf_bm"), None)
+            cfuvid_cookie = next((c for c in cookies if c["name"] == "_cfuvid"), None)
+            provisional_user_id_cookie = next(
+                (c for c in cookies if c["name"] == "provisional_user_id"), None
+            )
+
             config = get_config()
+            updated_config = False
+            try:
+                # Store full cookie jar (used to construct browser-like request cookies)
+                config["browser_cookies"] = {
+                    c.get("name"): c.get("value")
+                    for c in cookies
+                    if c.get("name") and c.get("value")
+                }
+                updated_config = True
+            except Exception:
+                pass
+
             if cf_clearance_cookie:
                 config["cf_clearance"] = cf_clearance_cookie["value"]
-                save_config(config)
                 debug_print(f"✅ Saved cf_clearance token: {cf_clearance_cookie['value'][:20]}...")
+                updated_config = True
             else:
                 debug_print("⚠️ Could not find cf_clearance cookie.")
+
+            if cf_bm_cookie:
+                config["cf_bm"] = cf_bm_cookie["value"]
+                debug_print(f"✅ Saved __cf_bm token: {cf_bm_cookie['value'][:20]}...")
+                updated_config = True
+
+            if cfuvid_cookie:
+                config["cfuvid"] = cfuvid_cookie["value"]
+                debug_print(f"✅ Saved _cfuvid token: {cfuvid_cookie['value'][:20]}...")
+                updated_config = True
+
+            if provisional_user_id_cookie:
+                config["provisional_user_id"] = provisional_user_id_cookie["value"]
+                debug_print(
+                    f"✅ Saved provisional_user_id: {provisional_user_id_cookie['value'][:20]}..."
+                )
+                updated_config = True
+
+            try:
+                user_agent = await page.evaluate("() => navigator.userAgent")
+                if user_agent:
+                    config["user_agent"] = user_agent
+                    debug_print(f"✅ Saved User-Agent: {user_agent[:60]}...")
+                    updated_config = True
+            except Exception as e:
+                debug_print(f"⚠️ Could not read User-Agent: {e}")
+
+            if updated_config:
+                save_config(config)
 
             # Extract models
             debug_print("Extracting models from page...")
@@ -1048,7 +1228,14 @@ async def startup_event():
         
         # 2. Now start the initial reCAPTCHA fetch (using the cookie we just got)
         # Block startup until we have a token or fail, so we don't serve 403s
-        await refresh_recaptcha_token()
+        try:
+            config = get_config()
+            auth_tokens = config.get("auth_tokens", [])
+            prefetch_token = auth_tokens[0] if auth_tokens else config.get("auth_token", "").strip()
+            if prefetch_token:
+                await refresh_recaptcha_token(auth_token=prefetch_token, force_new=True)
+        except Exception as e:
+            debug_print(f"⚠️  Startup reCAPTCHA prefetch failed: {e}")
         
         # 3. Start background tasks
         asyncio.create_task(periodic_refresh_task())
@@ -2104,17 +2291,6 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
         # Use API key + conversation tracking
         api_key_str = api_key["key"]
 
-        # --- NEW: Get reCAPTCHA v3 Token for Payload ---
-        recaptcha_token = await refresh_recaptcha_token()
-        if not recaptcha_token:
-            debug_print("❌ Cannot proceed, failed to get reCAPTCHA token.")
-            raise HTTPException(
-                status_code=503,
-                detail="Service Unavailable: Failed to acquire reCAPTCHA token. The bridge server may be blocked."
-            )
-        debug_print(f"🔑 Using reCAPTCHA v3 token: {recaptcha_token[:20]}...")
-        # -----------------------------------------------
-        
         # Generate conversation ID from context (API key + model + first user message)
         import hashlib
         first_user_message = next((m.get("content", "") for m in messages if m.get("role") == "user"), "")
@@ -2127,9 +2303,6 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
         debug_print(f"🔑 API Key: {api_key_str[:20]}...")
         debug_print(f"💭 Auto-generated Conversation ID: {conversation_id}")
         debug_print(f"🔑 Conversation key: {conversation_key[:100]}...")
-        
-        headers = get_request_headers()
-        debug_print(f"📋 Headers prepared (auth token length: {len(headers.get('Cookie', '').split('arena-auth-prod-v1=')[-1].split(';')[0])} chars)")
         
         # Check if conversation exists for this API key
         session = chat_sessions[api_key_str].get(conversation_id)
@@ -2183,7 +2356,6 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                     "metadata": {}
                 },
                 "modality": modality,
-                "recaptchaV3Token": recaptcha_token, # <--- ADD TOKEN HERE
             }
             url = "https://lmarena.ai/nextjs-api/stream/create-evaluation"
             debug_print(f"📤 Target URL: {url}")
@@ -2209,7 +2381,6 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                     "metadata": {}
                 },
                 "modality": modality,
-                "recaptchaV3Token": recaptcha_token, # <--- ADD TOKEN HERE
             }
             url = f"https://lmarena.ai/nextjs-api/stream/post-to-evaluation/{session['conversation_id']}"
             debug_print(f"📤 Target URL: {url}")
@@ -2228,10 +2399,25 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
         current_token = get_next_auth_token(exclude_tokens=failed_tokens)
         headers = get_request_headers_with_token(current_token)
         debug_print(f"🔑 Using token (round-robin): {current_token[:20]}...")
+
+        # Acquire a fresh reCAPTCHA token aligned to the chosen auth token.
+        # (Retry PUT requests currently send an empty payload.)
+        if http_method != "PUT":
+            recaptcha_token = await refresh_recaptcha_token(auth_token=current_token, force_new=True)
+            if not recaptcha_token:
+                debug_print("❌ Cannot proceed, failed to get reCAPTCHA token.")
+                raise HTTPException(
+                    status_code=503,
+                    detail="Service Unavailable: Failed to acquire reCAPTCHA token. The bridge server may be blocked.",
+                )
+            payload["recaptchaV3Token"] = recaptcha_token
+            debug_print(f"🔑 Using reCAPTCHA v3 token: {recaptcha_token[:20]}...")
+            # reCAPTCHA acquisition may refresh CF cookies/UA in config; rebuild headers.
+            headers = get_request_headers_with_token(current_token)
         
         # Retry logic wrapper
-        async def make_request_with_retry(url, payload, http_method, max_retries=3):
-            """Make request with automatic retry on 429/401 errors"""
+        async def make_request_with_retry(url, payload, http_method, max_retries=5):
+            """Make request with automatic retry on 429/401/reCAPTCHA errors"""
             nonlocal current_token, headers, failed_tokens
             
             for attempt in range(max_retries):
@@ -2257,6 +2443,14 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                     # Try with next token (excluding failed ones)
                                     current_token = get_next_auth_token(exclude_tokens=failed_tokens)
                                     headers = get_request_headers_with_token(current_token)
+                                    # Re-align reCAPTCHA token to the new auth token
+                                    if isinstance(payload, dict) and "recaptchaV3Token" in payload:
+                                        new_recaptcha = await refresh_recaptcha_token(
+                                            auth_token=current_token, force_new=True
+                                        )
+                                        if new_recaptcha:
+                                            payload["recaptchaV3Token"] = new_recaptcha
+                                            headers = get_request_headers_with_token(current_token)
                                     debug_print(f"🔄 Retrying with next token: {current_token[:20]}...")
                                     await asyncio.sleep(1)  # Brief delay
                                     continue
@@ -2277,12 +2471,45 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                     # Try with next available token (excluding failed ones)
                                     current_token = get_next_auth_token(exclude_tokens=failed_tokens)
                                     headers = get_request_headers_with_token(current_token)
+                                    # Re-align reCAPTCHA token to the new auth token
+                                    if isinstance(payload, dict) and "recaptchaV3Token" in payload:
+                                        new_recaptcha = await refresh_recaptcha_token(
+                                            auth_token=current_token, force_new=True
+                                        )
+                                        if new_recaptcha:
+                                            payload["recaptchaV3Token"] = new_recaptcha
+                                            headers = get_request_headers_with_token(current_token)
                                     debug_print(f"🔄 Retrying with next token: {current_token[:20]}...")
                                     await asyncio.sleep(1)  # Brief delay
                                     continue
                                 except HTTPException as e:
                                     debug_print(f"❌ No more tokens available: {e.detail}")
                                     break
+
+                        elif response.status_code == HTTPStatus.FORBIDDEN:
+                            # Handle reCAPTCHA failures (Issue #27)
+                            try:
+                                error_body = response.json()
+                            except Exception:
+                                error_body = None
+                            if (
+                                isinstance(error_body, dict)
+                                and error_body.get("error") == "recaptcha validation failed"
+                                and isinstance(payload, dict)
+                                and "recaptchaV3Token" in payload
+                                and attempt < max_retries - 1
+                            ):
+                                debug_print(
+                                    f"🤖 Attempt {attempt + 1}/{max_retries} - reCAPTCHA validation failed. Refreshing token..."
+                                )
+                                new_recaptcha = await refresh_recaptcha_token(
+                                    auth_token=current_token, force_new=True
+                                )
+                                if new_recaptcha:
+                                    payload["recaptchaV3Token"] = new_recaptcha
+                                    headers = get_request_headers_with_token(current_token)
+                                    await asyncio.sleep(1)
+                                    continue
                         
                         # If we get here, return the response (success or non-retryable error)
                         response.raise_for_status()
@@ -2306,7 +2533,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                 chunk_id = f"chatcmpl-{uuid.uuid4()}"
                 
                 # Retry logic for streaming
-                max_retries = 3
+                max_retries = 5
                 for attempt in range(max_retries):
                     # Reset response data for each attempt
                     response_text = ""
@@ -2331,6 +2558,13 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                     if attempt < max_retries - 1:
                                         current_token = get_next_auth_token()
                                         headers = get_request_headers_with_token(current_token)
+                                        if isinstance(payload, dict) and "recaptchaV3Token" in payload:
+                                            new_recaptcha = await refresh_recaptcha_token(
+                                                auth_token=current_token, force_new=True
+                                            )
+                                            if new_recaptcha:
+                                                payload["recaptchaV3Token"] = new_recaptcha
+                                                headers = get_request_headers_with_token(current_token)
                                         debug_print(f"🔄 Retrying stream with next token: {current_token[:20]}...")
                                         await asyncio.sleep(1)
                                         continue
@@ -2342,12 +2576,46 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                         try:
                                             current_token = get_next_auth_token()
                                             headers = get_request_headers_with_token(current_token)
+                                            if isinstance(payload, dict) and "recaptchaV3Token" in payload:
+                                                new_recaptcha = await refresh_recaptcha_token(
+                                                    auth_token=current_token, force_new=True
+                                                )
+                                                if new_recaptcha:
+                                                    payload["recaptchaV3Token"] = new_recaptcha
+                                                    headers = get_request_headers_with_token(current_token)
                                             debug_print(f"🔄 Retrying stream with next token: {current_token[:20]}...")
                                             await asyncio.sleep(1)
                                             continue
                                         except HTTPException:
                                             debug_print(f"❌ No more tokens available")
                                             break
+
+                                elif response.status_code == HTTPStatus.FORBIDDEN:
+                                    # Handle reCAPTCHA failures (Issue #27)
+                                    try:
+                                        body_bytes = await response.aread()
+                                        error_body = json.loads(body_bytes.decode("utf-8"))
+                                    except Exception:
+                                        error_body = None
+
+                                    if (
+                                        isinstance(error_body, dict)
+                                        and error_body.get("error") == "recaptcha validation failed"
+                                        and isinstance(payload, dict)
+                                        and "recaptchaV3Token" in payload
+                                        and attempt < max_retries - 1
+                                    ):
+                                        debug_print(
+                                            f"🤖 Stream attempt {attempt + 1}/{max_retries} - reCAPTCHA validation failed. Refreshing token..."
+                                        )
+                                        new_recaptcha = await refresh_recaptcha_token(
+                                            auth_token=current_token, force_new=True
+                                        )
+                                        if new_recaptcha:
+                                            payload["recaptchaV3Token"] = new_recaptcha
+                                            headers = get_request_headers_with_token(current_token)
+                                            await asyncio.sleep(1)
+                                            continue
                                 
                                 log_http_status(response.status_code, "Stream Connection")
                                 response.raise_for_status()
@@ -2916,6 +3184,9 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                     "code": "request_timeout"
                 }
             }
+        
+        except HTTPException:
+            raise
         
         except Exception as e:
             print(f"\n❌ UNEXPECTED ERROR IN HTTP CLIENT")
