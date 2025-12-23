@@ -9,6 +9,7 @@ import mimetypes
 from collections import defaultdict
 from typing import Optional, Dict, List
 from datetime import datetime, timezone, timedelta
+import sys
 
 import uvicorn
 from camoufox.async_api import AsyncCamoufox
@@ -187,12 +188,47 @@ def log_http_status(status_code: int, context: str = ""):
         debug_print(f"{emoji} HTTP {status_code}: {message} ({context})")
     else:
         debug_print(f"{emoji} HTTP {status_code}: {message}")
+
+
+def parse_retry_after_seconds(value: Optional[str]) -> Optional[int]:
+    if not value:
+        return None
+    value = value.strip()
+    if not value:
+        return None
+    try:
+        seconds = int(value)
+    except (TypeError, ValueError):
+        return None
+    if seconds < 0:
+        return None
+    return seconds
+
+
+def get_rate_limit_sleep_seconds(retry_after_header: Optional[str], attempt: int) -> int:
+    retry_after = parse_retry_after_seconds(retry_after_header)
+    if retry_after is not None:
+        return max(1, min(retry_after, 60))
+    return max(1, min(2 ** (attempt + 1), 60))
 # ============================================================
 
 def debug_print(*args, **kwargs):
     """Print debug messages only if DEBUG is True"""
     if DEBUG:
-        print(*args, **kwargs)
+        try:
+            print(*args, **kwargs)
+        except UnicodeEncodeError:
+            # Some Windows consoles (e.g. GBK codepages) can't print emoji. Avoid
+            # crashing the server just because logging contains unicode.
+            encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+            end = kwargs.get("end", "\n")
+            sep = kwargs.get("sep", " ")
+            message = sep.join(str(a) for a in args) + end
+            try:
+                sys.stdout.buffer.write(message.encode(encoding, errors="replace"))
+            except Exception:
+                safe = message.encode("ascii", errors="backslashreplace").decode("ascii")
+                print(safe, end="")
 
 # --- New reCAPTCHA Functions ---
 
@@ -2486,30 +2522,14 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                         
                         # Check for retry-able errors
                         if response.status_code == HTTPStatus.TOO_MANY_REQUESTS:
-                            debug_print(f"⏱️  Attempt {attempt + 1}/{max_retries} - Rate limit with token {current_token[:20]}...")
-                            # Add current token to failed set
-                            failed_tokens.add(current_token)
-                            debug_print(f"📝 Failed tokens so far: {len(failed_tokens)}")
-                            
+                            retry_after = response.headers.get("Retry-After")
+                            sleep_seconds = get_rate_limit_sleep_seconds(retry_after, attempt)
+                            debug_print(
+                                f"⏱️  Attempt {attempt + 1}/{max_retries} - Upstream rate limited. Waiting {sleep_seconds}s before retrying..."
+                            )
                             if attempt < max_retries - 1:
-                                try:
-                                    # Try with next token (excluding failed ones)
-                                    current_token = get_next_auth_token(exclude_tokens=failed_tokens)
-                                    headers = get_request_headers_with_token(current_token)
-                                    # Re-align reCAPTCHA token to the new auth token
-                                    if isinstance(payload, dict) and "recaptchaV3Token" in payload:
-                                        new_recaptcha = await refresh_recaptcha_token(
-                                            auth_token=current_token, force_new=True
-                                        )
-                                        if new_recaptcha:
-                                            payload["recaptchaV3Token"] = new_recaptcha
-                                            headers = get_request_headers_with_token(current_token)
-                                    debug_print(f"🔄 Retrying with next token: {current_token[:20]}...")
-                                    await asyncio.sleep(1)  # Brief delay
-                                    continue
-                                except HTTPException as e:
-                                    debug_print(f"❌ No more tokens available: {e.detail}")
-                                    break
+                                await asyncio.sleep(sleep_seconds)
+                                continue
                         
                         elif response.status_code == HTTPStatus.UNAUTHORIZED:
                             debug_print(f"🔒 Attempt {attempt + 1}/{max_retries} - Auth failed with token {current_token[:20]}...")
@@ -2607,19 +2627,13 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                 
                                 # Check for retry-able errors before processing stream
                                 if response.status_code == HTTPStatus.TOO_MANY_REQUESTS:
-                                    debug_print(f"⏱️  Stream attempt {attempt + 1}/{max_retries}")
+                                    retry_after = response.headers.get("Retry-After")
+                                    sleep_seconds = get_rate_limit_sleep_seconds(retry_after, attempt)
+                                    debug_print(
+                                        f"⏱️  Stream attempt {attempt + 1}/{max_retries} - Upstream rate limited. Waiting {sleep_seconds}s before retrying..."
+                                    )
                                     if attempt < max_retries - 1:
-                                        current_token = get_next_auth_token()
-                                        headers = get_request_headers_with_token(current_token)
-                                        if isinstance(payload, dict) and "recaptchaV3Token" in payload:
-                                            new_recaptcha = await refresh_recaptcha_token(
-                                                auth_token=current_token, force_new=True
-                                            )
-                                            if new_recaptcha:
-                                                payload["recaptchaV3Token"] = new_recaptcha
-                                                headers = get_request_headers_with_token(current_token)
-                                        debug_print(f"🔄 Retrying stream with next token: {current_token[:20]}...")
-                                        await asyncio.sleep(1)
+                                        await asyncio.sleep(sleep_seconds)
                                         continue
                                 
                                 elif response.status_code == HTTPStatus.UNAUTHORIZED:
