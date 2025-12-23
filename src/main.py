@@ -7,6 +7,8 @@ import secrets
 import base64
 import mimetypes
 from collections import defaultdict
+from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Optional, Dict, List
 from datetime import datetime, timezone, timedelta
 import sys
@@ -18,6 +20,10 @@ from starlette.responses import HTMLResponse, RedirectResponse, StreamingRespons
 from fastapi.security import APIKeyHeader
 
 import httpx
+try:
+    from curl_cffi import requests as curl_requests
+except ImportError:  # Optional; used as fallback for anti-bot checks.
+    curl_requests = None
 
 # ============================================================
 # CONFIGURATION
@@ -208,7 +214,7 @@ def parse_retry_after_seconds(value: Optional[str]) -> Optional[int]:
 def get_rate_limit_sleep_seconds(retry_after_header: Optional[str], attempt: int) -> int:
     retry_after = parse_retry_after_seconds(retry_after_header)
     if retry_after is not None:
-        return max(1, min(retry_after, 60))
+        return max(1, min(retry_after, 3600))
     return max(1, min(2 ** (attempt + 1), 60))
 # ============================================================
 
@@ -279,6 +285,15 @@ async def get_recaptcha_v3_token(auth_token: Optional[str] = None) -> Optional[s
     
     config = get_config()
     cf_clearance = config.get("cf_clearance", "").strip()
+    cf_bm = config.get("cf_bm", "").strip()
+    cfuvid = config.get("cfuvid", "").strip()
+    provisional_user_id = config.get("provisional_user_id", "").strip()
+    cookie_store = config.get("browser_cookies", {})
+    if isinstance(cookie_store, dict):
+        cf_clearance = cf_clearance or str(cookie_store.get("cf_clearance", "")).strip()
+        cf_bm = cf_bm or str(cookie_store.get("__cf_bm", "")).strip()
+        cfuvid = cfuvid or str(cookie_store.get("_cfuvid", "")).strip()
+        provisional_user_id = provisional_user_id or str(cookie_store.get("provisional_user_id", "")).strip()
 
     # If not explicitly provided, try to use the first configured auth token.
     # This helps align the reCAPTCHA session with the same user token used for API calls.
@@ -293,13 +308,39 @@ async def get_recaptcha_v3_token(auth_token: Optional[str] = None) -> Optional[s
     recaptcha_headless = bool(config.get("recaptcha_headless", False))
     
     try:
-        async with AsyncCamoufox(headless=recaptcha_headless, humanize=True) as browser:
-            context = await browser.new_context()
+        recaptcha_profile_dir = Path(CONFIG_FILE).with_name("grecaptcha")
+        async with AsyncCamoufox(
+            headless=recaptcha_headless,
+            humanize=True,
+            persistent_context=True,
+            user_data_dir=str(recaptcha_profile_dir),
+        ) as context:
             cookies = []
             if cf_clearance:
                 cookies.append({
                     "name": "cf_clearance",
                     "value": cf_clearance,
+                    "domain": ".lmarena.ai",
+                    "path": "/",
+                })
+            if cf_bm:
+                cookies.append({
+                    "name": "__cf_bm",
+                    "value": cf_bm,
+                    "domain": ".lmarena.ai",
+                    "path": "/",
+                })
+            if cfuvid:
+                cookies.append({
+                    "name": "_cfuvid",
+                    "value": cfuvid,
+                    "domain": ".lmarena.ai",
+                    "path": "/",
+                })
+            if provisional_user_id:
+                cookies.append({
+                    "name": "provisional_user_id",
+                    "value": provisional_user_id,
                     "domain": ".lmarena.ai",
                     "path": "/",
                 })
@@ -384,7 +425,8 @@ async def get_recaptcha_v3_token(auth_token: Optional[str] = None) -> Optional[s
             debug_print("  🖱️  Waking up page...")
             try:
                 # Wait for the main app UI to render (helps reCAPTCHA score vs. firing immediately).
-                await page.wait_for_selector("textarea", timeout=30000)
+                textarea = page.locator("textarea[name='message']").first
+                await textarea.wait_for(state="visible", timeout=30000)
 
                 await page.mouse.move(100, 100)
                 await asyncio.sleep(0.5)
@@ -392,8 +434,8 @@ async def get_recaptcha_v3_token(auth_token: Optional[str] = None) -> Optional[s
                 await asyncio.sleep(1)
 
                 # Light interaction without actually submitting anything.
-                await page.click("textarea")
-                await page.type("textarea", "hi")
+                await textarea.focus()
+                await page.keyboard.type("hi")
                 await asyncio.sleep(1)
                 await page.keyboard.press("Backspace")
                 await page.keyboard.press("Backspace")
@@ -950,26 +992,35 @@ def get_request_headers_with_token(token: str):
     user_agent = config.get("user_agent", "").strip()
 
     cookie_parts = []
+    cookie_names = set()
     cookie_store = config.get("browser_cookies", {})
     if isinstance(cookie_store, dict):
         for name, value in cookie_store.items():
             if not name or not value or name == "arena-auth-prod-v1":
                 continue
             cookie_parts.append(f"{name}={value}")
-    else:
-        # Fallback to the minimal cookie set
-        cf_bm = config.get("cf_bm", "").strip()
-        cfuvid = config.get("cfuvid", "").strip()
-        cf_clearance = config.get("cf_clearance", "").strip()
-        provisional_user_id = config.get("provisional_user_id", "").strip()
-        if cf_bm:
-            cookie_parts.append(f"__cf_bm={cf_bm}")
-        if cfuvid:
-            cookie_parts.append(f"_cfuvid={cfuvid}")
-        if cf_clearance:
-            cookie_parts.append(f"cf_clearance={cf_clearance}")
-        if provisional_user_id:
-            cookie_parts.append(f"provisional_user_id={provisional_user_id}")
+            cookie_names.add(name)
+
+    # Keep backwards compatibility with configs that store some cookies separately.
+    cf_bm = config.get("cf_bm", "").strip()
+    if cf_bm and "__cf_bm" not in cookie_names:
+        cookie_parts.append(f"__cf_bm={cf_bm}")
+        cookie_names.add("__cf_bm")
+
+    cfuvid = config.get("cfuvid", "").strip()
+    if cfuvid and "_cfuvid" not in cookie_names:
+        cookie_parts.append(f"_cfuvid={cfuvid}")
+        cookie_names.add("_cfuvid")
+
+    cf_clearance = config.get("cf_clearance", "").strip()
+    if cf_clearance and "cf_clearance" not in cookie_names:
+        cookie_parts.append(f"cf_clearance={cf_clearance}")
+        cookie_names.add("cf_clearance")
+
+    provisional_user_id = config.get("provisional_user_id", "").strip()
+    if provisional_user_id and "provisional_user_id" not in cookie_names:
+        cookie_parts.append(f"provisional_user_id={provisional_user_id}")
+        cookie_names.add("provisional_user_id")
 
     cookie_parts.append(f"arena-auth-prod-v1={token}")
 
@@ -991,9 +1042,24 @@ def get_request_headers_with_token(token: str):
 
     return headers
 
+def get_curl_impersonate() -> str:
+    """Choose a curl_cffi impersonation profile aligned with the saved User-Agent."""
+    config = get_config()
+    configured = config.get("curl_impersonate")
+    if isinstance(configured, str) and configured.strip():
+        return configured.strip()
+    ua = (config.get("user_agent") or "").lower()
+    if "edg" in ua:
+        return "edge"
+    if "firefox" in ua or ("gecko" in ua and "chrome" not in ua and "edg" not in ua):
+        return "firefox"
+    if "safari" in ua and "chrome" not in ua:
+        return "safari"
+    return "chrome136"
+
 def get_next_auth_token(exclude_tokens: set = None):
     """Get next auth token using round-robin selection
-    
+     
     Args:
         exclude_tokens: Set of tokens to exclude from selection (e.g., already tried tokens)
     """
@@ -2313,7 +2379,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
         debug_print(f"✅ Found model ID: {model_id}")
         debug_print(f"🔧 Model capabilities: {model_capabilities}")
         
-        # Determine modality based on model capabilities
+        # Determine modality based on model capabilities.
         # Priority: image > search > chat
         if model_capabilities.get('outputCapabilities', {}).get('image'):
             modality = "image"
@@ -2614,7 +2680,49 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                 chunk_id = f"chatcmpl-{uuid.uuid4()}"
                 
                 # Retry logic for streaming
-                max_retries = 5
+                max_retries = 6
+                use_curl_cffi = False
+
+                async def read_response_bytes(response):
+                    if hasattr(response, "aread"):
+                        return await response.aread()
+                    return await response.acontent()
+
+                @asynccontextmanager
+                async def open_stream(http_client: httpx.AsyncClient):
+                    if use_curl_cffi and curl_requests is not None:
+                        impersonate = get_curl_impersonate()
+                        debug_print(f"Upstream transport: curl_cffi (impersonate={impersonate})")
+                        async with curl_requests.AsyncSession() as curl_client:
+                            response = await curl_client.request(
+                                http_method,
+                                url,
+                                data=json.dumps(payload),
+                                headers=headers,
+                                timeout=120,
+                                stream=True,
+                                impersonate=impersonate,
+                            )
+                            try:
+                                yield response
+                            finally:
+                                try:
+                                    await response.aclose()
+                                except Exception:
+                                    pass
+                        return
+
+                    if http_method == "PUT":
+                        stream_context = http_client.stream(
+                            "PUT", url, content=json.dumps(payload), headers=headers, timeout=120
+                        )
+                    else:
+                        stream_context = http_client.stream(
+                            "POST", url, content=json.dumps(payload), headers=headers, timeout=120
+                        )
+
+                    async with stream_context as response:
+                        yield response
                 for attempt in range(max_retries):
                     # Reset response data for each attempt
                     response_text = ""
@@ -2624,18 +2732,35 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                         async with httpx.AsyncClient() as client:
                             debug_print(f"📡 Sending {http_method} request for streaming (attempt {attempt + 1}/{max_retries})...")
                             
-                            if http_method == "PUT":
-                                stream_context = client.stream('PUT', url, json=payload, headers=headers, timeout=120)
-                            else:
-                                stream_context = client.stream('POST', url, json=payload, headers=headers, timeout=120)
-                            
-                            async with stream_context as response:
+                            async with open_stream(client) as response:
                                 # Log status with human-readable message
                                 log_http_status(response.status_code, "LMArena API Stream")
                                 
                                 # Check for retry-able errors before processing stream
                                 if response.status_code == HTTPStatus.TOO_MANY_REQUESTS:
                                     retry_after = response.headers.get("Retry-After")
+                                    debug_print(f"  Retry-After header: {retry_after!r}")
+                                    try:
+                                        body_preview = (await read_response_bytes(response)).decode(
+                                            "utf-8", errors="replace"
+                                        )
+                                        debug_print(f"  429 body preview: {body_preview[:200]}")
+                                        try:
+                                            error_body = json.loads(body_preview)
+                                        except Exception:
+                                            error_body = None
+                                        if (
+                                            not use_curl_cffi
+                                            and curl_requests is not None
+                                            and isinstance(error_body, dict)
+                                            and error_body.get("error") == "prompt failed"
+                                        ):
+                                            debug_print(
+                                                "  Switching upstream transport to curl_cffi after prompt failure."
+                                            )
+                                            use_curl_cffi = True
+                                    except Exception:
+                                        pass
                                     sleep_seconds = get_rate_limit_sleep_seconds(retry_after, attempt)
                                     debug_print(
                                         f"⏱️  Stream attempt {attempt + 1}/{max_retries} - Upstream rate limited. Waiting {sleep_seconds}s before retrying..."
@@ -2676,7 +2801,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                 elif response.status_code == HTTPStatus.FORBIDDEN:
                                     # Handle reCAPTCHA failures (Issue #27)
                                     try:
-                                        body_bytes = await response.aread()
+                                        body_bytes = await read_response_bytes(response)
                                         error_body = json.loads(body_bytes.decode("utf-8"))
                                     except Exception:
                                         error_body = None
@@ -2697,13 +2822,30 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                         if new_recaptcha:
                                             payload["recaptchaV3Token"] = new_recaptcha
                                             headers = get_request_headers_with_token(current_token)
+                                            if curl_requests is not None:
+                                                use_curl_cffi = True
                                             await asyncio.sleep(1)
                                             continue
                                 
                                 log_http_status(response.status_code, "Stream Connection")
-                                response.raise_for_status()
+                                if response.status_code != HTTPStatus.OK:
+                                    body_bytes = await read_response_bytes(response)
+                                    try:
+                                        body_preview = body_bytes.decode("utf-8", errors="replace")
+                                        debug_print(f"  Error body preview: {body_preview[:200]}")
+                                    except Exception:
+                                        pass
+                                    raise httpx.HTTPStatusError(
+                                        f"Upstream error: {response.status_code}",
+                                        request=httpx.Request(http_method, url),
+                                        response=httpx.Response(
+                                            response.status_code, content=body_bytes
+                                        ),
+                                    )
                                 
                                 async for line in response.aiter_lines():
+                                    if isinstance(line, (bytes, bytearray)):
+                                        line = line.decode("utf-8", errors="replace")
                                     line = line.strip()
                                     if not line:
                                         continue
@@ -2839,6 +2981,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                                 }]
                                             }
                                             yield f"data: {json.dumps(final_chunk)}\n\n"
+                                            break
                                         except json.JSONDecodeError:
                                             continue
                             
@@ -2900,7 +3043,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                             error_msg = f"LMArena API error: {e.response.status_code}"
                             error_type = "api_error"
                         
-                        print(f"❌ {error_msg}")
+                        debug_print(f"❌ {error_msg}")
                         error_chunk = {
                             "error": {
                                 "message": error_msg,
@@ -2911,7 +3054,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                         yield f"data: {json.dumps(error_chunk)}\n\n"
                         return
                     except Exception as e:
-                        print(f"❌ Stream error: {str(e)}")
+                        debug_print(f"❌ Stream error: {str(e)}")
                         error_chunk = {
                             "error": {
                                 "message": str(e),

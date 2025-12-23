@@ -164,10 +164,69 @@ class TestIssue27RecaptchaValidation(unittest.IsolatedAsyncioTestCase):
     async def test_create_evaluation_does_not_fail_recaptcha(self) -> None:
         from camoufox.async_api import AsyncCamoufox
 
+        cfg_path = Path("config.json")
+        if not cfg_path.exists():
+            self.skipTest("No config.json found (need existing bridge config with auth tokens).")
+
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        tokens = cfg.get("auth_tokens") or []
+        if not tokens:
+            self.skipTest("No auth_tokens found in config.json (login via dashboard first).")
+
+        auth_token = tokens[0]
         headless = os.getenv("LMARENA_HEADLESS", "1") not in {"0", "false", "False"}
 
         async with AsyncCamoufox(headless=headless) as browser:
-            page = await browser.new_page()
+            context = await browser.new_context()
+            cookies = []
+
+            cookie_store = cfg.get("browser_cookies", {})
+            if isinstance(cookie_store, dict):
+                for name, value in cookie_store.items():
+                    if not name or not value:
+                        continue
+                    cookies.append(
+                        {
+                            "name": str(name),
+                            "value": str(value),
+                            "domain": ".lmarena.ai",
+                            "path": "/",
+                        }
+                    )
+
+            for cookie_name, key in [
+                ("cf_clearance", "cf_clearance"),
+                ("__cf_bm", "cf_bm"),
+                ("_cfuvid", "cfuvid"),
+                ("provisional_user_id", "provisional_user_id"),
+            ]:
+                val = str(cfg.get(key, "") or "").strip()
+                if not val:
+                    continue
+                if any(c.get("name") == cookie_name for c in cookies):
+                    continue
+                cookies.append(
+                    {
+                        "name": cookie_name,
+                        "value": val,
+                        "domain": ".lmarena.ai",
+                        "path": "/",
+                    }
+                )
+
+            cookies.append(
+                {
+                    "name": "arena-auth-prod-v1",
+                    "value": auth_token,
+                    "domain": ".lmarena.ai",
+                    "path": "/",
+                }
+            )
+
+            if cookies:
+                await context.add_cookies(cookies)
+
+            page = await context.new_page()
             await page.goto(LMARENA_ORIGIN, wait_until="domcontentloaded")
             await wait_for_cloudflare(page, timeout_s=120)
             await page.wait_for_selector("textarea", timeout=60000)
@@ -192,10 +251,6 @@ class TestIssue27RecaptchaValidation(unittest.IsolatedAsyncioTestCase):
 
             self.assertTrue(models, "No models available (neither from page nor models.json)")
             model_id = models[0]["id"]
-
-            await page.fill("textarea", "Hello")
-            await page.keyboard.press("Enter")
-            await wait_for_arena_auth_cookie(page, timeout_s=60)
 
             recaptcha_token = await get_recaptcha_token_via_injected_script(page, timeout_s=30)
             self.assertGreater(len(recaptcha_token), 200)
