@@ -801,6 +801,59 @@ def get_config():
         config.setdefault("recaptcha_headless", False)
         config.setdefault("api_keys", [])
         config.setdefault("usage_stats", {})
+
+        # Normalize API key schema for backward compatibility (older configs may
+        # have api_keys without a "name", or even as raw strings).
+        api_keys = config.get("api_keys", [])
+        if not isinstance(api_keys, list):
+            api_keys = []
+        normalized_api_keys = []
+        for idx, entry in enumerate(api_keys):
+            if isinstance(entry, str):
+                key_value = entry.strip()
+                if not key_value:
+                    continue
+                normalized_api_keys.append(
+                    {
+                        "name": f"Key {idx + 1}",
+                        "key": key_value,
+                        "rpm": 60,
+                        "created": 0,
+                    }
+                )
+                continue
+            if not isinstance(entry, dict):
+                continue
+
+            key_value = entry.get("key")
+            if not isinstance(key_value, str) or not key_value.strip():
+                continue
+
+            name_value = entry.get("name")
+            if not isinstance(name_value, str) or not name_value.strip():
+                name_value = f"Key {idx + 1}"
+
+            rpm_value = entry.get("rpm", 60)
+            try:
+                rpm_int = int(rpm_value)
+            except (TypeError, ValueError):
+                rpm_int = 60
+            rpm_int = max(1, min(rpm_int, 1000))
+
+            created_value = entry.get("created", 0)
+            try:
+                created_int = int(created_value)
+            except (TypeError, ValueError):
+                created_int = 0
+
+            normalized = dict(entry)
+            normalized["name"] = name_value.strip()
+            normalized["key"] = key_value.strip()
+            normalized["rpm"] = rpm_int
+            normalized["created"] = created_int
+            normalized_api_keys.append(normalized)
+
+        config["api_keys"] = normalized_api_keys
     except Exception as e:
         debug_print(f"⚠️  Error setting config defaults: {e}")
     
