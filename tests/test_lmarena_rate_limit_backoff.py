@@ -41,7 +41,7 @@ class TestLMArenaRateLimitBackoff(unittest.IsolatedAsyncioTestCase):
         self.main.CONFIG_FILE = self._orig_config_file
         self._temp_dir.cleanup()
 
-    async def test_stream_429_respects_retry_after_without_refreshing_recaptcha(self) -> None:
+    async def test_stream_429_respects_retry_after_and_refreshes_recaptcha(self) -> None:
         real_async_client = httpx.AsyncClient
         upstream_calls = {"count": 0}
 
