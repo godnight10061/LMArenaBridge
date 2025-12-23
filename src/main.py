@@ -2529,6 +2529,14 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                             )
                             if attempt < max_retries - 1:
                                 await asyncio.sleep(sleep_seconds)
+                                # reCAPTCHA tokens can be single-use; fetch a fresh one before retrying.
+                                if isinstance(payload, dict) and "recaptchaV3Token" in payload:
+                                    new_recaptcha = await refresh_recaptcha_token(
+                                        auth_token=current_token, force_new=True
+                                    )
+                                    if new_recaptcha:
+                                        payload["recaptchaV3Token"] = new_recaptcha
+                                        headers = get_request_headers_with_token(current_token)
                                 continue
                         
                         elif response.status_code == HTTPStatus.UNAUTHORIZED:
@@ -2634,6 +2642,14 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                     )
                                     if attempt < max_retries - 1:
                                         await asyncio.sleep(sleep_seconds)
+                                        # reCAPTCHA tokens can be single-use; fetch a fresh one before retrying.
+                                        if isinstance(payload, dict) and "recaptchaV3Token" in payload:
+                                            new_recaptcha = await refresh_recaptcha_token(
+                                                auth_token=current_token, force_new=True
+                                            )
+                                            if new_recaptcha:
+                                                payload["recaptchaV3Token"] = new_recaptcha
+                                                headers = get_request_headers_with_token(current_token)
                                         continue
                                 
                                 elif response.status_code == HTTPStatus.UNAUTHORIZED:

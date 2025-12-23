@@ -120,6 +120,6 @@ class TestLMArenaRateLimitBackoff(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(upstream_calls["count"], 2)
         self.assertEqual(token_calls["count"], 1)
-        self.assertEqual(refresh_mock.call_count, 1)
+        self.assertEqual(refresh_mock.call_count, 2)
 
         sleep_mock.assert_any_await(2)
