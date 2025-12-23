@@ -1,6 +1,9 @@
 venv/
+__pycache__/
 *webui_secret_key
 *cache_ggshield
 config.json
 grecaptcha/
+chrome_grecaptcha/
 recaptcha_storage_state.json
+tmp_*_profile/

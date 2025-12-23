@@ -1,16 +1,14 @@
-import asyncio
 import json
 import os
-import re
 import secrets
 import time
 import unittest
 from pathlib import Path
 
+import httpx
+
 
 LMARENA_ORIGIN = "https://lmarena.ai"
-RECAPTCHA_SITEKEY = "6Led_uYrAAAAAKjxDIF58fgFtX3t8loNAK85bW9I"
-RECAPTCHA_ACTION = "chat_submit"
 
 
 def uuid7() -> str:
@@ -26,144 +24,12 @@ def uuid7() -> str:
     return f"{hex_str[0:8]}-{hex_str[8:12]}-{hex_str[12:16]}-{hex_str[16:20]}-{hex_str[20:32]}"
 
 
-async def maybe_click_turnstile(page) -> bool:
-    selectors = [
-        "#cf-turnstile",
-        "iframe[src*='challenges.cloudflare.com']",
-        "[style*='display: grid'] iframe",
-    ]
-
-    for selector in selectors:
-        el = await page.query_selector(selector)
-        if not el:
-            continue
-        box = await el.bounding_box()
-        if not box:
-            continue
-        await page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
-        await asyncio.sleep(2)
-        return True
-    return False
-
-
-async def wait_for_cloudflare(page, timeout_s: int = 120) -> None:
-    deadline = time.time() + timeout_s
-    while time.time() < deadline:
-        try:
-            title = await page.title()
-        except Exception:
-            title = ""
-        if "Just a moment" not in title and "Attention Required" not in title:
-            return
-        await maybe_click_turnstile(page)
-        await asyncio.sleep(2)
-    raise TimeoutError(f"Timed out waiting for Cloudflare challenge (title={title!r})")
-
-
-async def wait_for_arena_auth_cookie(page, timeout_s: int = 60) -> None:
-    deadline = time.time() + timeout_s
-    attempt = 0
-    while time.time() < deadline:
-        cookies = await page.context.cookies()
-        if any(c.get("name") == "arena-auth-prod-v1" for c in cookies):
-            return
-        if attempt % 3 == 0:
-            await maybe_click_turnstile(page)
-        attempt += 1
-        await asyncio.sleep(1)
-    raise TimeoutError("Timed out waiting for arena-auth-prod-v1 cookie")
-
-
-async def get_recaptcha_token_via_injected_script(page, timeout_s: int = 30) -> str:
-    js = f"""
-(() => {{
-  const root = document.documentElement;
-  root.dataset.__lm_bridge_recaptcha = '';
-  root.dataset.__lm_bridge_recaptcha_err = '';
-
-  const getGrecaptcha = () => window.grecaptcha?.enterprise || window.grecaptcha;
-  const exec = () => {{
-    const grecaptcha = getGrecaptcha();
-    if (!grecaptcha) return;
-    try {{
-      grecaptcha.ready(() => {{
-        grecaptcha.execute('{RECAPTCHA_SITEKEY}', {{ action: '{RECAPTCHA_ACTION}' }})
-          .then((token) => {{ root.dataset.__lm_bridge_recaptcha = token; }})
-          .catch((err) => {{ root.dataset.__lm_bridge_recaptcha_err = String(err); }});
-      }});
-    }} catch (e) {{
-      root.dataset.__lm_bridge_recaptcha_err = 'SYNC_ERROR: ' + String(e);
-    }}
-  }};
-
-  const start = Date.now();
-  const timer = setInterval(() => {{
-    if (getGrecaptcha()) {{
-      clearInterval(timer);
-      exec();
-      return;
-    }}
-    if (Date.now() - start > {timeout_s * 1000}) {{
-      clearInterval(timer);
-      root.dataset.__lm_bridge_recaptcha_err = 'TIMEOUT_WAITING_FOR_GRECAPTCHA';
-    }}
-  }}, 250);
-}})();
-"""
-
-    await page.evaluate(
-        """(code) => {
-          const s = document.createElement('script');
-          s.textContent = code;
-          document.documentElement.appendChild(s);
-          s.remove();
-        }""",
-        js,
-    )
-
-    deadline = time.time() + timeout_s
-    while time.time() < deadline:
-        token = await page.evaluate("() => document.documentElement.dataset.__lm_bridge_recaptcha")
-        err = await page.evaluate("() => document.documentElement.dataset.__lm_bridge_recaptcha_err")
-        if err:
-            raise RuntimeError(err)
-        if token:
-            return token
-        await asyncio.sleep(0.25)
-    raise TimeoutError("Timed out polling for recaptcha token")
-
-
-async def fetch_create_evaluation_first_chunk(page, payload: dict) -> dict:
-    return await page.evaluate(
-        """async (payload) => {
-          const res = await fetch('/nextjs-api/stream/create-evaluation', {
-            method: 'POST',
-            headers: { 'content-type': 'text/plain;charset=UTF-8' },
-            body: JSON.stringify(payload),
-          });
-          let first = '';
-          try {
-            const reader = res.body.getReader();
-            const { value } = await reader.read();
-            if (value) first = new TextDecoder().decode(value);
-            await reader.cancel();
-          } catch (e) {
-            first = 'READ_ERROR:' + String(e);
-          }
-          return { status: res.status, first };
-        }""",
-        payload,
-    )
-
-
 class TestIssue27RecaptchaValidation(unittest.IsolatedAsyncioTestCase):
     @unittest.skipUnless(
         os.getenv("RUN_LMARENA_INTEGRATION") == "1",
         "Set RUN_LMARENA_INTEGRATION=1 to run this real external integration test.",
     )
     async def test_create_evaluation_does_not_fail_recaptcha(self) -> None:
-        from camoufox.async_api import AsyncCamoufox
-
         cfg_path = Path("config.json")
         if not cfg_path.exists():
             self.skipTest("No config.json found (need existing bridge config with auth tokens).")
@@ -174,107 +40,77 @@ class TestIssue27RecaptchaValidation(unittest.IsolatedAsyncioTestCase):
             self.skipTest("No auth_tokens found in config.json (login via dashboard first).")
 
         auth_token = tokens[0]
-        headless = os.getenv("LMARENA_HEADLESS", "1") not in {"0", "false", "False"}
+        from src import main
 
-        async with AsyncCamoufox(headless=headless) as browser:
-            context = await browser.new_context()
-            cookies = []
+        if not main.find_chrome_executable(main.get_config()):
+            self.skipTest("No Chrome/Edge executable found (required for current LMArena reCAPTCHA flow).")
 
-            cookie_store = cfg.get("browser_cookies", {})
-            if isinstance(cookie_store, dict):
-                for name, value in cookie_store.items():
-                    if not name or not value:
-                        continue
-                    cookies.append(
-                        {
-                            "name": str(name),
-                            "value": str(value),
-                            "domain": ".lmarena.ai",
-                            "path": "/",
-                        }
-                    )
+        models_path = Path("models.json")
+        models = json.loads(models_path.read_text(encoding="utf-8")) if models_path.exists() else []
+        self.assertTrue(models, "No models.json available (run the bridge once to fetch models).")
+        model = next(
+            (
+                m
+                for m in models
+                if m.get("publicName") == "gemini-3-pro-grounding"
+                or m.get("name") == "gemini-3-pro-grounding"
+            ),
+            models[0],
+        )
+        model_id = model["id"]
+        capabilities = model.get("capabilities") or {}
+        output_caps = (capabilities.get("outputCapabilities") or {}) if isinstance(capabilities, dict) else {}
+        modality = "search" if output_caps.get("search") else "chat"
 
-            for cookie_name, key in [
-                ("cf_clearance", "cf_clearance"),
-                ("__cf_bm", "cf_bm"),
-                ("_cfuvid", "cfuvid"),
-                ("provisional_user_id", "provisional_user_id"),
-            ]:
-                val = str(cfg.get(key, "") or "").strip()
-                if not val:
-                    continue
-                if any(c.get("name") == cookie_name for c in cookies):
-                    continue
-                cookies.append(
-                    {
-                        "name": cookie_name,
-                        "value": val,
-                        "domain": ".lmarena.ai",
-                        "path": "/",
-                    }
-                )
+        async def post_create_evaluation(first_payload: dict) -> dict:
+            headers = main.get_request_headers_with_token(auth_token)
+            async with httpx.AsyncClient() as client:
+                async with client.stream(
+                    "POST",
+                    f"{LMARENA_ORIGIN}/nextjs-api/stream/create-evaluation",
+                    headers=headers,
+                    content=json.dumps(first_payload),
+                    timeout=120.0,
+                ) as response:
+                    first = b""
+                    async for chunk in response.aiter_bytes():
+                        if chunk:
+                            first = chunk
+                            break
+            return {"status": response.status_code, "first": first.decode("utf-8", errors="replace")}
 
-            cookies.append(
-                {
-                    "name": "arena-auth-prod-v1",
-                    "value": auth_token,
-                    "domain": ".lmarena.ai",
-                    "path": "/",
-                }
-            )
+        recaptcha_token = await main.refresh_recaptcha_token(auth_token=auth_token, force_new=True)
+        self.assertIsNotNone(recaptcha_token, "Failed to acquire reCAPTCHA token")
+        self.assertGreater(len(recaptcha_token), 200)
 
-            if cookies:
-                await context.add_cookies(cookies)
+        payload = {
+            "id": uuid7(),
+            "mode": "direct",
+            "modelAId": model_id,
+            "userMessageId": uuid7(),
+            "modelAMessageId": uuid7(),
+            "userMessage": {
+                "content": "Hello from integration test",
+                "experimental_attachments": [],
+                "metadata": {},
+            },
+            "modality": modality,
+            "recaptchaV3Token": recaptcha_token,
+        }
 
-            page = await context.new_page()
-            await page.goto(LMARENA_ORIGIN, wait_until="domcontentloaded")
-            await wait_for_cloudflare(page, timeout_s=120)
-            await page.wait_for_selector("textarea", timeout=60000)
+        result = await post_create_evaluation(payload)
 
-            match = None
-            for _ in range(2):
-                html = await page.content()
-                match = re.search(
-                    r'{\\"initialModels\\":(\\[.*?\\]),\\"initialModel[A-Z]Id',
-                    html,
-                    re.DOTALL,
-                )
-                if match:
-                    break
-                await asyncio.sleep(3)
+        if result["status"] == 401 and "user not found" in result["first"].lower():
+            signed_up = await main.signup_user_if_needed(auth_token)
+            self.assertTrue(signed_up, msg=f"Sign-up flow failed: {result['first'][:200]}")
+            recaptcha_token = await main.refresh_recaptcha_token(auth_token=auth_token, force_new=True)
+            self.assertIsNotNone(recaptcha_token, "Failed to acquire reCAPTCHA token after sign-up")
+            payload["recaptchaV3Token"] = recaptcha_token
+            result = await post_create_evaluation(payload)
 
-            if match:
-                models_json = match.group(1).encode().decode("unicode_escape")
-                models = json.loads(models_json)
-            else:
-                models = json.loads(Path("models.json").read_text(encoding="utf-8"))
-
-            self.assertTrue(models, "No models available (neither from page nor models.json)")
-            model_id = models[0]["id"]
-
-            recaptcha_token = await get_recaptcha_token_via_injected_script(page, timeout_s=30)
-            self.assertGreater(len(recaptcha_token), 200)
-
-            payload = {
-                "id": uuid7(),
-                "mode": "direct",
-                "modelAId": model_id,
-                "userMessageId": uuid7(),
-                "modelAMessageId": uuid7(),
-                "userMessage": {
-                    "content": "Hello from integration test",
-                    "experimental_attachments": [],
-                    "metadata": {},
-                },
-                "modality": "chat",
-                "recaptchaV3Token": recaptcha_token,
-            }
-
-            result = await fetch_create_evaluation_first_chunk(page, payload)
-
-            self.assertEqual(
-                result["status"],
-                200,
-                msg=f"Expected 200 OK but got {result['status']} with first chunk: {result['first'][:200]}",
-            )
-            self.assertNotIn("recaptcha validation failed", result["first"])
+        self.assertEqual(
+            result["status"],
+            200,
+            msg=f"Expected 200 OK but got {result['status']} with first chunk: {result['first'][:200]}",
+        )
+        self.assertNotIn("recaptcha validation failed", result["first"])

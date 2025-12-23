@@ -15,7 +15,7 @@ class TestGemini3ProGroundingIntegration(unittest.IsolatedAsyncioTestCase):
     async def test_bridge_streams_gemini_3_pro_grounding(self) -> None:
         from src import main
 
-        model_name = os.getenv("LMARENA_TEST_MODEL", "gemini-3-pro")
+        model_name = os.getenv("LMARENA_TEST_MODEL", "gemini-3-pro-grounding")
 
         source_config_path = Path("config.json")
         if not source_config_path.exists():

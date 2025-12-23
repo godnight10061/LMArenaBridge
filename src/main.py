@@ -6,6 +6,8 @@ import time
 import secrets
 import base64
 import mimetypes
+import os
+import shutil
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -24,6 +26,10 @@ try:
     from curl_cffi import requests as curl_requests
 except ImportError:  # Optional; used as fallback for anti-bot checks.
     curl_requests = None
+try:
+    from playwright.async_api import async_playwright
+except ImportError:  # Optional; used for Chrome-based reCAPTCHA flow.
+    async_playwright = None
 
 # ============================================================
 # CONFIGURATION
@@ -242,6 +248,503 @@ def debug_print(*args, **kwargs):
 RECAPTCHA_SITEKEY = "6Led_uYrAAAAAKjxDIF58fgFtX3t8loNAK85bW9I"
 RECAPTCHA_ACTION = "chat_submit"
 
+def find_chrome_executable(config: dict) -> Optional[str]:
+    configured = (
+        str(config.get("chrome_path") or "").strip()
+        or str(os.environ.get("CHROME_PATH") or "").strip()
+    )
+    if configured and Path(configured).exists():
+        return configured
+
+    candidates = [
+        Path(os.environ.get("PROGRAMFILES", r"C:\Program Files"))
+        / "Google"
+        / "Chrome"
+        / "Application"
+        / "chrome.exe",
+        Path(os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)"))
+        / "Google"
+        / "Chrome"
+        / "Application"
+        / "chrome.exe",
+        Path(os.environ.get("LOCALAPPDATA", ""))
+        / "Google"
+        / "Chrome"
+        / "Application"
+        / "chrome.exe",
+        Path(os.environ.get("PROGRAMFILES", r"C:\Program Files"))
+        / "Microsoft"
+        / "Edge"
+        / "Application"
+        / "msedge.exe",
+        Path(os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)"))
+        / "Microsoft"
+        / "Edge"
+        / "Application"
+        / "msedge.exe",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+
+    for name in ("google-chrome", "chrome", "chromium", "chromium-browser", "msedge"):
+        resolved = shutil.which(name)
+        if resolved:
+            return resolved
+
+    return None
+
+async def signup_user_if_needed(auth_token: str) -> bool:
+    """Best-effort sign-up flow to resolve 401 'User not found'."""
+    if async_playwright is None:
+        return False
+
+    config = get_config()
+    chrome_path = find_chrome_executable(config)
+    if not chrome_path:
+        return False
+
+    headless = bool(config.get("recaptcha_headless", False))
+    profile_dir = Path(CONFIG_FILE).with_name("chrome_grecaptcha")
+
+    cf_clearance = (config.get("cf_clearance") or "").strip()
+    cf_bm = (config.get("cf_bm") or "").strip()
+    cfuvid = (config.get("cfuvid") or "").strip()
+    provisional_user_id = (config.get("provisional_user_id") or "").strip()
+    cookie_store = config.get("browser_cookies", {})
+    if isinstance(cookie_store, dict):
+        cf_clearance = cf_clearance or str(cookie_store.get("cf_clearance", "")).strip()
+        cf_bm = cf_bm or str(cookie_store.get("__cf_bm", "")).strip()
+        cfuvid = cfuvid or str(cookie_store.get("_cfuvid", "")).strip()
+        provisional_user_id = provisional_user_id or str(cookie_store.get("provisional_user_id", "")).strip()
+
+    debug_print("📝 Starting sign-up flow (Chrome)...")
+    async with async_playwright() as p:
+        context = await p.chromium.launch_persistent_context(
+            user_data_dir=str(profile_dir),
+            executable_path=chrome_path,
+            headless=headless,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-first-run",
+                "--no-default-browser-check",
+            ],
+        )
+        try:
+            cookies = []
+            if cf_clearance:
+                cookies.append(
+                    {"name": "cf_clearance", "value": cf_clearance, "domain": ".lmarena.ai", "path": "/"}
+                )
+            if cf_bm:
+                cookies.append(
+                    {"name": "__cf_bm", "value": cf_bm, "domain": ".lmarena.ai", "path": "/"}
+                )
+            if cfuvid:
+                cookies.append(
+                    {"name": "_cfuvid", "value": cfuvid, "domain": ".lmarena.ai", "path": "/"}
+                )
+            if provisional_user_id:
+                cookies.append(
+                    {
+                        "name": "provisional_user_id",
+                        "value": provisional_user_id,
+                        "domain": ".lmarena.ai",
+                        "path": "/",
+                    }
+                )
+            cookies.append(
+                {"name": "arena-auth-prod-v1", "value": auth_token, "domain": ".lmarena.ai", "path": "/"}
+            )
+            if cookies:
+                await context.add_cookies(cookies)
+
+            page = await context.new_page()
+            await page.goto("https://lmarena.ai/?mode=direct", wait_until="domcontentloaded")
+
+            debug_print("  🛡  Waiting for Cloudflare challenge to clear (sign-up)...")
+            try:
+                for _ in range(60):  # ~120s
+                    title = await page.title()
+                    if "Just a moment" not in title and "Attention Required" not in title:
+                        break
+                    await click_turnstile(page)
+                    await asyncio.sleep(2)
+            except Exception as e:
+                debug_print(f"  ⚠️ Error handling Cloudflare challenge (sign-up): {e}")
+
+            textarea = page.locator("textarea[name='message']").first
+            await textarea.wait_for(state="visible", timeout=60000)
+            await textarea.click()
+            await textarea.fill("hi")
+
+            form = textarea.locator("xpath=ancestor::form[1]")
+            send_button = form.locator('button[type="submit"]:not([disabled])').first
+            await send_button.wait_for(state="visible", timeout=60000)
+
+            ok = False
+            for signup_attempt in range(3):
+                try:
+                    await textarea.fill("hi")
+                    await send_button.wait_for(state="visible", timeout=60000)
+                    async with page.expect_response(
+                        lambda r: "/nextjs-api/sign-up" in r.url,
+                        timeout=60000,
+                    ) as signup_info:
+                        await send_button.click()
+                    resp = await signup_info.value
+                    if resp.status == 200:
+                        debug_print("📝 Sign-up response: 200")
+                        ok = True
+                        break
+                    try:
+                        body_preview = (await resp.text())[:200]
+                    except Exception:
+                        body_preview = ""
+                    if "duplicate key value" in body_preview.lower():
+                        debug_print("📝 Sign-up indicates user already exists.")
+                        ok = True
+                        break
+                    debug_print(f"📝 Sign-up response: {resp.status} body={body_preview!r}")
+                except Exception as e:
+                    debug_print(f"📝 Sign-up request failed (attempt {signup_attempt + 1}/3): {e}")
+                if signup_attempt < 2:
+                    await asyncio.sleep(2**signup_attempt)
+
+            # Persist latest cookies/UA (some flows add CF cookies like _cfuvid).
+            try:
+                latest_cookies = await page.context.cookies()
+                latest_user_agent = await page.evaluate("() => navigator.userAgent")
+
+                config_update = get_config()
+                config_update["browser_cookies"] = {
+                    c.get("name"): c.get("value")
+                    for c in latest_cookies
+                    if c.get("name") and c.get("value")
+                }
+                if latest_user_agent:
+                    config_update["user_agent"] = latest_user_agent
+                save_config(config_update)
+            except Exception as e:
+                debug_print(f"  ⚠️ Failed to refresh cookie/user-agent state (sign-up): {e}")
+
+            return ok
+        except Exception as e:
+            debug_print(f"📝 Sign-up flow failed: {e}")
+            return False
+        finally:
+            await context.close()
+
+async def get_recaptcha_v3_token_with_chrome(
+    auth_token: Optional[str],
+    cf_clearance: str,
+    cf_bm: str,
+    cfuvid: str,
+    provisional_user_id: str,
+    headless: bool,
+) -> Optional[str]:
+    if async_playwright is None:
+        return None
+
+    config = get_config()
+    chrome_path = find_chrome_executable(config)
+    if not chrome_path:
+        return None
+
+    profile_dir = Path(CONFIG_FILE).with_name("chrome_grecaptcha")
+    debug_print("🔐 Starting reCAPTCHA v3 token retrieval (Chrome)...")
+
+    async with async_playwright() as p:
+        context = await p.chromium.launch_persistent_context(
+            user_data_dir=str(profile_dir),
+            executable_path=chrome_path,
+            headless=headless,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-first-run",
+                "--no-default-browser-check",
+            ],
+        )
+        try:
+            cookies = []
+            if cf_clearance:
+                cookies.append(
+                    {"name": "cf_clearance", "value": cf_clearance, "domain": ".lmarena.ai", "path": "/"}
+                )
+            if cf_bm:
+                cookies.append(
+                    {"name": "__cf_bm", "value": cf_bm, "domain": ".lmarena.ai", "path": "/"}
+                )
+            if cfuvid:
+                cookies.append(
+                    {"name": "_cfuvid", "value": cfuvid, "domain": ".lmarena.ai", "path": "/"}
+                )
+            if provisional_user_id:
+                cookies.append(
+                    {
+                        "name": "provisional_user_id",
+                        "value": provisional_user_id,
+                        "domain": ".lmarena.ai",
+                        "path": "/",
+                    }
+                )
+            if auth_token:
+                cookies.append(
+                    {
+                        "name": "arena-auth-prod-v1",
+                        "value": auth_token,
+                        "domain": ".lmarena.ai",
+                        "path": "/",
+                    }
+                )
+            if cookies:
+                await context.add_cookies(cookies)
+
+            page = await context.new_page()
+            await page.goto("https://lmarena.ai/?mode=direct", wait_until="domcontentloaded")
+
+            debug_print("  🛡  Waiting for Cloudflare challenge to clear (Chrome)...")
+            try:
+                for _ in range(60):  # ~120s
+                    title = await page.title()
+                    if "Just a moment" not in title and "Attention Required" not in title:
+                        break
+                    await click_turnstile(page)
+                    await asyncio.sleep(2)
+            except Exception as e:
+                debug_print(f"  ⚠️ Error handling Cloudflare challenge (Chrome): {e}")
+
+            # Persist latest cookies/user-agent (helps align later API calls).
+            try:
+                latest_cookies = await page.context.cookies()
+                latest_user_agent = await page.evaluate("() => navigator.userAgent")
+                config_update = get_config()
+                config_update["browser_cookies"] = {
+                    c.get("name"): c.get("value")
+                    for c in latest_cookies
+                    if c.get("name") and c.get("value")
+                }
+                if latest_user_agent:
+                    config_update["user_agent"] = latest_user_agent
+                save_config(config_update)
+            except Exception as e:
+                debug_print(f"  ⚠️ Failed to refresh cookie/user-agent state (Chrome): {e}")
+
+            # Light warm-up (improves reCAPTCHA v3 score vs firing immediately).
+            try:
+                textarea = page.locator("textarea[name='message']").first
+                await textarea.wait_for(state="visible", timeout=30000)
+                await textarea.click()
+                await page.keyboard.type("hi")
+                await asyncio.sleep(0.5)
+                await page.keyboard.press("Backspace")
+                await page.keyboard.press("Backspace")
+                await asyncio.sleep(2)
+            except Exception:
+                pass
+
+            await page.wait_for_function(
+                "window.grecaptcha && ("
+                "(window.grecaptcha.enterprise && typeof window.grecaptcha.enterprise.execute === 'function') || "
+                "typeof window.grecaptcha.execute === 'function'"
+                ")",
+                timeout=60000,
+            )
+            token = await page.evaluate(
+                """({sitekey, action}) => new Promise((resolve, reject) => {
+                  const g = (window.grecaptcha?.enterprise && typeof window.grecaptcha.enterprise.execute === 'function')
+                    ? window.grecaptcha.enterprise
+                    : window.grecaptcha;
+                  if (!g || typeof g.execute !== 'function') return reject('NO_GRECAPTCHA');
+                  try {
+                    g.ready(() => {
+                      g.execute(sitekey, { action }).then(resolve).catch((err) => reject(String(err)));
+                    });
+                  } catch (e) { reject(String(e)); }
+                })""",
+                {"sitekey": RECAPTCHA_SITEKEY, "action": RECAPTCHA_ACTION},
+            )
+            if isinstance(token, str) and token:
+                debug_print(f"✅ Token captured! ({len(token)} chars)")
+                return token
+            return None
+        except Exception as e:
+            debug_print(f"⚠️ Chrome reCAPTCHA retrieval failed: {e}")
+            return None
+        finally:
+            await context.close()
+
+class BrowserFetchStreamResponse:
+    def __init__(self, status_code: int, headers: Optional[dict], text: str):
+        self.status_code = status_code
+        self.headers = headers or {}
+        self._text = text or ""
+
+    async def aiter_lines(self):
+        for line in self._text.splitlines():
+            yield line
+
+    async def aread(self) -> bytes:
+        return self._text.encode("utf-8")
+
+    async def aclose(self) -> None:
+        return None
+
+async def fetch_lmarena_stream_via_chrome(
+    http_method: str,
+    url: str,
+    payload: dict,
+    auth_token: str,
+    timeout_seconds: int = 120,
+) -> Optional[BrowserFetchStreamResponse]:
+    if async_playwright is None:
+        return None
+
+    config = get_config()
+    chrome_path = find_chrome_executable(config)
+    if not chrome_path:
+        return None
+
+    headless = bool(config.get("recaptcha_headless", False))
+    profile_dir = Path(CONFIG_FILE).with_name("chrome_grecaptcha")
+
+    cf_clearance = (config.get("cf_clearance") or "").strip()
+    cf_bm = (config.get("cf_bm") or "").strip()
+    cfuvid = (config.get("cfuvid") or "").strip()
+    provisional_user_id = (config.get("provisional_user_id") or "").strip()
+    cookie_store = config.get("browser_cookies", {})
+    if isinstance(cookie_store, dict):
+        cf_clearance = cf_clearance or str(cookie_store.get("cf_clearance", "")).strip()
+        cf_bm = cf_bm or str(cookie_store.get("__cf_bm", "")).strip()
+        cfuvid = cfuvid or str(cookie_store.get("_cfuvid", "")).strip()
+        provisional_user_id = provisional_user_id or str(cookie_store.get("provisional_user_id", "")).strip()
+
+    fetch_url = url
+    if fetch_url.startswith("https://lmarena.ai"):
+        fetch_url = fetch_url[len("https://lmarena.ai") :]
+    if not fetch_url.startswith("/"):
+        fetch_url = "/" + fetch_url
+
+    body = json.dumps(payload) if payload is not None else ""
+
+    async with async_playwright() as p:
+        context = await p.chromium.launch_persistent_context(
+            user_data_dir=str(profile_dir),
+            executable_path=chrome_path,
+            headless=headless,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-first-run",
+                "--no-default-browser-check",
+            ],
+        )
+        try:
+            cookies = []
+            if cf_clearance:
+                cookies.append(
+                    {"name": "cf_clearance", "value": cf_clearance, "domain": ".lmarena.ai", "path": "/"}
+                )
+            if cf_bm:
+                cookies.append(
+                    {"name": "__cf_bm", "value": cf_bm, "domain": ".lmarena.ai", "path": "/"}
+                )
+            if cfuvid:
+                cookies.append(
+                    {"name": "_cfuvid", "value": cfuvid, "domain": ".lmarena.ai", "path": "/"}
+                )
+            if provisional_user_id:
+                cookies.append(
+                    {
+                        "name": "provisional_user_id",
+                        "value": provisional_user_id,
+                        "domain": ".lmarena.ai",
+                        "path": "/",
+                    }
+                )
+            cookies.append(
+                {"name": "arena-auth-prod-v1", "value": auth_token, "domain": ".lmarena.ai", "path": "/"}
+            )
+            await context.add_cookies(cookies)
+
+            page = await context.new_page()
+            await page.goto("https://lmarena.ai/?mode=direct", wait_until="domcontentloaded")
+
+            debug_print("  🛡  Waiting for Cloudflare challenge to clear (Chrome fetch)...")
+            try:
+                for _ in range(60):  # ~120s
+                    title = await page.title()
+                    if "Just a moment" not in title and "Attention Required" not in title:
+                        break
+                    await click_turnstile(page)
+                    await asyncio.sleep(2)
+            except Exception as e:
+                debug_print(f"  ⚠️ Error handling Cloudflare challenge (Chrome fetch): {e}")
+
+            result = await page.evaluate(
+                """async ({url, method, body, timeoutMs}) => {
+                  const controller = new AbortController();
+                  const timer = setTimeout(() => controller.abort('timeout'), timeoutMs);
+                  try {
+                    const res = await fetch(url, {
+                      method,
+                      headers: { 'content-type': 'text/plain;charset=UTF-8' },
+                      body,
+                      credentials: 'include',
+                      signal: controller.signal,
+                    });
+                    const headers = Object.fromEntries(res.headers.entries());
+                    let text = '';
+                    if (res.body) {
+                      const reader = res.body.getReader();
+                      const decoder = new TextDecoder();
+                      while (true) {
+                        const { value, done } = await reader.read();
+                        if (done) break;
+                        if (value) text += decoder.decode(value, { stream: true });
+                      }
+                      text += decoder.decode();
+                    } else {
+                      text = await res.text();
+                    }
+                    return { status: res.status, headers, text };
+                  } catch (e) {
+                    return { status: 0, headers: {}, text: 'FETCH_ERROR:' + String(e) };
+                  } finally {
+                    clearTimeout(timer);
+                  }
+                }""",
+                {
+                    "url": fetch_url,
+                    "method": http_method,
+                    "body": body,
+                    "timeoutMs": int(timeout_seconds * 1000),
+                },
+            )
+
+            # Persist latest cookies/UA (helps later requests align with the browser session).
+            try:
+                latest_cookies = await page.context.cookies()
+                latest_user_agent = await page.evaluate("() => navigator.userAgent")
+                config_update = get_config()
+                config_update["browser_cookies"] = {
+                    c.get("name"): c.get("value")
+                    for c in latest_cookies
+                    if c.get("name") and c.get("value")
+                }
+                if latest_user_agent:
+                    config_update["user_agent"] = latest_user_agent
+                save_config(config_update)
+            except Exception:
+                pass
+
+            return BrowserFetchStreamResponse(
+                int(result.get("status") or 0),
+                result.get("headers") if isinstance(result, dict) else {},
+                result.get("text") if isinstance(result, dict) else "",
+            )
+        finally:
+            await context.close()
+
 async def click_turnstile(page):
     """
     Attempts to locate and click the Cloudflare Turnstile widget.
@@ -306,6 +809,17 @@ async def get_recaptcha_v3_token(auth_token: Optional[str] = None) -> Optional[s
 
     # Prefer headful mode for better reCAPTCHA scores unless explicitly overridden.
     recaptcha_headless = bool(config.get("recaptcha_headless", False))
+
+    chrome_token = await get_recaptcha_v3_token_with_chrome(
+        auth_token=auth_token,
+        cf_clearance=cf_clearance,
+        cf_bm=cf_bm,
+        cfuvid=cfuvid,
+        provisional_user_id=provisional_user_id,
+        headless=recaptcha_headless,
+    )
+    if chrome_token:
+        return chrome_token
     
     try:
         recaptcha_profile_dir = Path(CONFIG_FILE).with_name("grecaptcha")
@@ -2607,6 +3121,29 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                         
                         elif response.status_code == HTTPStatus.UNAUTHORIZED:
                             debug_print(f"🔒 Attempt {attempt + 1}/{max_retries} - Auth failed with token {current_token[:20]}...")
+                            try:
+                                error_body = response.json()
+                            except Exception:
+                                error_body = None
+                            if (
+                                isinstance(error_body, dict)
+                                and str(error_body.get("message", "")).strip().lower() == "user not found"
+                                and attempt < max_retries - 1
+                            ):
+                                debug_print(
+                                    f"?? Attempt {attempt + 1}/{max_retries} - User not found. Running sign-up flow..."
+                                )
+                                if await signup_user_if_needed(current_token):
+                                    if isinstance(payload, dict) and "recaptchaV3Token" in payload:
+                                        new_recaptcha = await refresh_recaptcha_token(
+                                            auth_token=current_token, force_new=True
+                                        )
+                                        if new_recaptcha:
+                                            payload["recaptchaV3Token"] = new_recaptcha
+                                    headers = get_request_headers_with_token(current_token)
+                                    await asyncio.sleep(1)
+                                    continue
+
                             # Add current token to failed set
                             failed_tokens.add(current_token)
                             # Remove the expired token from config
@@ -2678,18 +3215,35 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
             async def generate_stream():
                 nonlocal current_token, headers
                 chunk_id = f"chatcmpl-{uuid.uuid4()}"
-                
+
                 # Retry logic for streaming
                 max_retries = 6
                 use_curl_cffi = False
+                config_snapshot = get_config()
+                chrome_available = find_chrome_executable(config_snapshot) is not None
+                use_browser_fetch = bool(config_snapshot.get("upstream_via_browser", False))
 
                 async def read_response_bytes(response):
                     if hasattr(response, "aread"):
                         return await response.aread()
-                    return await response.acontent()
+                    if hasattr(response, "acontent"):
+                        return await response.acontent()
+                    return b""
 
                 @asynccontextmanager
                 async def open_stream(http_client: httpx.AsyncClient):
+                    if use_browser_fetch:
+                        response = await fetch_lmarena_stream_via_chrome(
+                            http_method=http_method,
+                            url=url,
+                            payload=payload,
+                            auth_token=current_token,
+                            timeout_seconds=120,
+                        )
+                        if response is not None:
+                            yield response
+                            return
+
                     if use_curl_cffi and curl_requests is not None:
                         impersonate = get_curl_impersonate()
                         debug_print(f"Upstream transport: curl_cffi (impersonate={impersonate})")
@@ -2779,6 +3333,30 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                 
                                 elif response.status_code == HTTPStatus.UNAUTHORIZED:
                                     debug_print(f"🔒 Stream token expired")
+                                    try:
+                                        body_bytes = await read_response_bytes(response)
+                                        error_body = json.loads(body_bytes.decode("utf-8"))
+                                    except Exception:
+                                        error_body = None
+                                    if (
+                                        isinstance(error_body, dict)
+                                        and str(error_body.get("message", "")).strip().lower() == "user not found"
+                                        and attempt < max_retries - 1
+                                    ):
+                                        debug_print(
+                                            f"?? Stream attempt {attempt + 1}/{max_retries} - User not found. Running sign-up flow..."
+                                        )
+                                        if await signup_user_if_needed(current_token):
+                                            if isinstance(payload, dict) and "recaptchaV3Token" in payload:
+                                                new_recaptcha = await refresh_recaptcha_token(
+                                                    auth_token=current_token, force_new=True
+                                                )
+                                                if new_recaptcha:
+                                                    payload["recaptchaV3Token"] = new_recaptcha
+                                            headers = get_request_headers_with_token(current_token)
+                                            await asyncio.sleep(1)
+                                            continue
+
                                     remove_auth_token(current_token)
                                     if attempt < max_retries - 1:
                                         try:
@@ -2824,6 +3402,11 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                             headers = get_request_headers_with_token(current_token)
                                             if curl_requests is not None:
                                                 use_curl_cffi = True
+                                            if chrome_available and not use_browser_fetch:
+                                                debug_print(
+                                                    "?? Switching upstream transport to browser fetch after reCAPTCHA failure."
+                                                )
+                                                use_browser_fetch = True
                                             await asyncio.sleep(1)
                                             continue
                                 
