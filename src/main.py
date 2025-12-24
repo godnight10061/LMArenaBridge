@@ -11,7 +11,7 @@ import shutil
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Tuple
 from datetime import datetime, timezone, timedelta
 import sys
 
@@ -247,6 +247,8 @@ def debug_print(*args, **kwargs):
 # Updated constants from gpt4free/g4f/Provider/needs_auth/LMArena.py
 RECAPTCHA_SITEKEY = "6Led_uYrAAAAAKjxDIF58fgFtX3t8loNAK85bW9I"
 RECAPTCHA_ACTION = "chat_submit"
+TURNSTILE_SITEKEY = "0x4AAAAAAA65vWDmG-O_lPtT"
+TURNSTILE_SCRIPT_URL = "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit"
 
 def find_chrome_executable(config: dict) -> Optional[str]:
     configured = (
@@ -331,6 +333,10 @@ async def signup_user_if_needed(auth_token: str) -> bool:
             ],
         )
         try:
+            try:
+                await context.clear_cookies()
+            except Exception:
+                pass
             cookies = []
             if cf_clearance:
                 cookies.append(
@@ -353,9 +359,7 @@ async def signup_user_if_needed(auth_token: str) -> bool:
                         "path": "/",
                     }
                 )
-            cookies.append(
-                {"name": "arena-auth-prod-v1", "value": auth_token, "domain": ".lmarena.ai", "path": "/"}
-            )
+            cookies.extend(build_playwright_arena_auth_cookies(auth_token))
             if cookies:
                 await context.add_cookies(cookies)
 
@@ -364,52 +368,72 @@ async def signup_user_if_needed(auth_token: str) -> bool:
 
             debug_print("  🛡  Waiting for Cloudflare challenge to clear (sign-up)...")
             try:
-                for _ in range(60):  # ~120s
-                    title = await page.title()
-                    if "Just a moment" not in title and "Attention Required" not in title:
-                        break
-                    await click_turnstile(page)
-                    await asyncio.sleep(2)
+                await wait_for_cloudflare_challenge_to_clear(page, timeout_seconds=120)
             except Exception as e:
                 debug_print(f"  ⚠️ Error handling Cloudflare challenge (sign-up): {e}")
-
-            textarea = page.locator("textarea[name='message']").first
-            await textarea.wait_for(state="visible", timeout=60000)
-            await textarea.click()
-            await textarea.fill("hi")
-
-            form = textarea.locator("xpath=ancestor::form[1]")
-            send_button = form.locator('button[type="submit"]:not([disabled])').first
-            await send_button.wait_for(state="visible", timeout=60000)
+            # The web app creates an anonymous user via Turnstile and `/nextjs-api/sign-up`.
+            if not provisional_user_id:
+                try:
+                    latest_cookies = await page.context.cookies()
+                    provisional_cookie = next(
+                        (c for c in latest_cookies if c.get("name") == "provisional_user_id"),
+                        None,
+                    )
+                    if provisional_cookie and provisional_cookie.get("value"):
+                        provisional_user_id = provisional_cookie["value"]
+                except Exception:
+                    pass
+            if not provisional_user_id:
+                debug_print("📝 Sign-up aborted: missing provisional_user_id.")
+                return False
 
             ok = False
             for signup_attempt in range(3):
                 try:
-                    await textarea.fill("hi")
-                    await send_button.wait_for(state="visible", timeout=60000)
-                    async with page.expect_response(
-                        lambda r: "/nextjs-api/sign-up" in r.url,
-                        timeout=60000,
-                    ) as signup_info:
-                        await send_button.click()
-                    resp = await signup_info.value
-                    if resp.status == 200:
+                    turnstile_token = await get_turnstile_token(page, timeout_seconds=60)
+                    if not turnstile_token:
+                        raise RuntimeError("NO_TURNSTILE_TOKEN")
+
+                    result = await page.evaluate(
+                        """async ({turnstileToken, provisionalUserId}) => {
+                          try {
+                            const res = await fetch('/nextjs-api/sign-up', {
+                              method: 'POST',
+                              body: JSON.stringify({ turnstileToken, provisionalUserId }),
+                              credentials: 'include',
+                            });
+                            const text = await res.text();
+                            return { status: res.status, text: text.slice(0, 400) };
+                          } catch (e) {
+                            return { status: 0, text: 'FETCH_ERROR:' + String(e) };
+                          }
+                        }""",
+                        {
+                            "turnstileToken": turnstile_token,
+                            "provisionalUserId": provisional_user_id,
+                        },
+                    )
+                    status = int(result.get("status") or 0) if isinstance(result, dict) else 0
+                    preview = result.get("text") if isinstance(result, dict) else ""
+                    if status == 200:
                         debug_print("📝 Sign-up response: 200")
                         ok = True
                         break
-                    try:
-                        body_preview = (await resp.text())[:200]
-                    except Exception:
-                        body_preview = ""
-                    if "duplicate key value" in body_preview.lower():
-                        debug_print("📝 Sign-up indicates user already exists.")
-                        ok = True
-                        break
-                    debug_print(f"📝 Sign-up response: {resp.status} body={body_preview!r}")
+                    if status == 400 and isinstance(preview, str):
+                        lowered = preview.lower()
+                        if "already exists" in lowered or "duplicate key" in lowered:
+                            debug_print("📝 Sign-up indicates user already exists.")
+                            ok = True
+                            break
+                    if status == 429 and signup_attempt < 2:
+                        debug_print("📝 Sign-up rate limited, retrying...")
+                        await asyncio.sleep(2**signup_attempt)
+                        continue
+                    debug_print(f"📝 Sign-up response: {status} body={preview!r}")
                 except Exception as e:
                     debug_print(f"📝 Sign-up request failed (attempt {signup_attempt + 1}/3): {e}")
-                if signup_attempt < 2:
-                    await asyncio.sleep(2**signup_attempt)
+                    if signup_attempt < 2:
+                        await asyncio.sleep(2**signup_attempt)
 
             # Persist latest cookies/UA (some flows add CF cookies like _cfuvid).
             try:
@@ -466,6 +490,10 @@ async def get_recaptcha_v3_token_with_chrome(
             ],
         )
         try:
+            try:
+                await context.clear_cookies()
+            except Exception:
+                pass
             cookies = []
             if cf_clearance:
                 cookies.append(
@@ -489,14 +517,7 @@ async def get_recaptcha_v3_token_with_chrome(
                     }
                 )
             if auth_token:
-                cookies.append(
-                    {
-                        "name": "arena-auth-prod-v1",
-                        "value": auth_token,
-                        "domain": ".lmarena.ai",
-                        "path": "/",
-                    }
-                )
+                cookies.extend(build_playwright_arena_auth_cookies(auth_token))
             if cookies:
                 await context.add_cookies(cookies)
 
@@ -505,12 +526,7 @@ async def get_recaptcha_v3_token_with_chrome(
 
             debug_print("  🛡  Waiting for Cloudflare challenge to clear (Chrome)...")
             try:
-                for _ in range(60):  # ~120s
-                    title = await page.title()
-                    if "Just a moment" not in title and "Attention Required" not in title:
-                        break
-                    await click_turnstile(page)
-                    await asyncio.sleep(2)
+                await wait_for_cloudflare_challenge_to_clear(page, timeout_seconds=120)
             except Exception as e:
                 debug_print(f"  ⚠️ Error handling Cloudflare challenge (Chrome): {e}")
 
@@ -532,7 +548,7 @@ async def get_recaptcha_v3_token_with_chrome(
 
             # Light warm-up (improves reCAPTCHA v3 score vs firing immediately).
             try:
-                textarea = page.locator("textarea[name='message']").first
+                textarea = await get_chat_textarea_locator(page)
                 await textarea.wait_for(state="visible", timeout=30000)
                 await textarea.click()
                 await page.keyboard.type("hi")
@@ -543,27 +559,40 @@ async def get_recaptcha_v3_token_with_chrome(
             except Exception:
                 pass
 
-            await page.wait_for_function(
-                "window.grecaptcha && ("
-                "(window.grecaptcha.enterprise && typeof window.grecaptcha.enterprise.execute === 'function') || "
-                "typeof window.grecaptcha.execute === 'function'"
-                ")",
-                timeout=60000,
-            )
-            token = await page.evaluate(
-                """({sitekey, action}) => new Promise((resolve, reject) => {
-                  const g = (window.grecaptcha?.enterprise && typeof window.grecaptcha.enterprise.execute === 'function')
-                    ? window.grecaptcha.enterprise
-                    : window.grecaptcha;
-                  if (!g || typeof g.execute !== 'function') return reject('NO_GRECAPTCHA');
-                  try {
-                    g.ready(() => {
-                      g.execute(sitekey, { action }).then(resolve).catch((err) => reject(String(err)));
-                    });
-                  } catch (e) { reject(String(e)); }
-                })""",
-                {"sitekey": RECAPTCHA_SITEKEY, "action": RECAPTCHA_ACTION},
-            )
+            async def execute_recaptcha() -> str:
+                await page.wait_for_function(
+                    "window.grecaptcha && ("
+                    "(window.grecaptcha.enterprise && typeof window.grecaptcha.enterprise.execute === 'function') || "
+                    "typeof window.grecaptcha.execute === 'function'"
+                    ")",
+                    timeout=60000,
+                )
+                return await page.evaluate(
+                    """({sitekey, action}) => new Promise((resolve, reject) => {
+                      const g = (window.grecaptcha?.enterprise && typeof window.grecaptcha.enterprise.execute === 'function')
+                        ? window.grecaptcha.enterprise
+                        : window.grecaptcha;
+                      if (!g || typeof g.execute !== 'function') return reject('NO_GRECAPTCHA');
+                      try {
+                        g.ready(() => {
+                          g.execute(sitekey, { action }).then(resolve).catch((err) => reject(String(err)));
+                        });
+                      } catch (e) { reject(String(e)); }
+                    })""",
+                    {"sitekey": RECAPTCHA_SITEKEY, "action": RECAPTCHA_ACTION},
+                )
+
+            try:
+                token = await execute_recaptcha()
+            except Exception as e:
+                debug_print(f"⚠️ Chrome reCAPTCHA retrieval failed, reloading: {e}")
+                try:
+                    await page.reload(wait_until="domcontentloaded")
+                    await wait_for_cloudflare_challenge_to_clear(page, timeout_seconds=60)
+                    token = await execute_recaptcha()
+                except Exception as e2:
+                    debug_print(f"⚠️ Chrome reCAPTCHA retrieval failed after reload: {e2}")
+                    return None
             if isinstance(token, str) and token:
                 debug_print(f"✅ Token captured! ({len(token)} chars)")
                 return token
@@ -639,6 +668,10 @@ async def fetch_lmarena_stream_via_chrome(
             ],
         )
         try:
+            try:
+                await context.clear_cookies()
+            except Exception:
+                pass
             cookies = []
             if cf_clearance:
                 cookies.append(
@@ -661,9 +694,7 @@ async def fetch_lmarena_stream_via_chrome(
                         "path": "/",
                     }
                 )
-            cookies.append(
-                {"name": "arena-auth-prod-v1", "value": auth_token, "domain": ".lmarena.ai", "path": "/"}
-            )
+            cookies.extend(build_playwright_arena_auth_cookies(auth_token))
             await context.add_cookies(cookies)
 
             page = await context.new_page()
@@ -671,12 +702,7 @@ async def fetch_lmarena_stream_via_chrome(
 
             debug_print("  🛡  Waiting for Cloudflare challenge to clear (Chrome fetch)...")
             try:
-                for _ in range(60):  # ~120s
-                    title = await page.title()
-                    if "Just a moment" not in title and "Attention Required" not in title:
-                        break
-                    await click_turnstile(page)
-                    await asyncio.sleep(2)
+                await wait_for_cloudflare_challenge_to_clear(page, timeout_seconds=120)
             except Exception as e:
                 debug_print(f"  ⚠️ Error handling Cloudflare challenge (Chrome fetch): {e}")
 
@@ -752,10 +778,32 @@ async def click_turnstile(page):
     """
     debug_print("  🖱️  Attempting to click Cloudflare Turnstile...")
     try:
+        iframe_selector = 'iframe[src*="challenges.cloudflare.com"]'
+        iframe = await page.query_selector(iframe_selector)
+        if iframe:
+            try:
+                frame = await iframe.content_frame()
+                if frame:
+                    for selector in (
+                        'input[type="checkbox"]',
+                        'div[role="checkbox"]',
+                        "label",
+                    ):
+                        checkbox = frame.locator(selector).first
+                        try:
+                            if await checkbox.count():
+                                await checkbox.click(timeout=5000)
+                                await asyncio.sleep(2)
+                                return True
+                        except Exception:
+                            continue
+            except Exception:
+                pass
+
         # Common selectors used by LMArena's Turnstile implementation
         selectors = [
             '#cf-turnstile', 
-            'iframe[src*="challenges.cloudflare.com"]',
+            iframe_selector,
             '[style*="display: grid"] iframe' # The grid style often wraps the checkbox
         ]
         
@@ -775,6 +823,154 @@ async def click_turnstile(page):
     except Exception as e:
         debug_print(f"  ⚠️ Error clicking turnstile: {e}")
         return False
+
+async def is_cloudflare_challenge_page(page) -> bool:
+    try:
+        title = await page.title()
+    except Exception:
+        title = ""
+
+    if "Just a moment" in title or "Attention Required" in title:
+        return True
+
+    try:
+        if await page.locator("text=Security Verification").count():
+            return True
+    except Exception:
+        pass
+
+    try:
+        if await page.locator('iframe[src*="challenges.cloudflare.com"]').count():
+            return True
+    except Exception:
+        pass
+
+    try:
+        if await page.locator("#cf-turnstile").count():
+            return True
+    except Exception:
+        pass
+
+    return False
+
+async def wait_for_cloudflare_challenge_to_clear(page, timeout_seconds: int = 120) -> None:
+    deadline = time.time() + max(1, int(timeout_seconds))
+    while time.time() < deadline:
+        try:
+            if not await is_cloudflare_challenge_page(page):
+                return
+        except Exception:
+            return
+        await click_turnstile(page)
+        await asyncio.sleep(2)
+
+async def get_chat_textarea_locator(page):
+    locator = page.locator("textarea[name='message']").first
+    try:
+        if await locator.count():
+            return locator
+    except Exception:
+        pass
+
+    locator = page.locator("textarea[placeholder*='Ask']").first
+    try:
+        if await locator.count():
+            return locator
+    except Exception:
+        pass
+
+    return page.locator("textarea").first
+
+async def get_turnstile_token(page, timeout_seconds: int = 60) -> Optional[str]:
+    """
+    Generate a Cloudflare Turnstile token by injecting the Turnstile script and rendering an
+    invisible widget. Used for `/nextjs-api/sign-up` when an auth token exists but the backend
+    reports "User not found".
+    """
+    try:
+        token = await page.evaluate(
+            """async ({scriptUrl, sitekey, timeoutMs}) => {
+              const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+              const ensureTurnstile = async () => {
+                if (window.turnstile && typeof window.turnstile.render === 'function') return;
+                let script = document.querySelector('script[data-lm-bridge-turnstile]');
+                if (!script) {
+                  script = document.createElement('script');
+                  script.src = scriptUrl;
+                  script.async = true;
+                  script.defer = true;
+                  script.dataset.lmBridgeTurnstile = '1';
+                  document.head.appendChild(script);
+                }
+                const deadline = Date.now() + timeoutMs;
+                while (Date.now() < deadline) {
+                  if (window.turnstile && typeof window.turnstile.render === 'function') return;
+                  await sleep(200);
+                }
+                throw new Error('TURNSTILE_SCRIPT_TIMEOUT');
+              };
+
+              await ensureTurnstile();
+
+              return await new Promise((resolve, reject) => {
+                const container = document.createElement('div');
+                container.id = '__lm_bridge_turnstile';
+                container.style.position = 'fixed';
+                container.style.left = '-10000px';
+                container.style.top = '-10000px';
+                document.body.appendChild(container);
+
+                let resolved = false;
+                const cleanup = () => {
+                  try { container.remove(); } catch (e) {}
+                };
+
+                const done = (value, isErr) => {
+                  if (resolved) return;
+                  resolved = true;
+                  cleanup();
+                  if (isErr) reject(value);
+                  else resolve(value);
+                };
+
+                let widgetId;
+                try {
+                  widgetId = window.turnstile.render(container, {
+                    sitekey,
+                    size: 'invisible',
+                    callback: (t) => done(String(t || ''), false),
+                    'error-callback': () => done('TURNSTILE_ERROR', true),
+                    'expired-callback': () => done('TURNSTILE_EXPIRED', true),
+                  });
+                } catch (e) {
+                  done(String(e), true);
+                  return;
+                }
+
+                try {
+                  window.turnstile.execute(widgetId);
+                } catch (e) {
+                  // Some Turnstile modes execute automatically; ignore.
+                }
+
+                setTimeout(() => done('TURNSTILE_TIMEOUT', true), timeoutMs);
+              });
+            }""",
+            {
+                "scriptUrl": TURNSTILE_SCRIPT_URL,
+                "sitekey": TURNSTILE_SITEKEY,
+                "timeoutMs": int(max(1, timeout_seconds) * 1000),
+            },
+        )
+    except Exception as e:
+        debug_print(f"🛡  Turnstile token retrieval failed: {e}")
+        return None
+
+    if isinstance(token, str) and token:
+        debug_print(f"🛡  Turnstile token captured! ({len(token)} chars)")
+        return token
+    return None
 
 async def get_recaptcha_v3_token(auth_token: Optional[str] = None) -> Optional[str]:
     """
@@ -818,6 +1014,15 @@ async def get_recaptcha_v3_token(auth_token: Optional[str] = None) -> Optional[s
         provisional_user_id=provisional_user_id,
         headless=recaptcha_headless,
     )
+    if not chrome_token and auth_token:
+        chrome_token = await get_recaptcha_v3_token_with_chrome(
+            auth_token=None,
+            cf_clearance=cf_clearance,
+            cf_bm=cf_bm,
+            cfuvid=cfuvid,
+            provisional_user_id=provisional_user_id,
+            headless=recaptcha_headless,
+        )
     if chrome_token:
         return chrome_token
     
@@ -829,6 +1034,10 @@ async def get_recaptcha_v3_token(auth_token: Optional[str] = None) -> Optional[s
             persistent_context=True,
             user_data_dir=str(recaptcha_profile_dir),
         ) as context:
+            try:
+                await context.clear_cookies()
+            except Exception:
+                pass
             cookies = []
             if cf_clearance:
                 cookies.append({
@@ -859,29 +1068,19 @@ async def get_recaptcha_v3_token(auth_token: Optional[str] = None) -> Optional[s
                     "path": "/",
                 })
             if auth_token:
-                cookies.append({
-                    "name": "arena-auth-prod-v1",
-                    "value": auth_token,
-                    "domain": ".lmarena.ai",
-                    "path": "/",
-                })
+                cookies.extend(build_playwright_arena_auth_cookies(auth_token))
             if cookies:
                 await context.add_cookies(cookies)
 
             page = await context.new_page()
             
             debug_print("  🌐 Navigating to lmarena.ai...")
-            await page.goto("https://lmarena.ai/", wait_until="domcontentloaded")
+            await page.goto("https://lmarena.ai/?mode=direct", wait_until="domcontentloaded")
 
             # --- Cloudflare/Turnstile Pass-Through ---
             debug_print("  🛡️  Waiting for Cloudflare challenge to clear...")
             try:
-                for _ in range(60):  # ~120s
-                    title = await page.title()
-                    if "Just a moment" not in title and "Attention Required" not in title:
-                        break
-                    await click_turnstile(page)
-                    await asyncio.sleep(2)
+                await wait_for_cloudflare_challenge_to_clear(page, timeout_seconds=120)
             except Exception as e:
                 debug_print(f"  ⚠️ Error handling Cloudflare challenge: {e}")
             # -----------------------------------------
@@ -939,7 +1138,7 @@ async def get_recaptcha_v3_token(auth_token: Optional[str] = None) -> Optional[s
             debug_print("  🖱️  Waking up page...")
             try:
                 # Wait for the main app UI to render (helps reCAPTCHA score vs. firing immediately).
-                textarea = page.locator("textarea[name='message']").first
+                textarea = await get_chat_textarea_locator(page)
                 await textarea.wait_for(state="visible", timeout=30000)
 
                 await page.mouse.move(100, 100)
@@ -1500,6 +1699,23 @@ def get_request_headers():
     
     return get_request_headers_with_token(token)
 
+def split_arena_auth_token_into_cookie_parts(
+    token: str, chunk_size: int = 3180
+) -> List[Tuple[str, str]]:
+    token = (token or "").strip()
+    if not token:
+        return []
+    if len(token) <= chunk_size:
+        return [("arena-auth-prod-v1", token)]
+    chunks = [token[i : i + chunk_size] for i in range(0, len(token), chunk_size)]
+    return [(f"arena-auth-prod-v1.{idx}", chunk) for idx, chunk in enumerate(chunks)]
+
+def build_playwright_arena_auth_cookies(token: str) -> List[dict]:
+    return [
+        {"name": name, "value": value, "domain": ".lmarena.ai", "path": "/"}
+        for name, value in split_arena_auth_token_into_cookie_parts(token)
+    ]
+
 def get_request_headers_with_token(token: str):
     """Get request headers with a specific auth token"""
     config = get_config()
@@ -1510,7 +1726,11 @@ def get_request_headers_with_token(token: str):
     cookie_store = config.get("browser_cookies", {})
     if isinstance(cookie_store, dict):
         for name, value in cookie_store.items():
-            if not name or not value or name == "arena-auth-prod-v1":
+            if not name or not value:
+                continue
+            if name == "arena-auth-prod-v1":
+                continue
+            if name.startswith("arena-auth-prod-v1.") and name.split(".")[-1].isdigit():
                 continue
             cookie_parts.append(f"{name}={value}")
             cookie_names.add(name)
@@ -1536,7 +1756,8 @@ def get_request_headers_with_token(token: str):
         cookie_parts.append(f"provisional_user_id={provisional_user_id}")
         cookie_names.add("provisional_user_id")
 
-    cookie_parts.append(f"arena-auth-prod-v1={token}")
+    for auth_cookie_name, auth_cookie_value in split_arena_auth_token_into_cookie_parts(token):
+        cookie_parts.append(f"{auth_cookie_name}={auth_cookie_value}")
 
     headers = {
         "Content-Type": "text/plain;charset=UTF-8",
