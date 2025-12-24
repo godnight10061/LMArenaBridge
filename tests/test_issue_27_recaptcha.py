@@ -1,116 +1,115 @@
 import json
-import os
-import secrets
-import time
+import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 import httpx
 
 
-LMARENA_ORIGIN = "https://lmarena.ai"
-
-
-def uuid7() -> str:
-    timestamp_ms = int(time.time() * 1000)
-    rand_a = secrets.randbits(12)
-    rand_b = secrets.randbits(62)
-
-    uuid_int = timestamp_ms << 80
-    uuid_int |= (0x7000 | rand_a) << 64
-    uuid_int |= 0x8000000000000000 | rand_b
-
-    hex_str = f"{uuid_int:032x}"
-    return f"{hex_str[0:8]}-{hex_str[8:12]}-{hex_str[12:16]}-{hex_str[16:20]}-{hex_str[20:32]}"
-
-
-class TestIssue27RecaptchaValidation(unittest.IsolatedAsyncioTestCase):
-    @unittest.skipUnless(
-        os.getenv("RUN_LMARENA_INTEGRATION") == "1",
-        "Set RUN_LMARENA_INTEGRATION=1 to run this real external integration test.",
-    )
-    async def test_create_evaluation_does_not_fail_recaptcha(self) -> None:
-        cfg_path = Path("config.json")
-        if not cfg_path.exists():
-            self.skipTest("No config.json found (need existing bridge config with auth tokens).")
-
-        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-        tokens = cfg.get("auth_tokens") or []
-        if not tokens:
-            self.skipTest("No auth_tokens found in config.json (login via dashboard first).")
-
-        auth_token = tokens[0]
+class TestIssue27RecaptchaFallback(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
         from src import main
 
-        if not main.find_chrome_executable(main.get_config()):
-            self.skipTest("No Chrome/Edge executable found (required for current LMArena reCAPTCHA flow).")
+        self.main = main
+        self.main.dashboard_sessions.clear()
+        self.main.chat_sessions.clear()
+        self.main.api_key_usage.clear()
 
-        models_path = Path("models.json")
-        models = json.loads(models_path.read_text(encoding="utf-8")) if models_path.exists() else []
-        self.assertTrue(models, "No models.json available (run the bridge once to fetch models).")
-        model = next(
-            (
-                m
-                for m in models
-                if m.get("publicName") == "gemini-3-pro-grounding"
-                or m.get("name") == "gemini-3-pro-grounding"
+        self._temp_dir = tempfile.TemporaryDirectory()
+        self._config_path = Path(self._temp_dir.name) / "config.json"
+        self._config_path.write_text(
+            json.dumps(
+                {
+                    "password": "admin",
+                    "auth_tokens": ["auth-token-1"],
+                    "api_keys": [
+                        {
+                            "name": "Test Key",
+                            "key": "test-key",
+                            "rpm": 999,
+                        }
+                    ],
+                }
             ),
-            models[0],
+            encoding="utf-8",
         )
-        model_id = model["id"]
-        capabilities = model.get("capabilities") or {}
-        output_caps = (capabilities.get("outputCapabilities") or {}) if isinstance(capabilities, dict) else {}
-        modality = "search" if output_caps.get("search") else "chat"
 
-        async def post_create_evaluation(first_payload: dict) -> dict:
-            headers = main.get_request_headers_with_token(auth_token)
-            async with httpx.AsyncClient() as client:
+        self._orig_config_file = self.main.CONFIG_FILE
+        self.main.CONFIG_FILE = str(self._config_path)
+
+    async def asyncTearDown(self) -> None:
+        self.main.CONFIG_FILE = self._orig_config_file
+        self._temp_dir.cleanup()
+
+    async def test_403_recaptcha_switches_to_browser_fetch(self) -> None:
+        real_async_client = httpx.AsyncClient
+
+        def upstream_handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(403, json={"error": "recaptcha validation failed"})
+
+        upstream_transport = httpx.MockTransport(upstream_handler)
+
+        def upstream_client_factory(*args, **kwargs) -> httpx.AsyncClient:
+            return real_async_client(transport=upstream_transport)
+
+        refresh_mock = AsyncMock(side_effect=["recaptcha-1", "recaptcha-2"])
+        sleep_mock = AsyncMock()
+        fetch_mock = AsyncMock(
+            return_value=self.main.BrowserFetchStreamResponse(
+                status_code=200,
+                headers={},
+                text='a0:"Hello"\nad:{"finishReason":"stop"}\n',
+            )
+        )
+
+        with patch.object(self.main, "get_models") as get_models_mock, patch(
+            "src.main.httpx.AsyncClient",
+            side_effect=upstream_client_factory,
+        ), patch.object(
+            self.main,
+            "refresh_recaptcha_token",
+            refresh_mock,
+        ), patch.object(
+            self.main,
+            "find_chrome_executable",
+            return_value="chrome.exe",
+        ), patch.object(
+            self.main,
+            "fetch_lmarena_stream_via_chrome",
+            fetch_mock,
+        ), patch(
+            "src.main.asyncio.sleep",
+            sleep_mock,
+        ):
+            get_models_mock.return_value = [
+                {
+                    "publicName": "test-model",
+                    "id": "model-id",
+                    "organization": "test-org",
+                    "capabilities": {
+                        "inputCapabilities": {"text": True},
+                        "outputCapabilities": {"text": True},
+                    },
+                }
+            ]
+
+            transport = httpx.ASGITransport(app=self.main.app, raise_app_exceptions=False)
+            async with real_async_client(transport=transport, base_url="http://test") as client:
                 async with client.stream(
                     "POST",
-                    f"{LMARENA_ORIGIN}/nextjs-api/stream/create-evaluation",
-                    headers=headers,
-                    content=json.dumps(first_payload),
-                    timeout=120.0,
+                    "/api/v1/chat/completions",
+                    headers={"Authorization": "Bearer test-key"},
+                    json={
+                        "model": "test-model",
+                        "messages": [{"role": "user", "content": "Hello"}],
+                        "stream": True,
+                    },
                 ) as response:
-                    first = b""
-                    async for chunk in response.aiter_bytes():
-                        if chunk:
-                            first = chunk
-                            break
-            return {"status": response.status_code, "first": first.decode("utf-8", errors="replace")}
+                    body_text = (await response.aread()).decode("utf-8", errors="replace")
 
-        recaptcha_token = await main.refresh_recaptcha_token(auth_token=auth_token, force_new=True)
-        self.assertIsNotNone(recaptcha_token, "Failed to acquire reCAPTCHA token")
-        self.assertGreater(len(recaptcha_token), 200)
-
-        payload = {
-            "id": uuid7(),
-            "mode": "direct",
-            "modelAId": model_id,
-            "userMessageId": uuid7(),
-            "modelAMessageId": uuid7(),
-            "userMessage": {
-                "content": "Hello from integration test",
-                "experimental_attachments": [],
-                "metadata": {},
-            },
-            "modality": modality,
-            "recaptchaV3Token": recaptcha_token,
-        }
-
-        result = await post_create_evaluation(payload)
-
-        if result["status"] == 401 and "user not found" in result["first"].lower():
-            signed_up = await main.signup_user_if_needed(auth_token)
-            self.assertTrue(signed_up, msg=f"Sign-up flow failed: {result['first'][:200]}")
-            recaptcha_token = await main.refresh_recaptcha_token(auth_token=auth_token, force_new=True)
-            self.assertIsNotNone(recaptcha_token, "Failed to acquire reCAPTCHA token after sign-up")
-            payload["recaptchaV3Token"] = recaptcha_token
-            result = await post_create_evaluation(payload)
-
-        self.assertEqual(
-            result["status"],
-            200,
-            msg=f"Expected 200 OK but got {result['status']} with first chunk: {result['first'][:200]}",
-        )
-        self.assertNotIn("recaptcha validation failed", result["first"])
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Hello", body_text)
+        self.assertIn("[DONE]", body_text)
+        self.assertGreaterEqual(refresh_mock.call_count, 2)
+        fetch_mock.assert_awaited()

@@ -8,10 +8,10 @@ import base64
 import mimetypes
 import os
 import shutil
-from collections import defaultdict
+from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, List, Tuple, Deque
 from datetime import datetime, timezone, timedelta
 import sys
 
@@ -250,6 +250,13 @@ RECAPTCHA_ACTION = "chat_submit"
 TURNSTILE_SITEKEY = "0x4AAAAAAA65vWDmG-O_lPtT"
 TURNSTILE_SCRIPT_URL = "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit"
 
+def get_recaptcha_headless(config: dict) -> bool:
+    """
+    Default to headless (no visible browser windows). Set `recaptcha_headful=true`
+    in `config.json` to temporarily show the browser for debugging.
+    """
+    return not bool(config.get("recaptcha_headful", False))
+
 def find_chrome_executable(config: dict) -> Optional[str]:
     configured = (
         str(config.get("chrome_path") or "").strip()
@@ -306,7 +313,7 @@ async def signup_user_if_needed(auth_token: str) -> bool:
     if not chrome_path:
         return False
 
-    headless = bool(config.get("recaptcha_headless", False))
+    headless = get_recaptcha_headless(config)
     profile_dir = Path(CONFIG_FILE).with_name("chrome_grecaptcha")
 
     cf_clearance = (config.get("cf_clearance") or "").strip()
@@ -315,10 +322,21 @@ async def signup_user_if_needed(auth_token: str) -> bool:
     provisional_user_id = (config.get("provisional_user_id") or "").strip()
     cookie_store = config.get("browser_cookies", {})
     if isinstance(cookie_store, dict):
-        cf_clearance = cf_clearance or str(cookie_store.get("cf_clearance", "")).strip()
-        cf_bm = cf_bm or str(cookie_store.get("__cf_bm", "")).strip()
-        cfuvid = cfuvid or str(cookie_store.get("_cfuvid", "")).strip()
-        provisional_user_id = provisional_user_id or str(cookie_store.get("provisional_user_id", "")).strip()
+        cookie_cf_clearance = str(cookie_store.get("cf_clearance", "")).strip()
+        if cookie_cf_clearance:
+            cf_clearance = cookie_cf_clearance
+
+        cookie_cf_bm = str(cookie_store.get("__cf_bm", "")).strip()
+        if cookie_cf_bm:
+            cf_bm = cookie_cf_bm
+
+        cookie_cfuvid = str(cookie_store.get("_cfuvid", "")).strip()
+        if cookie_cfuvid:
+            cfuvid = cookie_cfuvid
+
+        cookie_provisional = str(cookie_store.get("provisional_user_id", "")).strip()
+        if cookie_provisional:
+            provisional_user_id = cookie_provisional
 
     debug_print("📝 Starting sign-up flow (Chrome)...")
     async with async_playwright() as p:
@@ -467,6 +485,28 @@ async def get_recaptcha_v3_token_with_chrome(
     provisional_user_id: str,
     headless: bool,
 ) -> Optional[str]:
+    tokens = await get_recaptcha_v3_tokens_with_chrome(
+        auth_token=auth_token,
+        cf_clearance=cf_clearance,
+        cf_bm=cf_bm,
+        cfuvid=cfuvid,
+        provisional_user_id=provisional_user_id,
+        headless=headless,
+        count=1,
+    )
+    if tokens:
+        return tokens[0]
+    return None
+
+async def get_recaptcha_v3_tokens_with_chrome(
+    auth_token: Optional[str],
+    cf_clearance: str,
+    cf_bm: str,
+    cfuvid: str,
+    provisional_user_id: str,
+    headless: bool,
+    count: int,
+) -> Optional[List[str]]:
     if async_playwright is None:
         return None
 
@@ -477,6 +517,8 @@ async def get_recaptcha_v3_token_with_chrome(
 
     profile_dir = Path(CONFIG_FILE).with_name("chrome_grecaptcha")
     debug_print("🔐 Starting reCAPTCHA v3 token retrieval (Chrome)...")
+    if count < 1:
+        return None
 
     async with async_playwright() as p:
         context = await p.chromium.launch_persistent_context(
@@ -583,19 +625,31 @@ async def get_recaptcha_v3_token_with_chrome(
                 )
 
             try:
-                token = await execute_recaptcha()
+                tokens: List[str] = []
+                for _ in range(count):
+                    token = await execute_recaptcha()
+                    if not isinstance(token, str) or not token:
+                        raise RuntimeError("EMPTY_RECAPTCHA_TOKEN")
+                    tokens.append(token)
+                    await asyncio.sleep(0.25)
             except Exception as e:
                 debug_print(f"⚠️ Chrome reCAPTCHA retrieval failed, reloading: {e}")
                 try:
                     await page.reload(wait_until="domcontentloaded")
                     await wait_for_cloudflare_challenge_to_clear(page, timeout_seconds=60)
-                    token = await execute_recaptcha()
+                    tokens = []
+                    for _ in range(count):
+                        token = await execute_recaptcha()
+                        if not isinstance(token, str) or not token:
+                            raise RuntimeError("EMPTY_RECAPTCHA_TOKEN")
+                        tokens.append(token)
+                        await asyncio.sleep(0.25)
                 except Exception as e2:
                     debug_print(f"⚠️ Chrome reCAPTCHA retrieval failed after reload: {e2}")
                     return None
-            if isinstance(token, str) and token:
-                debug_print(f"✅ Token captured! ({len(token)} chars)")
-                return token
+            if tokens and all(isinstance(t, str) and t for t in tokens):
+                debug_print(f"✅ Token captured! ({len(tokens[0])} chars)")
+                return tokens
             return None
         except Exception as e:
             debug_print(f"⚠️ Chrome reCAPTCHA retrieval failed: {e}")
@@ -634,7 +688,7 @@ async def fetch_lmarena_stream_via_chrome(
     if not chrome_path:
         return None
 
-    headless = bool(config.get("recaptcha_headless", False))
+    headless = get_recaptcha_headless(config)
     profile_dir = Path(CONFIG_FILE).with_name("chrome_grecaptcha")
 
     cf_clearance = (config.get("cf_clearance") or "").strip()
@@ -643,10 +697,21 @@ async def fetch_lmarena_stream_via_chrome(
     provisional_user_id = (config.get("provisional_user_id") or "").strip()
     cookie_store = config.get("browser_cookies", {})
     if isinstance(cookie_store, dict):
-        cf_clearance = cf_clearance or str(cookie_store.get("cf_clearance", "")).strip()
-        cf_bm = cf_bm or str(cookie_store.get("__cf_bm", "")).strip()
-        cfuvid = cfuvid or str(cookie_store.get("_cfuvid", "")).strip()
-        provisional_user_id = provisional_user_id or str(cookie_store.get("provisional_user_id", "")).strip()
+        cookie_cf_clearance = str(cookie_store.get("cf_clearance", "")).strip()
+        if cookie_cf_clearance:
+            cf_clearance = cookie_cf_clearance
+
+        cookie_cf_bm = str(cookie_store.get("__cf_bm", "")).strip()
+        if cookie_cf_bm:
+            cf_bm = cookie_cf_bm
+
+        cookie_cfuvid = str(cookie_store.get("_cfuvid", "")).strip()
+        if cookie_cfuvid:
+            cfuvid = cookie_cfuvid
+
+        cookie_provisional = str(cookie_store.get("provisional_user_id", "")).strip()
+        if cookie_provisional:
+            provisional_user_id = cookie_provisional
 
     fetch_url = url
     if fetch_url.startswith("https://lmarena.ai"):
@@ -989,10 +1054,21 @@ async def get_recaptcha_v3_token(auth_token: Optional[str] = None) -> Optional[s
     provisional_user_id = config.get("provisional_user_id", "").strip()
     cookie_store = config.get("browser_cookies", {})
     if isinstance(cookie_store, dict):
-        cf_clearance = cf_clearance or str(cookie_store.get("cf_clearance", "")).strip()
-        cf_bm = cf_bm or str(cookie_store.get("__cf_bm", "")).strip()
-        cfuvid = cfuvid or str(cookie_store.get("_cfuvid", "")).strip()
-        provisional_user_id = provisional_user_id or str(cookie_store.get("provisional_user_id", "")).strip()
+        cookie_cf_clearance = str(cookie_store.get("cf_clearance", "")).strip()
+        if cookie_cf_clearance:
+            cf_clearance = cookie_cf_clearance
+
+        cookie_cf_bm = str(cookie_store.get("__cf_bm", "")).strip()
+        if cookie_cf_bm:
+            cf_bm = cookie_cf_bm
+
+        cookie_cfuvid = str(cookie_store.get("_cfuvid", "")).strip()
+        if cookie_cfuvid:
+            cfuvid = cookie_cfuvid
+
+        cookie_provisional = str(cookie_store.get("provisional_user_id", "")).strip()
+        if cookie_provisional:
+            provisional_user_id = cookie_provisional
 
     # If not explicitly provided, try to use the first configured auth token.
     # This helps align the reCAPTCHA session with the same user token used for API calls.
@@ -1004,7 +1080,7 @@ async def get_recaptcha_v3_token(auth_token: Optional[str] = None) -> Optional[s
             auth_token = config.get("auth_token", "").strip() or None
 
     # Prefer headful mode for better reCAPTCHA scores unless explicitly overridden.
-    recaptcha_headless = bool(config.get("recaptcha_headless", False))
+    recaptcha_headless = get_recaptcha_headless(config)
 
     chrome_token = await get_recaptcha_v3_token_with_chrome(
         auth_token=auth_token,
@@ -1234,37 +1310,135 @@ async def get_recaptcha_v3_token(auth_token: Optional[str] = None) -> Optional[s
         debug_print(f"❌ Unexpected error: {e}")
         return None
 
+def _get_recaptcha_pool_lock(cache_key: str) -> asyncio.Lock:
+    lock = RECAPTCHA_POOL_LOCKS.get(cache_key)
+    if lock is None:
+        lock = asyncio.Lock()
+        RECAPTCHA_POOL_LOCKS[cache_key] = lock
+    return lock
+
+async def get_recaptcha_v3_tokens(
+    *,
+    auth_token: Optional[str] = None,
+    count: int = 1,
+) -> Optional[List[str]]:
+    """Fetch `count` fresh reCAPTCHA v3 tokens (tokens are generally single-use)."""
+    if count < 1:
+        return None
+
+    config = get_config()
+    cf_clearance = (config.get("cf_clearance") or "").strip()
+    cf_bm = (config.get("cf_bm") or "").strip()
+    cfuvid = (config.get("cfuvid") or "").strip()
+    provisional_user_id = (config.get("provisional_user_id") or "").strip()
+    cookie_store = config.get("browser_cookies", {})
+    if isinstance(cookie_store, dict):
+        cf_clearance = cf_clearance or str(cookie_store.get("cf_clearance", "")).strip()
+        cf_bm = cf_bm or str(cookie_store.get("__cf_bm", "")).strip()
+        cfuvid = cfuvid or str(cookie_store.get("_cfuvid", "")).strip()
+        provisional_user_id = provisional_user_id or str(cookie_store.get("provisional_user_id", "")).strip()
+
+    # If not explicitly provided, try to use the first configured auth token.
+    if not auth_token:
+        auth_tokens = config.get("auth_tokens", [])
+        if auth_tokens:
+            auth_token = auth_tokens[0]
+        else:
+            auth_token = (config.get("auth_token") or "").strip() or None
+
+    recaptcha_headless = get_recaptcha_headless(config)
+
+    chrome_tokens = await get_recaptcha_v3_tokens_with_chrome(
+        auth_token=auth_token,
+        cf_clearance=cf_clearance,
+        cf_bm=cf_bm,
+        cfuvid=cfuvid,
+        provisional_user_id=provisional_user_id,
+        headless=recaptcha_headless,
+        count=count,
+    )
+    if not chrome_tokens and auth_token:
+        chrome_tokens = await get_recaptcha_v3_tokens_with_chrome(
+            auth_token=None,
+            cf_clearance=cf_clearance,
+            cf_bm=cf_bm,
+            cfuvid=cfuvid,
+            provisional_user_id=provisional_user_id,
+            headless=recaptcha_headless,
+            count=count,
+        )
+    if chrome_tokens:
+        return chrome_tokens
+
+    tokens: List[str] = []
+    for _ in range(count):
+        token = await get_recaptcha_v3_token(auth_token=auth_token)
+        if not token:
+            break
+        tokens.append(token)
+
+    return tokens or None
+
 async def refresh_recaptcha_token(auth_token: Optional[str] = None, force_new: bool = False):
-    """Refreshes the cached reCAPTCHA token for a given auth token if necessary."""
-    global RECAPTCHA_TOKENS, RECAPTCHA_EXPIRIES
+    """Return a fresh (single-use) reCAPTCHA token, using a small in-memory pool."""
+    global RECAPTCHA_TOKEN_POOLS, RECAPTCHA_POOL_EXPIRIES
     
     current_time = datetime.now(timezone.utc)
     cache_key = auth_token or "__default__"
 
-    expiry = RECAPTCHA_EXPIRIES.get(
-        cache_key, datetime.now(timezone.utc) - timedelta(days=365)
-    )
-    token = RECAPTCHA_TOKENS.get(cache_key)
+    lock = _get_recaptcha_pool_lock(cache_key)
+    async with lock:
+        expiry = RECAPTCHA_POOL_EXPIRIES.get(
+            cache_key, current_time - timedelta(days=365)
+        )
+        pool = RECAPTCHA_TOKEN_POOLS.get(cache_key)
+        if pool is None:
+            pool = deque()
+            RECAPTCHA_TOKEN_POOLS[cache_key] = pool
 
-    # Check if token is expired (set a refresh margin of 10 seconds)
-    if force_new or token is None or current_time > expiry - timedelta(seconds=10):
+        if force_new:
+            pool.clear()
+            RECAPTCHA_POOL_EXPIRIES[cache_key] = current_time - timedelta(days=365)
+            expiry = RECAPTCHA_POOL_EXPIRIES[cache_key]
+
+        # Expire whole pool with a 10s refresh margin.
+        if current_time > expiry - timedelta(seconds=10):
+            pool.clear()
+
+        if pool:
+            return pool.popleft()
+
         debug_print("🔄 Recaptcha token expired or missing. Refreshing...")
-        new_token = await get_recaptcha_v3_token(auth_token=auth_token)
-        if new_token:
-            RECAPTCHA_TOKENS[cache_key] = new_token
-            # reCAPTCHA v3 tokens typically last 120 seconds (2 minutes)
-            RECAPTCHA_EXPIRIES[cache_key] = current_time + timedelta(seconds=120)
+        config = get_config()
+        desired_pool_size = config.get("recaptcha_token_pool_size", 3)
+        try:
+            pool_size = int(desired_pool_size)
+        except (TypeError, ValueError):
+            pool_size = 3
+        pool_size = max(1, min(pool_size, 10))
+
+        # Only prefetch multiples when the Chrome-based path is available.
+        if not find_chrome_executable(config):
+            pool_size = 1
+
+        new_tokens = await get_recaptcha_v3_tokens(auth_token=auth_token, count=pool_size)
+        if new_tokens:
+            # Use newest token first (some upstreams only accept the latest token).
+            for token in reversed(new_tokens):
+                if isinstance(token, str) and token:
+                    pool.append(token)
+
+        if pool:
+            # reCAPTCHA v3 tokens typically last ~120 seconds.
+            RECAPTCHA_POOL_EXPIRIES[cache_key] = current_time + timedelta(seconds=120)
             debug_print(
-                f"✅ Recaptcha token refreshed, expires at {RECAPTCHA_EXPIRIES[cache_key].isoformat()}"
+                f"✅ Recaptcha token refreshed, expires at {RECAPTCHA_POOL_EXPIRIES[cache_key].isoformat()}"
             )
-            return new_token
+            return pool.popleft()
 
         debug_print("❌ Failed to refresh recaptcha token.")
-        # Set a short retry delay if refresh fails
-        RECAPTCHA_EXPIRIES[cache_key] = current_time + timedelta(seconds=10)
+        RECAPTCHA_POOL_EXPIRIES[cache_key] = current_time + timedelta(seconds=10)
         return None
-
-    return token
 
 # --- End New reCAPTCHA Functions ---
 
@@ -1560,9 +1734,11 @@ conversation_tokens: Dict[str, str] = {}
 request_failed_tokens: Dict[str, set] = {}
 
 # --- New Global State for reCAPTCHA ---
-RECAPTCHA_TOKENS: Dict[str, str] = {}
-# Initialize expiry far in the past to force a refresh on startup
-RECAPTCHA_EXPIRIES: Dict[str, datetime] = {}
+RECAPTCHA_TOKEN_POOLS: Dict[str, Deque[str]] = {}
+# Track expiry for each pool (reCAPTCHA v3 tokens are short-lived).
+RECAPTCHA_POOL_EXPIRIES: Dict[str, datetime] = {}
+# Lazily-created per-auth-token locks (avoid binding to the wrong loop at import time).
+RECAPTCHA_POOL_LOCKS: Dict[str, asyncio.Lock] = {}
 # --------------------------------------
 
 # --- Helper Functions ---
@@ -1589,7 +1765,10 @@ def get_config():
         config.setdefault("provisional_user_id", "")
         config.setdefault("user_agent", "")
         config.setdefault("browser_cookies", {})
-        config.setdefault("recaptcha_headless", False)
+        config.setdefault("recaptcha_headless", True)
+        config.setdefault("recaptcha_headful", False)
+        # reCAPTCHA tokens are single-use and can be finicky; keep the default conservative.
+        config.setdefault("recaptcha_token_pool_size", 1)
         config.setdefault("api_keys", [])
         config.setdefault("usage_stats", {})
 
@@ -3293,7 +3472,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
         # Acquire a fresh reCAPTCHA token aligned to the chosen auth token.
         # (Retry PUT requests currently send an empty payload.)
         if http_method != "PUT":
-            recaptcha_token = await refresh_recaptcha_token(auth_token=current_token, force_new=True)
+            recaptcha_token = await refresh_recaptcha_token(auth_token=current_token, force_new=False)
             if not recaptcha_token:
                 debug_print("❌ Cannot proceed, failed to get reCAPTCHA token.")
                 raise HTTPException(
