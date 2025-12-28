@@ -6,6 +6,7 @@ import time
 import secrets
 import base64
 import mimetypes
+import sys
 from collections import defaultdict
 from typing import Optional, Dict, List
 from datetime import datetime, timezone, timedelta
@@ -17,6 +18,14 @@ from starlette.responses import HTMLResponse, RedirectResponse, StreamingRespons
 from fastapi.security import APIKeyHeader
 
 import httpx
+
+# Best-effort: avoid UnicodeEncodeError on non-UTF8 Windows consoles (e.g., GBK).
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        if hasattr(_stream, "reconfigure"):
+            _stream.reconfigure(errors="replace")
+    except Exception:
+        pass
 
 # ============================================================
 # CONFIGURATION
@@ -189,10 +198,24 @@ def log_http_status(status_code: int, context: str = ""):
         debug_print(f"{emoji} HTTP {status_code}: {message}")
 # ============================================================
 
+def safe_print(*args, **kwargs):
+    """Print while tolerating non-UTF8 console encodings (e.g., GBK on Windows)."""
+    try:
+        print(*args, **kwargs)
+    except UnicodeEncodeError:
+        encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+        safe_args = []
+        for arg in args:
+            if isinstance(arg, str):
+                safe_args.append(arg.encode(encoding, errors="replace").decode(encoding, errors="replace"))
+            else:
+                safe_args.append(arg)
+        print(*safe_args, **kwargs)
+
 def debug_print(*args, **kwargs):
     """Print debug messages only if DEBUG is True"""
     if DEBUG:
-        print(*args, **kwargs)
+        safe_print(*args, **kwargs)
 
 # --- New reCAPTCHA Functions ---
 
@@ -362,14 +385,14 @@ async def get_recaptcha_v3_token() -> Optional[str]:
         debug_print(f"❌ Unexpected error: {e}")
         return None
 
-async def refresh_recaptcha_token():
+async def refresh_recaptcha_token(force: bool = False):
     """Checks if the global reCAPTCHA token is expired and refreshes it if necessary."""
     global RECAPTCHA_TOKEN, RECAPTCHA_EXPIRY
     
     current_time = datetime.now(timezone.utc)
     # Check if token is expired (set a refresh margin of 10 seconds)
-    if RECAPTCHA_TOKEN is None or current_time > RECAPTCHA_EXPIRY - timedelta(seconds=10):
-        debug_print("🔄 Recaptcha token expired or missing. Refreshing...")
+    if force or RECAPTCHA_TOKEN is None or current_time > RECAPTCHA_EXPIRY - timedelta(seconds=10):
+        debug_print(f"🔄 Recaptcha token {'forced refresh' if force else 'expired or missing'}. Refreshing...")
         new_token = await get_recaptcha_v3_token()
         if new_token:
             RECAPTCHA_TOKEN = new_token
@@ -2105,7 +2128,8 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
         api_key_str = api_key["key"]
 
         # --- NEW: Get reCAPTCHA v3 Token for Payload ---
-        recaptcha_token = await refresh_recaptcha_token()
+        # Always force-refresh per submission to avoid re-using a potentially single-use token.
+        recaptcha_token = await refresh_recaptcha_token(force=True)
         if not recaptcha_token:
             debug_print("❌ Cannot proceed, failed to get reCAPTCHA token.")
             raise HTTPException(
@@ -2155,6 +2179,10 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
             debug_print(f"🔁 Using RETRY endpoint")
             # Use LMArena's retry endpoint
             # Format: PUT /nextjs-api/stream/retry-evaluation-session-message/{sessionId}/messages/{messageId}
+            # Ensure IDs are defined for downstream session updates.
+            session_id = session["conversation_id"]
+            user_msg_id = stored_messages[-1].get("id") if stored_messages and stored_messages[-1].get("role") == "user" else str(uuid7())
+            model_msg_id = retry_message_id
             payload = {}
             url = f"https://lmarena.ai/nextjs-api/stream/retry-evaluation-session-message/{session['conversation_id']}/messages/{retry_message_id}"
             debug_print(f"📤 Target URL: {url}")
@@ -2258,6 +2286,9 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                     current_token = get_next_auth_token(exclude_tokens=failed_tokens)
                                     headers = get_request_headers_with_token(current_token)
                                     debug_print(f"🔄 Retrying with next token: {current_token[:20]}...")
+                                    new_token = await refresh_recaptcha_token(force=True)
+                                    if new_token:
+                                        payload["recaptchaV3Token"] = new_token
                                     await asyncio.sleep(1)  # Brief delay
                                     continue
                                 except HTTPException as e:
@@ -2278,20 +2309,38 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                     current_token = get_next_auth_token(exclude_tokens=failed_tokens)
                                     headers = get_request_headers_with_token(current_token)
                                     debug_print(f"🔄 Retrying with next token: {current_token[:20]}...")
+                                    new_token = await refresh_recaptcha_token(force=True)
+                                    if new_token:
+                                        payload["recaptchaV3Token"] = new_token
                                     await asyncio.sleep(1)  # Brief delay
                                     continue
                                 except HTTPException as e:
                                     debug_print(f"❌ No more tokens available: {e.detail}")
                                     break
+
+                        # Check for Recaptcha validation failure
+                        elif response.status_code == HTTPStatus.BAD_REQUEST and "recaptcha" in response.text.lower():
+                            debug_print(f"⚠️  Recaptcha validation failed (Attempt {attempt + 1}/{max_retries}). Refreshing token...")
+                            new_token = await refresh_recaptcha_token(force=True)
+                            if new_token:
+                                payload["recaptchaV3Token"] = new_token
+                                debug_print(f"🔄 Retrying with new recaptcha token...")
+                                await asyncio.sleep(1)
+                                continue
                         
                         # If we get here, return the response (success or non-retryable error)
                         response.raise_for_status()
                         return response
                         
                 except httpx.HTTPStatusError as e:
-                    # Only handle 429 and 401, let other errors through
-                    if e.response.status_code not in [429, 401]:
+                    # Only handle 429, 401, and 400 (Recaptcha), let other errors through
+                    if e.response.status_code not in [429, 401, 400]:
                         raise
+                    
+                    # For 400, only retry if it's recaptcha related (handled above, but just in case)
+                    if e.response.status_code == 400 and "recaptcha" not in e.response.text.lower():
+                        raise
+
                     # If last attempt, raise the error
                     if attempt == max_retries - 1:
                         raise
@@ -2332,6 +2381,9 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                         current_token = get_next_auth_token()
                                         headers = get_request_headers_with_token(current_token)
                                         debug_print(f"🔄 Retrying stream with next token: {current_token[:20]}...")
+                                        new_token = await refresh_recaptcha_token(force=True)
+                                        if new_token:
+                                            payload["recaptchaV3Token"] = new_token
                                         await asyncio.sleep(1)
                                         continue
                                 
@@ -2343,12 +2395,27 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                             current_token = get_next_auth_token()
                                             headers = get_request_headers_with_token(current_token)
                                             debug_print(f"🔄 Retrying stream with next token: {current_token[:20]}...")
+                                            new_token = await refresh_recaptcha_token(force=True)
+                                            if new_token:
+                                                payload["recaptchaV3Token"] = new_token
                                             await asyncio.sleep(1)
                                             continue
                                         except HTTPException:
                                             debug_print(f"❌ No more tokens available")
                                             break
                                 
+                                # Check for Recaptcha validation failure
+                                elif response.status_code == HTTPStatus.BAD_REQUEST and "recaptcha" in (await response.aread()).decode('utf-8', errors='ignore').lower():
+                                    # Note: we consumed the response body to check for error, so we can't use it for streaming if it was success
+                                    # But here it is failure (400).
+                                    debug_print(f"⚠️  Recaptcha validation failed (Stream). Refreshing token...")
+                                    new_token = await refresh_recaptcha_token(force=True)
+                                    if new_token:
+                                        payload["recaptchaV3Token"] = new_token
+                                        debug_print(f"🔄 Retrying stream with new recaptcha token...")
+                                        await asyncio.sleep(1)
+                                        continue
+
                                 log_http_status(response.status_code, "Stream Connection")
                                 response.raise_for_status()
                                 
@@ -2521,14 +2588,27 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                 }
                                 debug_print(f"💾 Saved new session for conversation {conversation_id}")
                             else:
-                                # Append new messages to history
-                                chat_sessions[api_key_str][conversation_id]["messages"].append(
-                                    {"id": user_msg_id, "role": "user", "content": prompt}
-                                )
-                                chat_sessions[api_key_str][conversation_id]["messages"].append(
-                                    assistant_message
-                                )
-                                debug_print(f"💾 Updated existing session for conversation {conversation_id}")
+                                if is_retry and retry_message_id:
+                                    # Update the retried assistant message in-place (avoid duplicating history).
+                                    updated = False
+                                    for msg in chat_sessions[api_key_str][conversation_id]["messages"]:
+                                        if msg.get("id") == model_msg_id and msg.get("role") == "assistant":
+                                            msg.clear()
+                                            msg.update(assistant_message)
+                                            updated = True
+                                            break
+                                    if not updated:
+                                        chat_sessions[api_key_str][conversation_id]["messages"].append(assistant_message)
+                                    debug_print(f"💾 Updated retried message for conversation {conversation_id}")
+                                else:
+                                    # Append new messages to history
+                                    chat_sessions[api_key_str][conversation_id]["messages"].append(
+                                        {"id": user_msg_id, "role": "user", "content": prompt}
+                                    )
+                                    chat_sessions[api_key_str][conversation_id]["messages"].append(
+                                        assistant_message
+                                    )
+                                    debug_print(f"💾 Updated existing session for conversation {conversation_id}")
                             
                             yield "data: [DONE]\n\n"
                             debug_print(f"✅ Stream completed - {len(response_text)} chars sent")
@@ -2764,14 +2844,27 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                 }
                 debug_print(f"💾 Saved new session for conversation {conversation_id}")
             else:
-                # Append new messages to history
-                chat_sessions[api_key_str][conversation_id]["messages"].append(
-                    {"id": user_msg_id, "role": "user", "content": prompt}
-                )
-                chat_sessions[api_key_str][conversation_id]["messages"].append(
-                    assistant_message
-                )
-                debug_print(f"💾 Updated existing session for conversation {conversation_id}")
+                if is_retry and retry_message_id:
+                    # Update the retried assistant message in-place (avoid duplicating history).
+                    updated = False
+                    for msg in chat_sessions[api_key_str][conversation_id]["messages"]:
+                        if msg.get("id") == model_msg_id and msg.get("role") == "assistant":
+                            msg.clear()
+                            msg.update(assistant_message)
+                            updated = True
+                            break
+                    if not updated:
+                        chat_sessions[api_key_str][conversation_id]["messages"].append(assistant_message)
+                    debug_print(f"💾 Updated retry message for conversation {conversation_id}")
+                else:
+                    # Append new messages to history
+                    chat_sessions[api_key_str][conversation_id]["messages"].append(
+                        {"id": user_msg_id, "role": "user", "content": prompt}
+                    )
+                    chat_sessions[api_key_str][conversation_id]["messages"].append(
+                        assistant_message
+                    )
+                    debug_print(f"💾 Updated existing session for conversation {conversation_id}")
 
             # Build message object with reasoning and citations if present
             message_obj = {
