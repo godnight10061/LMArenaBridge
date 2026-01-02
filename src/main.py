@@ -189,6 +189,19 @@ def log_http_status(status_code: int, context: str = ""):
         debug_print(f"{emoji} HTTP {status_code}: {message}")
 # ============================================================
 
+def get_rate_limit_sleep_seconds(retry_after: Optional[str], attempt: int) -> int:
+    """Compute backoff seconds for upstream 429 responses."""
+    if isinstance(retry_after, str):
+        try:
+            value = int(float(retry_after.strip()))
+        except Exception:
+            value = 0
+        if value > 0:
+            return min(value, 60)
+
+    attempt = max(0, int(attempt))
+    return int(min(5 * (2**attempt), 60))
+
 def debug_print(*args, **kwargs):
     """Print debug messages only if DEBUG is True"""
     if DEBUG:
@@ -2248,9 +2261,9 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                         # Check for retry-able errors
                         if response.status_code == HTTPStatus.TOO_MANY_REQUESTS:
                             debug_print(f"⏱️  Attempt {attempt + 1}/{max_retries} - Rate limit with token {current_token[:20]}...")
-                            # Add current token to failed set
-                            failed_tokens.add(current_token)
-                            debug_print(f"📝 Failed tokens so far: {len(failed_tokens)}")
+                            retry_after = response.headers.get("Retry-After")
+                            sleep_seconds = get_rate_limit_sleep_seconds(retry_after, attempt)
+                            debug_print(f"  Retry-After header: {retry_after!r}")
                             
                             if attempt < max_retries - 1:
                                 try:
@@ -2258,7 +2271,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                     current_token = get_next_auth_token(exclude_tokens=failed_tokens)
                                     headers = get_request_headers_with_token(current_token)
                                     debug_print(f"🔄 Retrying with next token: {current_token[:20]}...")
-                                    await asyncio.sleep(1)  # Brief delay
+                                    await asyncio.sleep(sleep_seconds)
                                     continue
                                 except HTTPException as e:
                                     debug_print(f"❌ No more tokens available: {e.detail}")
@@ -2327,12 +2340,16 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                 
                                 # Check for retry-able errors before processing stream
                                 if response.status_code == HTTPStatus.TOO_MANY_REQUESTS:
-                                    debug_print(f"⏱️  Stream attempt {attempt + 1}/{max_retries}")
+                                    retry_after = response.headers.get("Retry-After")
+                                    sleep_seconds = get_rate_limit_sleep_seconds(retry_after, attempt)
+                                    debug_print(
+                                        f"⏱️  Stream attempt {attempt + 1}/{max_retries} - Upstream rate limited. Waiting {sleep_seconds}s before retrying..."
+                                    )
                                     if attempt < max_retries - 1:
                                         current_token = get_next_auth_token()
                                         headers = get_request_headers_with_token(current_token)
                                         debug_print(f"🔄 Retrying stream with next token: {current_token[:20]}...")
-                                        await asyncio.sleep(1)
+                                        await asyncio.sleep(sleep_seconds)
                                         continue
                                 
                                 elif response.status_code == HTTPStatus.UNAUTHORIZED:
