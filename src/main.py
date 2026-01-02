@@ -231,6 +231,31 @@ async def click_turnstile(page):
         debug_print(f"  ⚠️ Error clicking turnstile: {e}")
         return False
 
+def is_execution_context_destroyed_error(exc: BaseException) -> bool:
+    message = str(exc)
+    return "Execution context was destroyed" in message
+
+
+async def safe_page_evaluate(page, script: str, retries: int = 3):
+    retries = max(1, min(int(retries), 5))
+    last_exc: Exception | None = None
+    for attempt in range(retries):
+        try:
+            return await page.evaluate(script)
+        except Exception as e:
+            last_exc = e
+            if is_execution_context_destroyed_error(e) and attempt < retries - 1:
+                try:
+                    await page.wait_for_load_state("domcontentloaded")
+                except Exception:
+                    pass
+                await asyncio.sleep(0.25)
+                continue
+            raise
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("Page.evaluate failed")
+
 async def get_recaptcha_v3_token() -> Optional[str]:
     """
     Retrieves reCAPTCHA v3 token using a 'Side-Channel' approach.
@@ -293,18 +318,24 @@ async def get_recaptcha_v3_token() -> Optional[str]:
 
             # 2. Check for Library
             debug_print("  ⏳ Checking for library...")
-            lib_ready = await page.evaluate("mw:() => !!(window.grecaptcha && window.grecaptcha.enterprise)")
+            lib_ready = await safe_page_evaluate(
+                page,
+                "mw:() => !!(window.grecaptcha && window.grecaptcha.enterprise)",
+            )
             if not lib_ready:
                 debug_print("  ⚠️ Library not found immediately. Waiting...")
                 await asyncio.sleep(3)
-                lib_ready = await page.evaluate("mw:() => !!(window.grecaptcha && window.grecaptcha.enterprise)")
+                lib_ready = await safe_page_evaluate(
+                    page,
+                    "mw:() => !!(window.grecaptcha && window.grecaptcha.enterprise)",
+                )
                 if not lib_ready:
                     debug_print("❌ reCAPTCHA library never loaded.")
                     return None
 
             # 3. SETUP: Initialize our global result variable
             # We use a unique name to avoid conflicts
-            await page.evaluate("mw:window.__token_result = 'PENDING'")
+            await safe_page_evaluate(page, "mw:window.__token_result = 'PENDING'")
 
             # 4. TRIGGER: Execute reCAPTCHA and write to the variable
             # We do NOT await the result here. We just fire the process.
@@ -323,7 +354,7 @@ async def get_recaptcha_v3_token() -> Optional[str]:
                 }}
             }}"""
             
-            await page.evaluate(trigger_script)
+            await safe_page_evaluate(page, trigger_script)
 
             # 5. POLL: Watch the variable for changes
             debug_print("  👀 Polling for result...")
@@ -331,7 +362,7 @@ async def get_recaptcha_v3_token() -> Optional[str]:
             
             for i in range(20): # Wait up to 20 seconds
                 # Read the global variable
-                result = await page.evaluate("mw:window.__token_result")
+                result = await safe_page_evaluate(page, "mw:window.__token_result", retries=2)
                 
                 if result != 'PENDING':
                     if result and result.startswith('ERROR'):
