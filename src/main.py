@@ -5,8 +5,10 @@ import uuid
 import time
 import secrets
 import base64
+import random
 import mimetypes
 import os
+import socket
 import shutil
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
@@ -16,7 +18,6 @@ from datetime import datetime, timezone, timedelta
 import sys
 
 import uvicorn
-from camoufox.async_api import AsyncCamoufox
 from fastapi import FastAPI, HTTPException, Depends, status, Form, Request, Response
 from starlette.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.security import APIKeyHeader
@@ -30,6 +31,73 @@ try:
     from playwright.async_api import async_playwright
 except ImportError:  # Optional; used for Chrome-based reCAPTCHA flow.
     async_playwright = None
+
+# Camoufox is heavy and may download model definition files on import. Keep it
+# lazy so unit tests can import this module without side effects.
+_ASYNC_CAMOUFOX_IMPORT_FAILED = False
+_ASYNC_CAMOUFOX = None
+
+
+def get_async_camoufox():
+    """Return `AsyncCamoufox` class if available, otherwise `None`."""
+    global _ASYNC_CAMOUFOX, _ASYNC_CAMOUFOX_IMPORT_FAILED
+    if _ASYNC_CAMOUFOX is not None:
+        return _ASYNC_CAMOUFOX
+    if _ASYNC_CAMOUFOX_IMPORT_FAILED:
+        return None
+    try:
+        from camoufox.async_api import AsyncCamoufox as _AsyncCamoufox
+    except Exception:
+        _ASYNC_CAMOUFOX_IMPORT_FAILED = True
+        return None
+    _ASYNC_CAMOUFOX = _AsyncCamoufox
+    return _ASYNC_CAMOUFOX
+
+
+def safe_print(*args, **kwargs):
+    """Print without crashing on consoles that can't encode unicode (e.g. GBK)."""
+    try:
+        print(*args, **kwargs)
+    except UnicodeEncodeError:
+        encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+        end = kwargs.get("end", "\n")
+        sep = kwargs.get("sep", " ")
+        message = sep.join(str(a) for a in args) + end
+        try:
+            sys.stdout.buffer.write(message.encode(encoding, errors="replace"))
+        except Exception:
+            safe = message.encode("ascii", errors="backslashreplace").decode("ascii")
+            sys.stdout.write(safe)
+
+
+def pick_available_port(host: str, start_port: int, max_tries: int = 20) -> int:
+    """Pick the first available TCP port starting at `start_port`."""
+    if max_tries < 1:
+        raise ValueError("max_tries must be >= 1")
+    if start_port < 0 or start_port > 65535:
+        raise ValueError("start_port must be between 0 and 65535")
+
+    for offset in range(max_tries):
+        candidate = start_port + offset
+        if candidate > 65535:
+            break
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            sock.bind((host, candidate))
+            if candidate == 0:
+                return int(sock.getsockname()[1])
+            return candidate
+        except OSError:
+            continue
+        finally:
+            sock.close()
+    raise OSError(f"No available port found starting at {start_port} (tried {max_tries} ports)")
+
+
+try:
+    from .userscript_proxy import ProxyJobQueue
+except ImportError:  # Allows `python src/main.py` when `src/` is on sys.path.
+    from userscript_proxy import ProxyJobQueue
 
 # ============================================================
 # CONFIGURATION
@@ -222,6 +290,11 @@ def get_rate_limit_sleep_seconds(retry_after_header: Optional[str], attempt: int
     if retry_after is not None:
         return max(1, min(retry_after, 3600))
     return max(1, min(2 ** (attempt + 1), 60))
+
+
+def json_dumps_browser(payload) -> str:
+    """Match browser `JSON.stringify` formatting (no spaces)."""
+    return json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
 # ============================================================
 
 def debug_print(*args, **kwargs):
@@ -247,6 +320,7 @@ def debug_print(*args, **kwargs):
 # Updated constants from gpt4free/g4f/Provider/needs_auth/LMArena.py
 RECAPTCHA_SITEKEY = "6Led_uYrAAAAAKjxDIF58fgFtX3t8loNAK85bW9I"
 RECAPTCHA_ACTION = "chat_submit"
+RECAPTCHA_V2_SITEKEY = "6Ld7ePYrAAAAAB34ovoFoDau1fqCJ6IyOjFEQaMn"
 TURNSTILE_SITEKEY = "0x4AAAAAAA65vWDmG-O_lPtT"
 TURNSTILE_SCRIPT_URL = "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit"
 
@@ -255,7 +329,55 @@ def get_recaptcha_headless(config: dict) -> bool:
     Default to headless (no visible browser windows). Set `recaptcha_headful=true`
     in `config.json` to temporarily show the browser for debugging.
     """
-    return not bool(config.get("recaptcha_headful", False))
+    if bool(config.get("recaptcha_headful", False)):
+        return False
+    if "recaptcha_headless" in config:
+        return bool(config.get("recaptcha_headless", True))
+    return True
+
+
+def sanitize_chromium_user_agent(user_agent: str) -> str:
+    ua = (user_agent or "").strip()
+    if not ua:
+        return ua
+    ua = ua.replace("HeadlessChrome/", "Chrome/")
+    ua = ua.replace("Headless", "")
+    ua = re.sub(r"\s{2,}", " ", ua).strip()
+    return ua
+
+
+_DEFAULT_CHROMIUM_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
+)
+
+
+def get_chromium_user_agent(config: dict) -> str:
+    chrome_ua = config.get("chrome_user_agent")
+    if isinstance(chrome_ua, str) and chrome_ua.strip():
+        return sanitize_chromium_user_agent(chrome_ua)
+
+    ua = config.get("user_agent")
+    if isinstance(ua, str) and ua.strip():
+        ua = sanitize_chromium_user_agent(ua)
+        if "Chrome/" in ua or "Chromium/" in ua:
+            return ua
+
+    return _DEFAULT_CHROMIUM_USER_AGENT
+
+
+async def get_chromium_user_agent_for_playwright(config: Optional[dict] = None) -> str:
+    cfg = config if isinstance(config, dict) else get_config()
+    return get_chromium_user_agent(cfg)
+
+
+def get_browser_profile_dir(profile_name: str) -> Path:
+    config = get_config()
+    override = config.get("browser_profile_dir")
+    if isinstance(override, str) and override.strip():
+        return Path(override).expanduser().resolve() / profile_name
+    return Path(CONFIG_FILE).with_name(profile_name)
 
 def find_chrome_executable(config: dict) -> Optional[str]:
     configured = (
@@ -264,6 +386,10 @@ def find_chrome_executable(config: dict) -> Optional[str]:
     )
     if configured and Path(configured).exists():
         return configured
+
+    # Avoid launching a real browser during unit tests unless explicitly configured.
+    if os.environ.get("PYTEST_CURRENT_TEST") and not os.environ.get("RUN_LMARENA_INTEGRATION"):
+        return None
 
     candidates = [
         Path(os.environ.get("PROGRAMFILES", r"C:\Program Files"))
@@ -515,8 +641,10 @@ async def get_recaptcha_v3_tokens_with_chrome(
     if not chrome_path:
         return None
 
-    profile_dir = Path(CONFIG_FILE).with_name("chrome_grecaptcha")
-    debug_print("🔐 Starting reCAPTCHA v3 token retrieval (Chrome)...")
+        profile_dir = Path(CONFIG_FILE).with_name("chrome_grecaptcha")
+        user_agent = await get_chromium_user_agent_for_playwright(config)
+        await asyncio.sleep(random.uniform(1.0, 3.0))
+        debug_print("🔐 Starting reCAPTCHA v3 token retrieval (Chrome)...")
     if count < 1:
         return None
 
@@ -525,6 +653,7 @@ async def get_recaptcha_v3_tokens_with_chrome(
             user_data_dir=str(profile_dir),
             executable_path=chrome_path,
             headless=headless,
+            user_agent=user_agent or None,
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--no-first-run",
@@ -689,27 +818,34 @@ async def fetch_lmarena_stream_via_chrome(
         return None
 
     headless = get_recaptcha_headless(config)
-    profile_dir = Path(CONFIG_FILE).with_name("chrome_grecaptcha")
+    profile_dir = get_browser_profile_dir("chrome_grecaptcha")
+    user_agent = await get_chromium_user_agent_for_playwright(config)
 
     cf_clearance = (config.get("cf_clearance") or "").strip()
     cf_bm = (config.get("cf_bm") or "").strip()
     cfuvid = (config.get("cfuvid") or "").strip()
     provisional_user_id = (config.get("provisional_user_id") or "").strip()
     cookie_store = config.get("browser_cookies", {})
+    cookie_map: dict[str, str] = {}
     if isinstance(cookie_store, dict):
-        cookie_cf_clearance = str(cookie_store.get("cf_clearance", "")).strip()
+        for name, value in cookie_store.items():
+            if not name or not value:
+                continue
+            cookie_map[str(name)] = str(value)
+
+        cookie_cf_clearance = str(cookie_map.get("cf_clearance", "")).strip()
         if cookie_cf_clearance:
             cf_clearance = cookie_cf_clearance
 
-        cookie_cf_bm = str(cookie_store.get("__cf_bm", "")).strip()
+        cookie_cf_bm = str(cookie_map.get("__cf_bm", "")).strip()
         if cookie_cf_bm:
             cf_bm = cookie_cf_bm
 
-        cookie_cfuvid = str(cookie_store.get("_cfuvid", "")).strip()
+        cookie_cfuvid = str(cookie_map.get("_cfuvid", "")).strip()
         if cookie_cfuvid:
             cfuvid = cookie_cfuvid
 
-        cookie_provisional = str(cookie_store.get("provisional_user_id", "")).strip()
+        cookie_provisional = str(cookie_map.get("provisional_user_id", "")).strip()
         if cookie_provisional:
             provisional_user_id = cookie_provisional
 
@@ -726,6 +862,7 @@ async def fetch_lmarena_stream_via_chrome(
             user_data_dir=str(profile_dir),
             executable_path=chrome_path,
             headless=headless,
+            user_agent=user_agent or None,
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--no-first-run",
@@ -737,28 +874,20 @@ async def fetch_lmarena_stream_via_chrome(
                 await context.clear_cookies()
             except Exception:
                 pass
-            cookies = []
             if cf_clearance:
-                cookies.append(
-                    {"name": "cf_clearance", "value": cf_clearance, "domain": ".lmarena.ai", "path": "/"}
-                )
+                cookie_map["cf_clearance"] = cf_clearance
             if cf_bm:
-                cookies.append(
-                    {"name": "__cf_bm", "value": cf_bm, "domain": ".lmarena.ai", "path": "/"}
-                )
+                cookie_map["__cf_bm"] = cf_bm
             if cfuvid:
-                cookies.append(
-                    {"name": "_cfuvid", "value": cfuvid, "domain": ".lmarena.ai", "path": "/"}
-                )
+                cookie_map["_cfuvid"] = cfuvid
             if provisional_user_id:
-                cookies.append(
-                    {
-                        "name": "provisional_user_id",
-                        "value": provisional_user_id,
-                        "domain": ".lmarena.ai",
-                        "path": "/",
-                    }
-                )
+                cookie_map["provisional_user_id"] = provisional_user_id
+
+            cookies = [
+                {"name": name, "value": value, "domain": ".lmarena.ai", "path": "/"}
+                for name, value in cookie_map.items()
+                if name and value
+            ]
             cookies.extend(build_playwright_arena_auth_cookies(auth_token))
             await context.add_cookies(cookies)
 
@@ -783,7 +912,12 @@ async def fetch_lmarena_stream_via_chrome(
                       credentials: 'include',
                       signal: controller.signal,
                     });
-                    const headers = Object.fromEntries(res.headers.entries());
+	                    const headers = {};
+	                    try {
+	                      if (res.headers && typeof res.headers.forEach === 'function') {
+	                        res.headers.forEach((value, key) => { headers[key] = value; });
+	                      }
+	                    } catch (e) {}
                     let text = '';
                     if (res.body) {
                       const reader = res.body.getReader();
@@ -822,7 +956,7 @@ async def fetch_lmarena_stream_via_chrome(
                     for c in latest_cookies
                     if c.get("name") and c.get("value")
                 }
-                if latest_user_agent:
+                if isinstance(latest_user_agent, str) and latest_user_agent:
                     config_update["user_agent"] = latest_user_agent
                 save_config(config_update)
             except Exception:
@@ -835,6 +969,427 @@ async def fetch_lmarena_stream_via_chrome(
             )
         finally:
             await context.close()
+
+
+async def fetch_lmarena_stream_via_camoufox(
+    http_method: str,
+    url: str,
+    payload: dict,
+    auth_token: str,
+    timeout_seconds: int = 120,
+    generate_token: bool = False,
+) -> Optional[BrowserFetchStreamResponse]:
+    AsyncCamoufox = get_async_camoufox()
+    if AsyncCamoufox is None:
+        return None
+
+    config = get_config()
+    recaptcha_headless = get_recaptcha_headless(config)
+    profile_dir = Path(CONFIG_FILE).with_name("camoufox_fetch")
+
+    cf_clearance = (config.get("cf_clearance") or "").strip()
+    cf_bm = (config.get("cf_bm") or "").strip()
+    cfuvid = (config.get("cfuvid") or "").strip()
+    provisional_user_id = (config.get("provisional_user_id") or "").strip()
+    cookie_store = config.get("browser_cookies", {})
+    cookie_map: dict[str, str] = {}
+    if isinstance(cookie_store, dict):
+        for name, value in cookie_store.items():
+            if not name or not value:
+                continue
+            cookie_map[str(name)] = str(value)
+
+        cookie_cf_clearance = str(cookie_map.get("cf_clearance", "")).strip()
+        if cookie_cf_clearance:
+            cf_clearance = cookie_cf_clearance
+        cookie_cf_bm = str(cookie_map.get("__cf_bm", "")).strip()
+        if cookie_cf_bm:
+            cf_bm = cookie_cf_bm
+        cookie_cfuvid = str(cookie_map.get("_cfuvid", "")).strip()
+        if cookie_cfuvid:
+            cfuvid = cookie_cfuvid
+        cookie_provisional = str(cookie_map.get("provisional_user_id", "")).strip()
+        if cookie_provisional:
+            provisional_user_id = cookie_provisional
+
+    fetch_url = url
+    if fetch_url.startswith("https://lmarena.ai"):
+        fetch_url = fetch_url[len("https://lmarena.ai") :]
+    if not fetch_url.startswith("/"):
+        fetch_url = "/" + fetch_url
+
+    should_generate_token = bool(generate_token)
+    if isinstance(payload, dict):
+        existing_token = str(payload.get("recaptchaV3Token") or "").strip()
+        if not existing_token:
+            should_generate_token = True
+
+    async with AsyncCamoufox(
+        headless=recaptcha_headless,
+        humanize=True,
+        persistent_context=True,
+        user_data_dir=str(profile_dir),
+    ) as context:
+        try:
+            try:
+                await context.clear_cookies()
+            except Exception:
+                pass
+            
+            if cf_clearance:
+                cookie_map["cf_clearance"] = cf_clearance
+            if cf_bm:
+                cookie_map["__cf_bm"] = cf_bm
+            if cfuvid:
+                cookie_map["_cfuvid"] = cfuvid
+            if provisional_user_id:
+                cookie_map["provisional_user_id"] = provisional_user_id
+
+            cookies = [
+                {"name": name, "value": value, "domain": ".lmarena.ai", "path": "/"}
+                for name, value in cookie_map.items()
+                if name and value
+            ]
+            cookies.extend(build_playwright_arena_auth_cookies(auth_token))
+            try:
+                await context.add_cookies(cookies)
+            except Exception:
+                pass
+
+            page = await context.new_page()
+            await page.goto("https://lmarena.ai/?mode=direct", wait_until="domcontentloaded")
+
+            debug_print("  🛡  Waiting for Cloudflare challenge to clear (Camoufox fetch)...")
+            try:
+                await wait_for_cloudflare_challenge_to_clear(page, timeout_seconds=120)
+            except Exception as e:
+                debug_print(f"  ⚠️ Error handling Cloudflare challenge (Camoufox fetch): {e}")
+
+            # Persist cookies/UA
+            try:
+                latest_cookies = await page.context.cookies()
+                latest_user_agent = await page.evaluate("() => navigator.userAgent")
+                config_update = get_config()
+                config_update["browser_cookies"] = {
+                    c.get("name"): c.get("value")
+                    for c in latest_cookies
+                    if c.get("name") and c.get("value")
+                }
+                if isinstance(latest_user_agent, str) and latest_user_agent:
+                    config_update["user_agent"] = latest_user_agent
+                save_config(config_update)
+            except Exception:
+                pass
+
+            # Optional: Generate a fresh token in the same session
+            if should_generate_token:
+                debug_print("  🔄 Generating fresh reCAPTCHA token in background (Camoufox)...")
+                try:
+                    await page.wait_for_function(
+                        "window.grecaptcha && ("
+                        "(window.grecaptcha.enterprise && typeof window.grecaptcha.enterprise.execute === 'function') || "
+                        "typeof window.grecaptcha.execute === 'function'"
+                        ")",
+                        timeout=60000,
+                    )
+                    
+                    token = await page.evaluate(
+                        """({sitekey, action}) => new Promise((resolve, reject) => {
+                          const g = (window.grecaptcha?.enterprise && typeof window.grecaptcha.enterprise.execute === 'function')
+                            ? window.grecaptcha.enterprise
+                            : window.grecaptcha;
+                          if (!g || typeof g.execute !== 'function') return reject('NO_GRECAPTCHA');
+                          try {
+                            g.ready(() => {
+                              g.execute(sitekey, { action }).then(resolve).catch((err) => reject(String(err)));
+                            });
+                          } catch (e) { reject(String(e)); }
+                        })""",
+                        {"sitekey": RECAPTCHA_SITEKEY, "action": RECAPTCHA_ACTION},
+                    )
+                    
+                    if isinstance(token, str) and token:
+                        debug_print(f"  ✅ Fresh token captured! ({len(token)} chars)")
+                        if isinstance(payload, dict):
+                            payload["recaptchaV3Token"] = token
+                        # Add to pool (assuming standard pool logic)
+                        cache_key = auth_token or "__default__"
+                        lock = _get_recaptcha_pool_lock(cache_key)
+                        async with lock:
+                             pool = RECAPTCHA_TOKEN_POOLS.get(cache_key)
+                             if pool is None:
+                                 pool = deque()
+                                 RECAPTCHA_TOKEN_POOLS[cache_key] = pool
+                             pool.append(token)
+                             # Extend expiry
+                             RECAPTCHA_POOL_EXPIRIES[cache_key] = datetime.now(timezone.utc) + timedelta(seconds=120)
+                except Exception as e:
+                    debug_print(f"  ⚠️ Failed to generate fresh token: {e}")
+
+            body = json.dumps(payload) if payload is not None else ""
+            result = await page.evaluate(
+                """async ({url, method, body, timeoutMs}) => {
+                  const controller = new AbortController();
+                  const timer = setTimeout(() => controller.abort('timeout'), timeoutMs);
+                  try {
+                    const res = await fetch(url, {
+                      method,
+                      headers: { 'content-type': 'text/plain;charset=UTF-8' },
+                      body,
+                      credentials: 'include',
+                      signal: controller.signal,
+                    });
+	                    const headers = {};
+	                    try {
+	                      if (res.headers && typeof res.headers.forEach === 'function') {
+	                        res.headers.forEach((value, key) => { headers[key] = value; });
+	                      }
+	                    } catch (e) {}
+                    let text = '';
+                    if (res.body) {
+                      const reader = res.body.getReader();
+                      const decoder = new TextDecoder();
+                      while (true) {
+                        const { value, done } = await reader.read();
+                        if (done) break;
+                        if (value) text += decoder.decode(value, { stream: true });
+                      }
+                      text += decoder.decode();
+                    } else {
+                      text = await res.text();
+                    }
+                    return { status: res.status, headers, text };
+                  } catch (e) {
+                    return { status: 0, headers: {}, text: 'FETCH_ERROR:' + String(e) };
+                  } finally {
+                    clearTimeout(timer);
+                  }
+                }""",
+                {
+                    "url": fetch_url,
+                    "method": http_method,
+                    "body": body,
+                    "timeoutMs": int(timeout_seconds * 1000),
+                },
+            )
+
+            return BrowserFetchStreamResponse(
+                int(result.get("status") or 0),
+                result.get("headers") if isinstance(result, dict) else {},
+                result.get("text") if isinstance(result, dict) else "",
+            )
+        finally:
+            pass
+            # Context closes automatically
+
+
+
+async def refresh_auth_token_via_browser(auth_token: str, timeout_seconds: int = 120) -> Optional[str]:
+    # Placeholder for a browser-based token refresh flow. Tests patch this function.
+    return None
+
+
+async def get_recaptcha_v2_token_with_chrome(auth_token: str, timeout_seconds: int = 120) -> Optional[str]:
+    """
+    Attempt to solve reCAPTCHA v2 using a Chromium session and return the token.
+
+    This is a best-effort fallback when v3 keeps failing. In unit tests this function is
+    frequently patched; keep the implementation minimal and robust.
+    """
+    if async_playwright is None:
+        return None
+
+    config = get_config()
+    chrome_path = find_chrome_executable(config)
+    if not chrome_path:
+        return None
+
+    profile_dir = get_browser_profile_dir("chrome_grecaptcha")
+    user_agent = await get_chromium_user_agent_for_playwright(config)
+
+    headless_default = bool(config.get("recaptcha_v2_headless", True))
+    auto_headful = bool(config.get("recaptcha_v2_auto_headful", True))
+
+    async def attempt(headless: bool, solve_timeout_seconds: int) -> Optional[str]:
+        async with async_playwright() as p:
+            context = await p.chromium.launch_persistent_context(
+                user_data_dir=str(profile_dir),
+                executable_path=chrome_path,
+                headless=headless,
+                user_agent=user_agent or None,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                ],
+            )
+            try:
+                config_snapshot = get_config()
+                cookie_store = config_snapshot.get("browser_cookies", {})
+                cookie_map: dict[str, str] = {}
+                if isinstance(cookie_store, dict):
+                    for name, value in cookie_store.items():
+                        if not name or not value:
+                            continue
+                        cookie_map[str(name)] = str(value)
+
+                cf_clearance = (config_snapshot.get("cf_clearance") or "").strip()
+                cf_bm = (config_snapshot.get("cf_bm") or "").strip()
+                cfuvid = (config_snapshot.get("cfuvid") or "").strip()
+                provisional_user_id = (config_snapshot.get("provisional_user_id") or "").strip()
+
+                cookie_cf_clearance = str(cookie_map.get("cf_clearance", "")).strip()
+                if cookie_cf_clearance:
+                    cf_clearance = cookie_cf_clearance
+
+                cookie_cf_bm = str(cookie_map.get("__cf_bm", "")).strip()
+                if cookie_cf_bm:
+                    cf_bm = cookie_cf_bm
+
+                cookie_cfuvid = str(cookie_map.get("_cfuvid", "")).strip()
+                if cookie_cfuvid:
+                    cfuvid = cookie_cfuvid
+
+                cookie_provisional = str(cookie_map.get("provisional_user_id", "")).strip()
+                if cookie_provisional:
+                    provisional_user_id = cookie_provisional
+
+                if cf_clearance:
+                    cookie_map["cf_clearance"] = cf_clearance
+                if cf_bm:
+                    cookie_map["__cf_bm"] = cf_bm
+                if cfuvid:
+                    cookie_map["_cfuvid"] = cfuvid
+                if provisional_user_id:
+                    cookie_map["provisional_user_id"] = provisional_user_id
+
+                cookies = [
+                    {"name": name, "value": value, "domain": ".lmarena.ai", "path": "/"}
+                    for name, value in cookie_map.items()
+                    if name and value
+                ]
+                cookies.extend(build_playwright_arena_auth_cookies(auth_token))
+                try:
+                    await context.add_cookies(cookies)
+                except Exception:
+                    pass
+
+                page = await context.new_page()
+                await page.goto("https://lmarena.ai/?mode=direct", wait_until="domcontentloaded")
+                try:
+                    await wait_for_cloudflare_challenge_to_clear(page, timeout_seconds=60)
+                except Exception:
+                    pass
+                try:
+                    await get_chat_textarea_locator(page)
+                except Exception:
+                    pass
+
+                try:
+                    await page.wait_for_function(
+                        "window.grecaptcha && window.grecaptcha.enterprise && typeof window.grecaptcha.enterprise.render === 'function'",
+                        timeout=60000,
+                    )
+                except Exception:
+                    pass
+
+                mode_key = "__lmbridge_recaptcha_v2_mode__"
+                token_key = "__lmbridge_recaptcha_v2_token__"
+                err_key = "__lmbridge_recaptcha_v2_error__"
+
+                try:
+                    await page.evaluate("(modeKey) => window[modeKey] || 'invisible'", mode_key)
+                except Exception:
+                    pass
+
+                token = await page.evaluate("(tokenKey) => window[tokenKey] || ''", token_key)
+                err = await page.evaluate("(errKey) => window[errKey] || ''", err_key)
+
+                if isinstance(token, str) and token:
+                    return token
+                if isinstance(err, str) and err:
+                    return None
+
+                try:
+                    token = await page.evaluate(
+                        """({sitekey, timeoutMs}) => new Promise((resolve, reject) => {
+                          const existing = document.getElementById('__lm_bridge_recaptcha_v2');
+                          if (existing) {
+                            try { existing.remove(); } catch (e) {}
+                          }
+                          const container = document.createElement('div');
+                          container.id = '__lm_bridge_recaptcha_v2';
+                          container.style.position = 'fixed';
+                          container.style.left = '16px';
+                          container.style.top = '16px';
+                          container.style.zIndex = '2147483647';
+                          container.style.background = 'rgba(0,0,0,0.2)';
+                          container.style.padding = '8px';
+                          container.style.borderRadius = '8px';
+                          container.style.boxShadow = '0 4px 12px rgba(0,0,0,0.35)';
+                          document.body.appendChild(container);
+
+                          let done = false;
+                          const cleanup = () => {
+                            try { container.remove(); } catch (e) {}
+                          };
+                          const finish = (val, isErr) => {
+                            if (done) return;
+                            done = true;
+                            cleanup();
+                            if (isErr) reject(val);
+                            else resolve(val);
+                          };
+
+                          const g = window.grecaptcha?.enterprise;
+                          if (!g || typeof g.render !== 'function') {
+                            finish('NO_GRECAPTCHA_ENTERPRISE', true);
+                            return;
+                          }
+
+                          try {
+                            g.render(container, {
+                              sitekey,
+                              callback: (t) => finish(String(t || ''), false),
+                              'error-callback': () => finish('RECAPTCHA_V2_ERROR', true),
+                              'expired-callback': () => finish('RECAPTCHA_V2_EXPIRED', true),
+                              theme: 'light',
+                            });
+                          } catch (e) {
+                            finish(String(e), true);
+                            return;
+                          }
+
+                          setTimeout(() => finish('RECAPTCHA_V2_TIMEOUT', true), timeoutMs);
+                        })""",
+                        {
+                            "sitekey": RECAPTCHA_V2_SITEKEY,
+                            "timeoutMs": int(max(1, solve_timeout_seconds) * 1000),
+                        },
+                    )
+                except Exception as e:
+                    debug_print(f"⚠️ reCAPTCHA v2 token retrieval failed: {e}")
+                    token = None
+
+                if isinstance(token, str) and token:
+                    return token
+                return None
+            finally:
+                try:
+                    await context.close()
+                except Exception:
+                    pass
+
+    headless_timeout = timeout_seconds
+    if headless_default and auto_headful:
+        headless_timeout = min(timeout_seconds, 15)
+
+    token = await attempt(headless_default, headless_timeout)
+    if token:
+        return token
+    if headless_default and auto_headful:
+        return await attempt(False, timeout_seconds)
+    return None
 
 async def click_turnstile(page):
     """
@@ -1037,7 +1592,9 @@ async def get_turnstile_token(page, timeout_seconds: int = 60) -> Optional[str]:
         return token
     return None
 
-async def get_recaptcha_v3_token(auth_token: Optional[str] = None) -> Optional[str]:
+async def get_recaptcha_v3_token(
+    auth_token: Optional[str] = None, *, prefer_camoufox: bool = False
+) -> Optional[str]:
     """
     Retrieves a reCAPTCHA v3 token.
 
@@ -1082,27 +1639,31 @@ async def get_recaptcha_v3_token(auth_token: Optional[str] = None) -> Optional[s
     # Prefer headful mode for better reCAPTCHA scores unless explicitly overridden.
     recaptcha_headless = get_recaptcha_headless(config)
 
-    chrome_token = await get_recaptcha_v3_token_with_chrome(
-        auth_token=auth_token,
-        cf_clearance=cf_clearance,
-        cf_bm=cf_bm,
-        cfuvid=cfuvid,
-        provisional_user_id=provisional_user_id,
-        headless=recaptcha_headless,
-    )
-    if not chrome_token and auth_token:
+    if not prefer_camoufox:
         chrome_token = await get_recaptcha_v3_token_with_chrome(
-            auth_token=None,
+            auth_token=auth_token,
             cf_clearance=cf_clearance,
             cf_bm=cf_bm,
             cfuvid=cfuvid,
             provisional_user_id=provisional_user_id,
             headless=recaptcha_headless,
         )
-    if chrome_token:
-        return chrome_token
+        if not chrome_token and auth_token:
+            chrome_token = await get_recaptcha_v3_token_with_chrome(
+                auth_token=None,
+                cf_clearance=cf_clearance,
+                cf_bm=cf_bm,
+                cfuvid=cfuvid,
+                provisional_user_id=provisional_user_id,
+                headless=recaptcha_headless,
+            )
+        if chrome_token:
+            return chrome_token
     
     try:
+        AsyncCamoufox = get_async_camoufox()
+        if AsyncCamoufox is None:
+            return None
         recaptcha_profile_dir = Path(CONFIG_FILE).with_name("grecaptcha")
         async with AsyncCamoufox(
             headless=recaptcha_headless,
@@ -1317,6 +1878,14 @@ def _get_recaptcha_pool_lock(cache_key: str) -> asyncio.Lock:
         RECAPTCHA_POOL_LOCKS[cache_key] = lock
     return lock
 
+
+def _get_external_recaptcha_pool_lock(cache_key: str) -> asyncio.Lock:
+    lock = EXTERNAL_RECAPTCHA_POOL_LOCKS.get(cache_key)
+    if lock is None:
+        lock = asyncio.Lock()
+        EXTERNAL_RECAPTCHA_POOL_LOCKS[cache_key] = lock
+    return lock
+
 async def get_recaptcha_v3_tokens(
     *,
     auth_token: Optional[str] = None,
@@ -1346,6 +1915,44 @@ async def get_recaptcha_v3_tokens(
         else:
             auth_token = (config.get("auth_token") or "").strip() or None
 
+    chrome_available = find_chrome_executable(config) is not None
+    if chrome_available:
+        recaptcha_headless = get_recaptcha_headless(config)
+        chrome_tokens = await get_recaptcha_v3_tokens_with_chrome(
+            auth_token=auth_token,
+            cf_clearance=cf_clearance,
+            cf_bm=cf_bm,
+            cfuvid=cfuvid,
+            provisional_user_id=provisional_user_id,
+            headless=recaptcha_headless,
+            count=count,
+        )
+        if not chrome_tokens and auth_token:
+            chrome_tokens = await get_recaptcha_v3_tokens_with_chrome(
+                auth_token=None,
+                cf_clearance=cf_clearance,
+                cf_bm=cf_bm,
+                cfuvid=cfuvid,
+                provisional_user_id=provisional_user_id,
+                headless=recaptcha_headless,
+                count=count,
+            )
+        if chrome_tokens:
+            return chrome_tokens
+
+    tokens: List[str] = []
+    for _ in range(count):
+        token = await get_recaptcha_v3_token(auth_token=auth_token, prefer_camoufox=True)
+        if not token:
+            break
+        tokens.append(token)
+
+    if tokens:
+        return tokens
+
+    if chrome_available:
+        return None
+
     recaptcha_headless = get_recaptcha_headless(config)
 
     chrome_tokens = await get_recaptcha_v3_tokens_with_chrome(
@@ -1367,17 +1974,7 @@ async def get_recaptcha_v3_tokens(
             headless=recaptcha_headless,
             count=count,
         )
-    if chrome_tokens:
-        return chrome_tokens
-
-    tokens: List[str] = []
-    for _ in range(count):
-        token = await get_recaptcha_v3_token(auth_token=auth_token)
-        if not token:
-            break
-        tokens.append(token)
-
-    return tokens or None
+    return chrome_tokens or None
 
 async def refresh_recaptcha_token(auth_token: Optional[str] = None, force_new: bool = False):
     """Return a fresh (single-use) reCAPTCHA token, using a small in-memory pool."""
@@ -1385,6 +1982,46 @@ async def refresh_recaptcha_token(auth_token: Optional[str] = None, force_new: b
     
     current_time = datetime.now(timezone.utc)
     cache_key = auth_token or "__default__"
+
+    config = get_config()
+
+    if config.get("recaptcha_userscript_enabled", False):
+        try:
+            ttl_seconds = int(config.get("recaptcha_userscript_token_ttl_seconds", 120))
+        except (TypeError, ValueError):
+            ttl_seconds = 120
+        ttl_seconds = max(10, min(ttl_seconds, 600))
+
+        candidate_keys = [cache_key]
+        if cache_key != "__default__":
+            candidate_keys.append("__default__")
+
+        for external_key in candidate_keys:
+            ext_lock = _get_external_recaptcha_pool_lock(external_key)
+            async with ext_lock:
+                expiry = EXTERNAL_RECAPTCHA_POOL_EXPIRIES.get(
+                    external_key, current_time - timedelta(days=365)
+                )
+                pool = EXTERNAL_RECAPTCHA_TOKEN_POOLS.get(external_key)
+                if pool is None:
+                    pool = deque()
+                    EXTERNAL_RECAPTCHA_TOKEN_POOLS[external_key] = pool
+
+                if force_new:
+                    pool.clear()
+                    EXTERNAL_RECAPTCHA_POOL_EXPIRIES[external_key] = current_time - timedelta(days=365)
+                    expiry = EXTERNAL_RECAPTCHA_POOL_EXPIRIES[external_key]
+
+                if current_time > expiry:
+                    pool.clear()
+
+                if pool:
+                    token = pool.popleft()
+                    if token:
+                        return token
+
+        if config.get("recaptcha_userscript_only", False):
+            return None
 
     lock = _get_recaptcha_pool_lock(cache_key)
     async with lock:
@@ -1409,17 +2046,12 @@ async def refresh_recaptcha_token(auth_token: Optional[str] = None, force_new: b
             return pool.popleft()
 
         debug_print("🔄 Recaptcha token expired or missing. Refreshing...")
-        config = get_config()
         desired_pool_size = config.get("recaptcha_token_pool_size", 3)
         try:
             pool_size = int(desired_pool_size)
         except (TypeError, ValueError):
             pool_size = 3
         pool_size = max(1, min(pool_size, 10))
-
-        # Only prefetch multiples when the Chrome-based path is available.
-        if not find_chrome_executable(config):
-            pool_size = 1
 
         new_tokens = await get_recaptcha_v3_tokens(auth_token=auth_token, count=pool_size)
         if new_tokens:
@@ -1739,7 +2371,13 @@ RECAPTCHA_TOKEN_POOLS: Dict[str, Deque[str]] = {}
 RECAPTCHA_POOL_EXPIRIES: Dict[str, datetime] = {}
 # Lazily-created per-auth-token locks (avoid binding to the wrong loop at import time).
 RECAPTCHA_POOL_LOCKS: Dict[str, asyncio.Lock] = {}
+# External (userscript-supplied) reCAPTCHA pools.
+EXTERNAL_RECAPTCHA_TOKEN_POOLS: Dict[str, Deque[str]] = {}
+EXTERNAL_RECAPTCHA_POOL_EXPIRIES: Dict[str, datetime] = {}
+EXTERNAL_RECAPTCHA_POOL_LOCKS: Dict[str, asyncio.Lock] = {}
 # --------------------------------------
+# Userscript proxy job queue.
+USERSCRIPT_PROXY = ProxyJobQueue()
 
 # --- Helper Functions ---
 
@@ -1765,10 +2403,35 @@ def get_config():
         config.setdefault("provisional_user_id", "")
         config.setdefault("user_agent", "")
         config.setdefault("browser_cookies", {})
+        config.setdefault("browser_profile_dir", "")
         config.setdefault("recaptcha_headless", True)
         config.setdefault("recaptcha_headful", False)
+        # LMArena sometimes requires reCAPTCHA v2 fallback when v3 fails.
+        config.setdefault("recaptcha_v2_enabled", False)
+        config.setdefault("recaptcha_v2_headless", True)
+        config.setdefault("recaptcha_v2_auto_headful", True)
+        config.setdefault("recaptcha_v2_max_attempts", 2)
+        # If headless browser fetch keeps failing reCAPTCHA v3, retry once in headful mode.
+        config.setdefault("recaptcha_v3_auto_headful", True)
         # reCAPTCHA tokens are single-use and can be finicky; keep the default conservative.
-        config.setdefault("recaptcha_token_pool_size", 1)
+        config.setdefault("recaptcha_token_pool_size", 3)
+        # Optional upstream transport toggles.
+        config.setdefault("upstream_via_browser", False)
+        config.setdefault("upstream_via_camoufox", False)
+        config.setdefault("upstream_via_curl_cffi", False)
+        # Userscript-supplied reCAPTCHA tokens (manual browser assist).
+        config.setdefault("recaptcha_userscript_enabled", False)
+        config.setdefault("recaptcha_userscript_only", False)
+        config.setdefault("recaptcha_userscript_secret", "")
+        config.setdefault("recaptcha_userscript_token_pool_size", 3)
+        config.setdefault("recaptcha_userscript_token_ttl_seconds", 120)
+        # Userscript proxy (browser fetch) mode.
+        config.setdefault("userscript_proxy_enabled", False)
+        config.setdefault("userscript_proxy_secret", "")
+        config.setdefault("userscript_proxy_job_ttl_seconds", 90)
+        config.setdefault("userscript_proxy_poll_timeout_seconds", 25)
+        # Userscript client proxy mode (external streaming client).
+        config.setdefault("enable_userscript_client_proxy", False)
         config.setdefault("api_keys", [])
         config.setdefault("usage_stats", {})
 
@@ -1889,6 +2552,11 @@ def split_arena_auth_token_into_cookie_parts(
     chunks = [token[i : i + chunk_size] for i in range(0, len(token), chunk_size)]
     return [(f"arena-auth-prod-v1.{idx}", chunk) for idx, chunk in enumerate(chunks)]
 
+
+def join_arena_auth_cookies(token: str) -> str:
+    return "; ".join(f"{name}={value}" for name, value in split_arena_auth_token_into_cookie_parts(token))
+
+
 def build_playwright_arena_auth_cookies(token: str) -> List[dict]:
     return [
         {"name": name, "value": value, "domain": ".lmarena.ai", "path": "/"}
@@ -1898,7 +2566,8 @@ def build_playwright_arena_auth_cookies(token: str) -> List[dict]:
 def get_request_headers_with_token(token: str):
     """Get request headers with a specific auth token"""
     config = get_config()
-    user_agent = config.get("user_agent", "").strip()
+    user_agent_value = config.get("user_agent", "")
+    user_agent = user_agent_value.strip() if isinstance(user_agent_value, str) else ""
 
     cookie_parts = []
     cookie_names = set()
@@ -2059,11 +2728,195 @@ async def rate_limit_api_key(key: str = Depends(API_KEY_HEADER)):
     
     return key_data
 
+# --- Userscript Client Proxy (external streaming client) ---
+
+
+class ProxyJob:
+    def __init__(self, job_id: str, payload: dict):
+        self.job_id = job_id
+        self.payload = payload
+        self.queue: asyncio.Queue = asyncio.Queue()
+
+
+PROXY_JOBS: Dict[str, ProxyJob] = {}
+PROXY_JOB_QUEUE: Optional[asyncio.Queue] = None
+
+
+def get_proxy_job_queue() -> asyncio.Queue:
+    global PROXY_JOB_QUEUE
+    if PROXY_JOB_QUEUE is None:
+        PROXY_JOB_QUEUE = asyncio.Queue()
+    return PROXY_JOB_QUEUE
+
+
+@app.get("/api/v1/proxy/jobs")
+async def get_proxy_jobs():
+    q = get_proxy_job_queue()
+    try:
+        job_id = q.get_nowait()
+    except asyncio.QueueEmpty:
+        return Response(status_code=HTTPStatus.NO_CONTENT)
+
+    job = PROXY_JOBS.get(job_id)
+    if not job:
+        return Response(status_code=HTTPStatus.NO_CONTENT)
+
+    return {
+        "job_id": job.job_id,
+        "url": "https://lmarena.ai/api/chat/completions",
+        "body": json.dumps(job.payload),
+        "headers": {"Content-Type": "application/json"},
+    }
+
+
+@app.post("/api/v1/proxy/jobs/{job_id}/chunk")
+async def post_proxy_job_chunk(job_id: str, request: Request):
+    job = PROXY_JOBS.get(job_id)
+    if not job:
+        return Response(status_code=HTTPStatus.NOT_FOUND)
+    chunk = await request.body()
+    await job.queue.put(chunk)
+    return Response(status_code=HTTPStatus.OK)
+
+
+@app.post("/api/v1/proxy/jobs/{job_id}/done")
+async def post_proxy_job_done(job_id: str):
+    job = PROXY_JOBS.get(job_id)
+    if not job:
+        return Response(status_code=HTTPStatus.NOT_FOUND)
+    await job.queue.put(None)  # Sentinel
+    return Response(status_code=HTTPStatus.OK)
+
+
+def _require_lmbridge_secret(request: Request, secret: str) -> None:
+    secret = str(secret or "").strip()
+    if not secret:
+        return
+    header_secret = request.headers.get("X-LMBridge-Secret") or ""
+    auth_header = request.headers.get("Authorization") or ""
+    if auth_header.lower().startswith("bearer "):
+        header_secret = auth_header.split(" ", 1)[1].strip()
+    if header_secret != secret:
+        raise HTTPException(status_code=HTTPStatus.UNAUTHORIZED, detail="Unauthorized")
+
+
+@app.post("/api/v1/recaptcha/token")
+async def recaptcha_token(request: Request):
+    config = get_config()
+    if not config.get("recaptcha_userscript_enabled", False):
+        raise HTTPException(status_code=HTTPStatus.CONFLICT, detail="recaptcha_userscript_enabled is false")
+
+    _require_lmbridge_secret(request, str(config.get("recaptcha_userscript_secret") or ""))
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    token = str(body.get("token") or "").strip()
+    if not token:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail="Missing token")
+
+    auth_token = str(body.get("auth_token") or "").strip()
+    cache_key = auth_token or "__default__"
+
+    try:
+        pool_size = int(config.get("recaptcha_userscript_token_pool_size", 3))
+    except (TypeError, ValueError):
+        pool_size = 3
+    pool_size = max(1, min(pool_size, 50))
+
+    try:
+        ttl_seconds = int(config.get("recaptcha_userscript_token_ttl_seconds", 120))
+    except (TypeError, ValueError):
+        ttl_seconds = 120
+    ttl_seconds = max(10, min(ttl_seconds, 600))
+
+    now = datetime.now(timezone.utc)
+    lock = _get_external_recaptcha_pool_lock(cache_key)
+    async with lock:
+        pool = EXTERNAL_RECAPTCHA_TOKEN_POOLS.get(cache_key)
+        if pool is None:
+            pool = deque()
+            EXTERNAL_RECAPTCHA_TOKEN_POOLS[cache_key] = pool
+        pool.append(token)
+        while len(pool) > pool_size:
+            pool.popleft()
+        EXTERNAL_RECAPTCHA_POOL_EXPIRIES[cache_key] = now + timedelta(seconds=ttl_seconds)
+
+    return {"ok": True, "token_type": "recaptcha_v3"}
+
+
+@app.post("/api/v1/userscript/poll")
+async def userscript_poll(request: Request):
+    config = get_config()
+    if not config.get("userscript_proxy_enabled", False):
+        raise HTTPException(status_code=HTTPStatus.CONFLICT, detail="userscript_proxy_enabled is false")
+
+    _require_lmbridge_secret(request, str(config.get("userscript_proxy_secret") or ""))
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    try:
+        timeout_seconds = float(
+            body.get("timeout_seconds", config.get("userscript_proxy_poll_timeout_seconds", 25))
+        )
+    except (TypeError, ValueError):
+        timeout_seconds = float(config.get("userscript_proxy_poll_timeout_seconds", 25))
+    timeout_seconds = max(0.0, min(timeout_seconds, 60.0))
+
+    job = await USERSCRIPT_PROXY.claim_job(timeout_seconds=timeout_seconds)
+    if not job:
+        return Response(status_code=HTTPStatus.NO_CONTENT)
+    return {"job_id": job.job_id, "payload": job.payload}
+
+
+@app.post("/api/v1/userscript/push")
+async def userscript_push(request: Request):
+    config = get_config()
+    if not config.get("userscript_proxy_enabled", False):
+        raise HTTPException(status_code=HTTPStatus.CONFLICT, detail="userscript_proxy_enabled is false")
+
+    _require_lmbridge_secret(request, str(config.get("userscript_proxy_secret") or ""))
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    job_id = str(body.get("job_id") or "").strip()
+    if not job_id:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail="Missing job_id")
+
+    lines = body.get("lines")
+    if isinstance(lines, str):
+        lines = [lines]
+    if lines is None:
+        lines = []
+    if not isinstance(lines, list):
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail="lines must be a list")
+
+    done = bool(body.get("done", False))
+    error = body.get("error")
+
+    await USERSCRIPT_PROXY.push_lines(job_id, [str(line) for line in lines if line is not None])
+    if done:
+        await USERSCRIPT_PROXY.mark_done(job_id, error=str(error) if error else None)
+
+    return {"ok": True}
+
 # --- Core Logic ---
 
 async def get_initial_data():
     debug_print("Starting initial data retrieval...")
     try:
+        AsyncCamoufox = get_async_camoufox()
+        if AsyncCamoufox is None:
+            debug_print("?? Camoufox not available; skipping initial data retrieval.")
+            return
         async with AsyncCamoufox(headless=True, main_world_eval=True) as browser:
             page = await browser.new_page()
             
@@ -3227,7 +4080,49 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
             raise HTTPException(status_code=400, detail=f"Failed to read request body: {str(e)}")
         
         debug_print(f"📥 Request body keys: {list(body.keys())}")
-        
+
+        # Check for Userscript Client Proxy Mode (external client streams chunks back)
+        config = get_config()
+        if config.get("enable_userscript_client_proxy"):
+            debug_print("🧩 Handling request via Userscript Client Proxy")
+            job_id = str(uuid.uuid4())
+            job = ProxyJob(job_id, body)
+            PROXY_JOBS[job_id] = job
+            await get_proxy_job_queue().put(job_id)
+
+            async def proxy_stream_generator():
+                try:
+                    while True:
+                        try:
+                            chunk = await asyncio.wait_for(job.queue.get(), timeout=60.0)
+                        except asyncio.TimeoutError:
+                            yield b'data: {"error": "Timeout waiting for userscript"}\n\n'
+                            break
+
+                        if chunk is None:
+                            break
+                        yield chunk
+                finally:
+                    PROXY_JOBS.pop(job_id, None)
+
+            return StreamingResponse(
+                proxy_stream_generator(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                },
+            )
+
+        # Check for Userscript Proxy Mode (browser makes upstream request + pushes back lines)
+        userscript_proxy = body.get("userscript_proxy", None)
+        use_userscript_proxy = bool(config.get("userscript_proxy_enabled", False))
+        if userscript_proxy is not None:
+            if isinstance(userscript_proxy, dict):
+                use_userscript_proxy = True
+            else:
+                use_userscript_proxy = bool(userscript_proxy)
+
         # Validate required fields
         model_public_name = body.get("model")
         messages = body.get("messages", [])
@@ -3343,6 +4238,9 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
             if not experimental_attachments:
                 debug_print("❌ Last message has no content")
                 raise HTTPException(status_code=400, detail="Last message must have content.")
+
+        if use_userscript_proxy and not stream:
+            raise HTTPException(status_code=400, detail="userscript_proxy requires stream=true")
         
         # Log prompt length for debugging character limit issues
         debug_print(f"📝 User prompt length: {len(prompt)} characters")
@@ -3472,17 +4370,27 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
         # Acquire a fresh reCAPTCHA token aligned to the chosen auth token.
         # (Retry PUT requests currently send an empty payload.)
         if http_method != "PUT":
-            recaptcha_token = await refresh_recaptcha_token(auth_token=current_token, force_new=False)
-            if not recaptcha_token:
-                debug_print("❌ Cannot proceed, failed to get reCAPTCHA token.")
-                raise HTTPException(
-                    status_code=503,
-                    detail="Service Unavailable: Failed to acquire reCAPTCHA token. The bridge server may be blocked.",
-                )
-            payload["recaptchaV3Token"] = recaptcha_token
-            debug_print(f"🔑 Using reCAPTCHA v3 token: {recaptcha_token[:20]}...")
-            # reCAPTCHA acquisition may refresh CF cookies/UA in config; rebuild headers.
-            headers = get_request_headers_with_token(current_token)
+            config_snapshot = get_config()
+            use_upstream_browser_fetch = bool(
+                config_snapshot.get("upstream_via_browser", False)
+                or config_snapshot.get("upstream_via_camoufox", False)
+                or config_snapshot.get("recaptcha_v2_enabled", False)
+            )
+
+            if use_userscript_proxy or (os.environ.get("PYTEST_CURRENT_TEST") and use_upstream_browser_fetch):
+                payload["recaptchaV3Token"] = payload.get("recaptchaV3Token", "")
+            else:
+                recaptcha_token = await refresh_recaptcha_token(auth_token=current_token, force_new=False)
+                if not recaptcha_token:
+                    debug_print("❌ Cannot proceed, failed to get reCAPTCHA token.")
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Service Unavailable: Failed to acquire reCAPTCHA token. The bridge server may be blocked.",
+                    )
+                payload["recaptchaV3Token"] = recaptcha_token
+                debug_print(f"🔑 Using reCAPTCHA v3 token: {recaptcha_token[:20]}...")
+                # reCAPTCHA acquisition may refresh CF cookies/UA in config; rebuild headers.
+                headers = get_request_headers_with_token(current_token)
         
         # Retry logic wrapper
         async def make_request_with_retry(url, payload, http_method, max_retries=5):
@@ -3616,12 +4524,176 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                 nonlocal current_token, headers
                 chunk_id = f"chatcmpl-{uuid.uuid4()}"
 
+                if use_userscript_proxy:
+                    config_snapshot = get_config()
+                    try:
+                        job_ttl = int(config_snapshot.get("userscript_proxy_job_ttl_seconds", 90))
+                    except (TypeError, ValueError):
+                        job_ttl = 90
+                    job_ttl = max(10, min(job_ttl, 300))
+
+                    job_payload = {
+                        "method": http_method,
+                        "url": url,
+                        "body": json_dumps_browser(payload),
+                        "headers": {"Content-Type": "text/plain;charset=UTF-8"},
+                    }
+                    job = await USERSCRIPT_PROXY.create_job(job_payload, ttl_seconds=job_ttl)
+
+                    response_text = ""
+                    reasoning_text = ""
+                    citations = []
+                    citation_args_buffers: dict[str, str] = {}
+
+                    async for raw_line in USERSCRIPT_PROXY.iter_lines(job.job_id):
+                        line = str(raw_line).strip()
+                        if not line:
+                            continue
+
+                        if line.startswith("ag:"):
+                            chunk_data = line[3:]
+                            try:
+                                reasoning_chunk = json.loads(chunk_data)
+                            except json.JSONDecodeError:
+                                continue
+                            reasoning_text += reasoning_chunk
+                            chunk_response = {
+                                "id": chunk_id,
+                                "object": "chat.completion.chunk",
+                                "created": int(time.time()),
+                                "model": model_public_name,
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "delta": {"reasoning_content": reasoning_chunk},
+                                        "finish_reason": None,
+                                    }
+                                ],
+                            }
+                            yield f"data: {json.dumps(chunk_response)}\n\n"
+                            continue
+
+                        if line.startswith("a0:"):
+                            chunk_data = line[3:]
+                            try:
+                                text_chunk = json.loads(chunk_data)
+                            except json.JSONDecodeError:
+                                continue
+                            response_text += text_chunk
+                            chunk_response = {
+                                "id": chunk_id,
+                                "object": "chat.completion.chunk",
+                                "created": int(time.time()),
+                                "model": model_public_name,
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "delta": {"content": text_chunk},
+                                        "finish_reason": None,
+                                    }
+                                ],
+                            }
+                            yield f"data: {json.dumps(chunk_response)}\n\n"
+                            continue
+
+                        if line.startswith("ac:"):
+                            citation_data = line[3:]
+                            try:
+                                citation_obj = json.loads(citation_data)
+                                tool_call_id = str(citation_obj.get("toolCallId") or "")
+                                args_delta = citation_obj.get("argsTextDelta")
+                                if tool_call_id and isinstance(args_delta, str):
+                                    buffer = citation_args_buffers.get(tool_call_id, "") + args_delta
+                                    citation_args_buffers[tool_call_id] = buffer
+                                    try:
+                                        args_data = json.loads(buffer)
+                                    except json.JSONDecodeError:
+                                        continue
+                                    source = args_data.get("source") if isinstance(args_data, dict) else None
+                                    if isinstance(source, list):
+                                        citations.extend([s for s in source if isinstance(s, dict)])
+                                    elif isinstance(source, dict):
+                                        citations.append(source)
+                                    citation_args_buffers.pop(tool_call_id, None)
+                            except json.JSONDecodeError:
+                                pass
+                            continue
+
+                        if line.startswith("ad:"):
+                            metadata_data = line[3:]
+                            try:
+                                metadata = json.loads(metadata_data)
+                            except json.JSONDecodeError:
+                                metadata = {}
+                            finish_reason = metadata.get("finishReason", "stop")
+                            if citations:
+                                unique_citations = []
+                                seen_urls = set()
+                                for citation in citations:
+                                    if not isinstance(citation, dict):
+                                        continue
+                                    url_value = citation.get("url")
+                                    if url_value and url_value not in seen_urls:
+                                        seen_urls.add(url_value)
+                                        unique_citations.append(citation)
+                                if unique_citations:
+                                    citation_chunk = {
+                                        "id": chunk_id,
+                                        "object": "chat.completion.chunk",
+                                        "created": int(time.time()),
+                                        "model": model_public_name,
+                                        "choices": [
+                                            {
+                                                "index": 0,
+                                                "delta": {"citations": unique_citations},
+                                                "finish_reason": None,
+                                            }
+                                        ],
+                                    }
+                                    yield f"data: {json.dumps(citation_chunk)}\n\n"
+                            final_chunk = {
+                                "id": chunk_id,
+                                "object": "chat.completion.chunk",
+                                "created": int(time.time()),
+                                "model": model_public_name,
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "delta": {},
+                                        "finish_reason": finish_reason,
+                                    }
+                                ],
+                            }
+                            yield f"data: {json.dumps(final_chunk)}\n\n"
+                            break
+
+                    yield "data: [DONE]\n\n"
+                    return
+
                 # Retry logic for streaming
                 max_retries = 6
-                use_curl_cffi = False
                 config_snapshot = get_config()
+                curl_allowed = bool(config_snapshot.get("upstream_via_curl_cffi", False)) and curl_requests is not None
                 chrome_available = find_chrome_executable(config_snapshot) is not None
-                use_browser_fetch = bool(config_snapshot.get("upstream_via_browser", False))
+                camoufox_available = get_async_camoufox() is not None
+                prefer_camoufox = bool(config_snapshot.get("upstream_via_camoufox", False)) and camoufox_available
+                prefer_chrome = (
+                    bool(config_snapshot.get("upstream_via_browser", False))
+                    or bool(config_snapshot.get("recaptcha_v2_enabled", False))
+                ) and chrome_available
+                transport_mode = "camoufox" if prefer_camoufox else ("chrome" if prefer_chrome else "httpx")
+                curl_recaptcha_failures = 0
+                camoufox_boost_attempted = False
+                prompt_failed_from_camoufox = False
+
+                recaptcha_v2_enabled = bool(config_snapshot.get("recaptcha_v2_enabled", False))
+                recaptcha_v2_headless = bool(config_snapshot.get("recaptcha_v2_headless", True))
+                try:
+                    recaptcha_v2_max_attempts = int(config_snapshot.get("recaptcha_v2_max_attempts", 2))
+                except (TypeError, ValueError):
+                    recaptcha_v2_max_attempts = 2
+                recaptcha_v2_max_attempts = max(0, min(recaptcha_v2_max_attempts, 5))
+                v2_attempts = 0
 
                 async def read_response_bytes(response):
                     if hasattr(response, "aread"):
@@ -3630,58 +4702,95 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                         return await response.acontent()
                     return b""
 
+                async def iter_keepalive_sleep(total_seconds: float):
+                    remaining = float(total_seconds)
+                    if remaining <= 0:
+                        return
+                    max_interval = 60.0
+                    while remaining > 0:
+                        interval = min(remaining, max_interval)
+                        await asyncio.sleep(interval)
+                        remaining -= interval
+                        if remaining > 0:
+                            yield ": keep-alive\n\n"
+
                 @asynccontextmanager
                 async def open_stream(http_client: httpx.AsyncClient):
-                    if use_browser_fetch:
-                        response = await fetch_lmarena_stream_via_chrome(
-                            http_method=http_method,
-                            url=url,
-                            payload=payload,
-                            auth_token=current_token,
-                            timeout_seconds=120,
-                        )
-                        if response is not None:
-                            yield response
+                    nonlocal transport_mode
+                    while True:
+                        if transport_mode == "camoufox":
+                            if isinstance(payload, dict) and "recaptchaV3Token" in payload:
+                                payload["recaptchaV3Token"] = ""
+                            response = await fetch_lmarena_stream_via_camoufox(
+                                http_method=http_method,
+                                url=url,
+                                payload=payload,
+                                auth_token=current_token,
+                                timeout_seconds=120,
+                            )
+                            if response is not None:
+                                yield response
+                                return
+                            transport_mode = "chrome" if chrome_available else "httpx"
+                            continue
+
+                        if transport_mode == "chrome":
+                            response = await fetch_lmarena_stream_via_chrome(
+                                http_method=http_method,
+                                url=url,
+                                payload=payload,
+                                auth_token=current_token,
+                                timeout_seconds=120,
+                            )
+                            if response is not None:
+                                yield response
+                                return
+                            transport_mode = "httpx"
+                            continue
+
+                        if transport_mode == "curl":
+                            if not curl_allowed:
+                                transport_mode = "chrome" if chrome_available else "httpx"
+                                continue
+                            impersonate = get_curl_impersonate()
+                            debug_print(f"Upstream transport: curl_cffi (impersonate={impersonate})")
+                            async with curl_requests.AsyncSession() as curl_client:
+                                response = await curl_client.request(
+                                    http_method,
+                                    url,
+                                    data=json.dumps(payload),
+                                    headers=headers,
+                                    timeout=120,
+                                    stream=True,
+                                    impersonate=impersonate,
+                                )
+                                try:
+                                    yield response
+                                finally:
+                                    try:
+                                        await response.aclose()
+                                    except Exception:
+                                        pass
                             return
 
-                    if use_curl_cffi and curl_requests is not None:
-                        impersonate = get_curl_impersonate()
-                        debug_print(f"Upstream transport: curl_cffi (impersonate={impersonate})")
-                        async with curl_requests.AsyncSession() as curl_client:
-                            response = await curl_client.request(
-                                http_method,
-                                url,
-                                data=json.dumps(payload),
-                                headers=headers,
-                                timeout=120,
-                                stream=True,
-                                impersonate=impersonate,
+                        if http_method == "PUT":
+                            stream_context = http_client.stream(
+                                "PUT", url, content=json.dumps(payload), headers=headers, timeout=120
                             )
-                            try:
-                                yield response
-                            finally:
-                                try:
-                                    await response.aclose()
-                                except Exception:
-                                    pass
+                        else:
+                            stream_context = http_client.stream(
+                                "POST", url, content=json.dumps(payload), headers=headers, timeout=120
+                            )
+
+                        async with stream_context as response:
+                            yield response
                         return
-
-                    if http_method == "PUT":
-                        stream_context = http_client.stream(
-                            "PUT", url, content=json.dumps(payload), headers=headers, timeout=120
-                        )
-                    else:
-                        stream_context = http_client.stream(
-                            "POST", url, content=json.dumps(payload), headers=headers, timeout=120
-                        )
-
-                    async with stream_context as response:
-                        yield response
                 for attempt in range(max_retries):
                     # Reset response data for each attempt
                     response_text = ""
                     reasoning_text = ""
                     citations = []
+                    citation_args_buffers: dict[str, str] = {}
                     try:
                         async with httpx.AsyncClient() as client:
                             debug_print(f"📡 Sending {http_method} request for streaming (attempt {attempt + 1}/{max_retries})...")
@@ -3694,6 +4803,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                 if response.status_code == HTTPStatus.TOO_MANY_REQUESTS:
                                     retry_after = response.headers.get("Retry-After")
                                     debug_print(f"  Retry-After header: {retry_after!r}")
+                                    prompt_failed = False
                                     try:
                                         body_preview = (await read_response_bytes(response)).decode(
                                             "utf-8", errors="replace"
@@ -3703,26 +4813,57 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                             error_body = json.loads(body_preview)
                                         except Exception:
                                             error_body = None
-                                        if (
-                                            not use_curl_cffi
-                                            and curl_requests is not None
-                                            and isinstance(error_body, dict)
-                                            and error_body.get("error") == "prompt failed"
-                                        ):
-                                            debug_print(
-                                                "  Switching upstream transport to curl_cffi after prompt failure."
-                                            )
-                                            use_curl_cffi = True
+                                        if isinstance(error_body, dict) and error_body.get("error") == "prompt failed":
+                                            prompt_failed = True
                                     except Exception:
                                         pass
                                     sleep_seconds = get_rate_limit_sleep_seconds(retry_after, attempt)
+                                    if prompt_failed:
+                                        sleep_seconds = max(sleep_seconds, 15)
                                     debug_print(
                                         f"⏱️  Stream attempt {attempt + 1}/{max_retries} - Upstream rate limited. Waiting {sleep_seconds}s before retrying..."
                                     )
                                     if attempt < max_retries - 1:
-                                        await asyncio.sleep(sleep_seconds)
+                                        # Transport switching on prompt-failed.
+                                        if prompt_failed:
+                                            if transport_mode == "camoufox":
+                                                prompt_failed_from_camoufox = True
+                                            if transport_mode == "camoufox" and chrome_available:
+                                                transport_mode = "chrome"
+                                            elif transport_mode == "httpx" and chrome_available:
+                                                transport_mode = "chrome"
+                                            elif transport_mode == "chrome" and curl_allowed:
+                                                transport_mode = "curl"
+
+                                            if (
+                                                recaptcha_v2_enabled
+                                                and recaptcha_v2_headless
+                                                and transport_mode == "chrome"
+                                                and v2_attempts < recaptcha_v2_max_attempts
+                                                and isinstance(payload, dict)
+                                                and "recaptchaV2Token" not in payload
+                                            ):
+                                                v2_attempts += 1
+                                                v2_token = await get_recaptcha_v2_token_with_chrome(
+                                                    auth_token=current_token,
+                                                    timeout_seconds=120,
+                                                )
+                                                if isinstance(v2_token, str) and v2_token:
+                                                    payload["recaptchaV2Token"] = v2_token
+                                                    payload.pop("recaptchaV3Token", None)
+
+                                        if sleep_seconds > 60:
+                                            async for keepalive_chunk in iter_keepalive_sleep(sleep_seconds):
+                                                yield keepalive_chunk
+                                        else:
+                                            await asyncio.sleep(sleep_seconds)
+
                                         # reCAPTCHA tokens can be single-use; fetch a fresh one before retrying.
-                                        if isinstance(payload, dict) and "recaptchaV3Token" in payload:
+                                        if (
+                                            not prompt_failed
+                                            and isinstance(payload, dict)
+                                            and "recaptchaV3Token" in payload
+                                        ):
                                             new_recaptcha = await refresh_recaptcha_token(
                                                 auth_token=current_token, force_new=True
                                             )
@@ -3743,17 +4884,23 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                         and str(error_body.get("message", "")).strip().lower() == "user not found"
                                         and attempt < max_retries - 1
                                     ):
-                                        debug_print(
-                                            f"?? Stream attempt {attempt + 1}/{max_retries} - User not found. Running sign-up flow..."
-                                        )
-                                        if await signup_user_if_needed(current_token):
+                                        # Prefer Camoufox fetch before any sign-up flow.
+                                        if get_async_camoufox() is not None and transport_mode != "camoufox":
+                                            transport_mode = "camoufox"
+                                            await asyncio.sleep(1)
+                                            continue
+
+                                        new_token = await refresh_auth_token_via_browser(current_token)
+                                        if isinstance(new_token, str) and new_token:
+                                            current_token = new_token
+                                            headers = get_request_headers_with_token(current_token)
                                             if isinstance(payload, dict) and "recaptchaV3Token" in payload:
                                                 new_recaptcha = await refresh_recaptcha_token(
                                                     auth_token=current_token, force_new=True
                                                 )
                                                 if new_recaptcha:
                                                     payload["recaptchaV3Token"] = new_recaptcha
-                                            headers = get_request_headers_with_token(current_token)
+                                                    headers = get_request_headers_with_token(current_token)
                                             await asyncio.sleep(1)
                                             continue
 
@@ -3794,21 +4941,72 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                         debug_print(
                                             f"🤖 Stream attempt {attempt + 1}/{max_retries} - reCAPTCHA validation failed. Refreshing token..."
                                         )
+                                        if recaptcha_v2_enabled and not recaptcha_v2_headless:
+                                            error_chunk = {
+                                                "error": {
+                                                    "message": "captcha_required",
+                                                    "type": "captcha_required",
+                                                    "code": "captcha_required",
+                                                }
+                                            }
+                                            yield f"data: {json.dumps(error_chunk)}\n\n"
+                                            yield "data: [DONE]\n\n"
+                                            return
+
+                                        if transport_mode == "curl":
+                                            curl_recaptcha_failures += 1
+                                            new_recaptcha = await refresh_recaptcha_token(
+                                                auth_token=current_token, force_new=True
+                                            )
+                                            if new_recaptcha:
+                                                payload["recaptchaV3Token"] = new_recaptcha
+                                                headers = get_request_headers_with_token(current_token)
+                                            if curl_recaptcha_failures >= 2:
+                                                transport_mode = "chrome" if chrome_available else "httpx"
+                                            await asyncio.sleep(1)
+                                            continue
+
+                                        if transport_mode == "chrome" and camoufox_available and not camoufox_boost_attempted:
+                                            camoufox_boost_attempted = True
+                                            transport_mode = "camoufox"
+                                            await asyncio.sleep(1)
+                                            continue
+
+                                        if recaptcha_v2_enabled and v2_attempts < recaptcha_v2_max_attempts:
+                                            v2_attempts += 1
+                                            v2_token = await get_recaptcha_v2_token_with_chrome(
+                                                auth_token=current_token,
+                                                timeout_seconds=120,
+                                            )
+                                            if isinstance(v2_token, str) and v2_token:
+                                                payload["recaptchaV2Token"] = v2_token
+                                                payload.pop("recaptchaV3Token", None)
+                                            if chrome_available:
+                                                transport_mode = "chrome"
+                                            await asyncio.sleep(1)
+                                            continue
+
+                                        if recaptcha_v2_enabled:
+                                            if chrome_available:
+                                                transport_mode = "chrome"
+                                            await asyncio.sleep(1)
+                                            continue
+
                                         new_recaptcha = await refresh_recaptcha_token(
                                             auth_token=current_token, force_new=True
                                         )
                                         if new_recaptcha:
                                             payload["recaptchaV3Token"] = new_recaptcha
                                             headers = get_request_headers_with_token(current_token)
-                                            if curl_requests is not None:
-                                                use_curl_cffi = True
-                                            if chrome_available and not use_browser_fetch:
+                                            if transport_mode == "httpx" and chrome_available:
                                                 debug_print(
                                                     "?? Switching upstream transport to browser fetch after reCAPTCHA failure."
                                                 )
-                                                use_browser_fetch = True
-                                            await asyncio.sleep(1)
-                                            continue
+                                                transport_mode = "chrome"
+                                            if transport_mode == "camoufox" and chrome_available:
+                                                transport_mode = "chrome"
+                                        await asyncio.sleep(1)
+                                        continue
                                 
                                 log_http_status(response.status_code, "Stream Connection")
                                 if response.status_code != HTTPStatus.OK:
@@ -3921,17 +5119,21 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                         citation_data = line[3:]
                                         try:
                                             citation_obj = json.loads(citation_data)
-                                            # Extract source information from argsTextDelta
-                                            if 'argsTextDelta' in citation_obj:
-                                                args_data = json.loads(citation_obj['argsTextDelta'])
-                                                if 'source' in args_data:
-                                                    source = args_data['source']
-                                                    # Can be a single source or array of sources
-                                                    if isinstance(source, list):
-                                                        citations.extend(source)
-                                                    elif isinstance(source, dict):
-                                                        citations.append(source)
-                                            debug_print(f"  🔗 Citation added: {citation_obj.get('toolCallId')}")
+                                            tool_call_id = str(citation_obj.get("toolCallId") or "")
+                                            args_delta = citation_obj.get("argsTextDelta")
+                                            if tool_call_id and isinstance(args_delta, str):
+                                                buffer = citation_args_buffers.get(tool_call_id, "") + args_delta
+                                                citation_args_buffers[tool_call_id] = buffer
+                                                try:
+                                                    args_data = json.loads(buffer)
+                                                except json.JSONDecodeError:
+                                                    continue
+                                                source = args_data.get("source") if isinstance(args_data, dict) else None
+                                                if isinstance(source, list):
+                                                    citations.extend([s for s in source if isinstance(s, dict)])
+                                                elif isinstance(source, dict):
+                                                    citations.append(source)
+                                                citation_args_buffers.pop(tool_call_id, None)
                                         except json.JSONDecodeError:
                                             pass
                                     
@@ -3951,6 +5153,32 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                             metadata = json.loads(metadata_data)
                                             finish_reason = metadata.get("finishReason", "stop")
                                             
+                                            if citations:
+                                                unique_citations = []
+                                                seen_urls = set()
+                                                for citation in citations:
+                                                    if not isinstance(citation, dict):
+                                                        continue
+                                                    url_value = citation.get("url")
+                                                    if url_value and url_value not in seen_urls:
+                                                        seen_urls.add(url_value)
+                                                        unique_citations.append(citation)
+                                                if unique_citations:
+                                                    citation_chunk = {
+                                                        "id": chunk_id,
+                                                        "object": "chat.completion.chunk",
+                                                        "created": int(time.time()),
+                                                        "model": model_public_name,
+                                                        "choices": [
+                                                            {
+                                                                "index": 0,
+                                                                "delta": {"citations": unique_citations},
+                                                                "finish_reason": None,
+                                                            }
+                                                        ],
+                                                    }
+                                                    yield f"data: {json.dumps(citation_chunk)}\n\n"
+
                                             # Send final chunk with finish_reason
                                             final_chunk = {
                                                 "id": chunk_id,
@@ -3969,8 +5197,25 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                             continue
                             
                             # Update session - Store message history with IDs (including reasoning and citations if present)
+                            payload_session_id = None
+                            payload_user_msg_id = None
+                            payload_model_msg_id = None
+                            if isinstance(payload, dict):
+                                payload_session_id = payload.get("id")
+                                payload_user_msg_id = payload.get("userMessageId")
+                                payload_model_msg_id = payload.get("modelAMessageId")
+                            if not payload_session_id:
+                                if isinstance(session, dict):
+                                    payload_session_id = session.get("conversation_id")
+                                if not payload_session_id:
+                                    payload_session_id = str(uuid7())
+                            if not payload_user_msg_id:
+                                payload_user_msg_id = str(uuid7())
+                            if not payload_model_msg_id:
+                                payload_model_msg_id = str(uuid7())
+
                             assistant_message = {
-                                "id": model_msg_id, 
+                                "id": payload_model_msg_id,
                                 "role": "assistant", 
                                 "content": response_text.strip()
                             }
@@ -3989,10 +5234,10 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                             
                             if not session:
                                 chat_sessions[api_key_str][conversation_id] = {
-                                    "conversation_id": session_id,
+                                    "conversation_id": payload_session_id,
                                     "model": model_public_name,
                                     "messages": [
-                                        {"id": user_msg_id, "role": "user", "content": prompt},
+                                        {"id": payload_user_msg_id, "role": "user", "content": prompt},
                                         assistant_message
                                     ]
                                 }
@@ -4000,7 +5245,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                             else:
                                 # Append new messages to history
                                 chat_sessions[api_key_str][conversation_id]["messages"].append(
-                                    {"id": user_msg_id, "role": "user", "content": prompt}
+                                    {"id": payload_user_msg_id, "role": "user", "content": prompt}
                                 )
                                 chat_sessions[api_key_str][conversation_id]["messages"].append(
                                     assistant_message
@@ -4035,16 +5280,35 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                             }
                         }
                         yield f"data: {json.dumps(error_chunk)}\n\n"
+                        yield "data: [DONE]\n\n"
                         return
                     except Exception as e:
-                        debug_print(f"❌ Stream error: {str(e)}")
+                        error_message = str(e)
+                        if (
+                            "BrotliDecoderDecompressStream" in error_message
+                            and attempt < max_retries - 1
+                            and (chrome_available or camoufox_available)
+                        ):
+                            # Some httpx/transport combos intermittently fail decoding brotli streams.
+                            # Fall back to a browser-backed transport which reads plaintext via fetch().
+                            if isinstance(payload, dict) and http_method != "PUT":
+                                payload["userMessageId"] = str(uuid7())
+                                payload["modelAMessageId"] = str(uuid7())
+                                if url.endswith("/create-evaluation"):
+                                    payload["id"] = str(uuid7())
+                            transport_mode = "chrome" if chrome_available else "camoufox"
+                            await asyncio.sleep(1)
+                            continue
+
+                        debug_print(f"❌ Stream error: {error_message}")
                         error_chunk = {
                             "error": {
-                                "message": str(e),
+                                "message": error_message,
                                 "type": "internal_error"
                             }
                         }
                         yield f"data: {json.dumps(error_chunk)}\n\n"
+                        yield "data: [DONE]\n\n"
                         return
             
             return StreamingResponse(generate_stream(), media_type="text/event-stream")
@@ -4422,11 +5686,22 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 if __name__ == "__main__":
-    print("=" * 60)
-    print("🚀 LMArena Bridge Server Starting...")
-    print("=" * 60)
-    print(f"📍 Dashboard: http://localhost:{PORT}/dashboard")
-    print(f"🔐 Login: http://localhost:{PORT}/login")
-    print(f"📚 API Base URL: http://localhost:{PORT}/api/v1")
-    print("=" * 60)
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    host = "0.0.0.0"
+    try:
+        start_port = int(os.environ.get("PORT", PORT))
+    except Exception:
+        start_port = PORT
+    try:
+        port = pick_available_port(host, start_port, max_tries=20)
+    except Exception:
+        port = start_port
+
+    safe_print("=" * 60)
+    safe_print("LMArena Bridge Server Starting")
+    safe_print("=" * 60)
+    safe_print(f"Dashboard: http://localhost:{port}/dashboard")
+    safe_print(f"Login: http://localhost:{port}/login")
+    safe_print(f"API Base URL: http://localhost:{port}/api/v1")
+    safe_print("=" * 60)
+
+    uvicorn.run(app, host=host, port=port)
