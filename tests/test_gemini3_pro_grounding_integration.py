@@ -24,7 +24,39 @@ class TestGemini3ProGroundingIntegration(unittest.IsolatedAsyncioTestCase):
         source_cfg = json.loads(source_config_path.read_text(encoding="utf-8"))
         auth_tokens = source_cfg.get("auth_tokens") or []
         if not auth_tokens:
-            self.skipTest("No auth_tokens found in config.json (login via dashboard first).")
+            # No human assistance: try to recover the arena auth token from the persistent browser profile.
+            cookies_db = Path("chrome_grecaptcha") / "cookies.sqlite"
+            if cookies_db.exists():
+                try:
+                    import sqlite3
+
+                    con = sqlite3.connect(str(cookies_db))
+                    cur = con.cursor()
+                    cur.execute(
+                        "SELECT name, value FROM moz_cookies "
+                        "WHERE host LIKE '%lmarena.ai%' AND name LIKE 'arena-auth-prod-v1%'"
+                    )
+                    rows = cur.fetchall()
+                    con.close()
+
+                    direct = next((v for n, v in rows if n == "arena-auth-prod-v1" and v), None)
+                    if isinstance(direct, str) and direct.strip():
+                        auth_tokens = [direct.strip()]
+                    else:
+                        parts = []
+                        for n, v in rows:
+                            if not isinstance(n, str) or not n.startswith("arena-auth-prod-v1."):
+                                continue
+                            suffix = n.split(".")[-1]
+                            if suffix.isdigit() and isinstance(v, str) and v:
+                                parts.append((int(suffix), v))
+                        if parts:
+                            auth_tokens = ["".join(v for _, v in sorted(parts))]
+                except Exception:
+                    auth_tokens = []
+
+        if not auth_tokens:
+            self.skipTest("No auth_tokens found in config.json or chrome_grecaptcha/cookies.sqlite.")
 
         temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(temp_dir.cleanup)
@@ -38,6 +70,7 @@ class TestGemini3ProGroundingIntegration(unittest.IsolatedAsyncioTestCase):
             "cfuvid": source_cfg.get("cfuvid", ""),
             "provisional_user_id": source_cfg.get("provisional_user_id", ""),
             "user_agent": source_cfg.get("user_agent", ""),
+            "chrome_path": source_cfg.get("chrome_path", ""),
             "browser_cookies": source_cfg.get("browser_cookies", {}),
             "recaptcha_headless": source_cfg.get("recaptcha_headless", False),
             "api_keys": [

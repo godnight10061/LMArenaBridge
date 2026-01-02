@@ -10,6 +10,7 @@ import mimetypes
 import os
 import socket
 import shutil
+import threading
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -289,7 +290,11 @@ def get_rate_limit_sleep_seconds(retry_after_header: Optional[str], attempt: int
     retry_after = parse_retry_after_seconds(retry_after_header)
     if retry_after is not None:
         return max(1, min(retry_after, 3600))
-    return max(1, min(2 ** (attempt + 1), 60))
+    # Retry-After is often absent for LMArena (429). Use a conservative backoff
+    # to avoid hammering the upstream and extending the ban window.
+    config = get_config()
+    base = int(config.get("rate_limit_backoff_base", 5))
+    return max(1, min(base * (2**attempt), 300))
 
 
 def json_dumps_browser(payload) -> str:
@@ -440,7 +445,7 @@ async def signup_user_if_needed(auth_token: str) -> bool:
         return False
 
     headless = get_recaptcha_headless(config)
-    profile_dir = Path(CONFIG_FILE).with_name("chrome_grecaptcha")
+    profile_dir = get_browser_profile_dir("chrome_grecaptcha")
 
     cf_clearance = (config.get("cf_clearance") or "").strip()
     cf_bm = (config.get("cf_bm") or "").strip()
@@ -641,10 +646,9 @@ async def get_recaptcha_v3_tokens_with_chrome(
     if not chrome_path:
         return None
 
-        profile_dir = Path(CONFIG_FILE).with_name("chrome_grecaptcha")
-        user_agent = await get_chromium_user_agent_for_playwright(config)
-        await asyncio.sleep(random.uniform(1.0, 3.0))
-        debug_print("🔐 Starting reCAPTCHA v3 token retrieval (Chrome)...")
+    profile_dir = get_browser_profile_dir("chrome_grecaptcha")
+    user_agent = await get_chromium_user_agent_for_playwright(config)
+    debug_print("🔐 Starting reCAPTCHA v3 token retrieval (Chrome)...")
     if count < 1:
         return None
 
@@ -661,36 +665,43 @@ async def get_recaptcha_v3_tokens_with_chrome(
             ],
         )
         try:
-            try:
-                await context.clear_cookies()
-            except Exception:
-                pass
-            cookies = []
-            if cf_clearance:
-                cookies.append(
-                    {"name": "cf_clearance", "value": cf_clearance, "domain": ".lmarena.ai", "path": "/"}
-                )
-            if cf_bm:
-                cookies.append(
-                    {"name": "__cf_bm", "value": cf_bm, "domain": ".lmarena.ai", "path": "/"}
-                )
-            if cfuvid:
-                cookies.append(
-                    {"name": "_cfuvid", "value": cfuvid, "domain": ".lmarena.ai", "path": "/"}
-                )
-            if provisional_user_id:
-                cookies.append(
-                    {
-                        "name": "provisional_user_id",
-                        "value": provisional_user_id,
-                        "domain": ".lmarena.ai",
-                        "path": "/",
-                    }
-                )
+            clear_cookies = bool(config.get("browser_fetch_clear_cookies", False))
+            if clear_cookies:
+                try:
+                    await context.clear_cookies()
+                except Exception:
+                    pass
+
+            cookies: List[dict] = []
+            if clear_cookies:
+                if cf_clearance:
+                    cookies.append(
+                        {"name": "cf_clearance", "value": cf_clearance, "domain": ".lmarena.ai", "path": "/"}
+                    )
+                if cf_bm:
+                    cookies.append(
+                        {"name": "__cf_bm", "value": cf_bm, "domain": ".lmarena.ai", "path": "/"}
+                    )
+                if cfuvid:
+                    cookies.append(
+                        {"name": "_cfuvid", "value": cfuvid, "domain": ".lmarena.ai", "path": "/"}
+                    )
+                if provisional_user_id:
+                    cookies.append(
+                        {
+                            "name": "provisional_user_id",
+                            "value": provisional_user_id,
+                            "domain": ".lmarena.ai",
+                            "path": "/",
+                        }
+                    )
             if auth_token:
                 cookies.extend(build_playwright_arena_auth_cookies(auth_token))
             if cookies:
-                await context.add_cookies(cookies)
+                try:
+                    await context.add_cookies(cookies)
+                except Exception:
+                    pass
 
             page = await context.new_page()
             await page.goto("https://lmarena.ai/?mode=direct", wait_until="domcontentloaded")
@@ -808,6 +819,7 @@ async def fetch_lmarena_stream_via_chrome(
     payload: dict,
     auth_token: str,
     timeout_seconds: int = 120,
+    force_headful: Optional[bool] = None,
 ) -> Optional[BrowserFetchStreamResponse]:
     if async_playwright is None:
         return None
@@ -818,6 +830,17 @@ async def fetch_lmarena_stream_via_chrome(
         return None
 
     headless = get_recaptcha_headless(config)
+    auto_headful = bool(config.get("recaptcha_v3_auto_headful", True))
+    if force_headful is True:
+        headless = False
+    is_unit_test = bool(os.environ.get("PYTEST_CURRENT_TEST")) and os.environ.get("RUN_LMARENA_INTEGRATION") != "1"
+    is_search = isinstance(payload, dict) and str(payload.get("modality") or "").strip().lower() == "search"
+    if (
+        not is_unit_test
+        and is_search
+        and bool(config.get("chrome_fetch_headful_for_search", False))
+    ):
+        headless = False
     profile_dir = get_browser_profile_dir("chrome_grecaptcha")
     user_agent = await get_chromium_user_agent_for_playwright(config)
 
@@ -855,8 +878,17 @@ async def fetch_lmarena_stream_via_chrome(
     if not fetch_url.startswith("/"):
         fetch_url = "/" + fetch_url
 
-    body = json.dumps(payload) if payload is not None else ""
+    should_generate_token = False
+    if isinstance(payload, dict):
+        if payload.get("recaptchaV2Token"):
+            should_generate_token = False
+        else:
+            existing_token = str(payload.get("recaptchaV3Token") or "").strip()
+            if not existing_token:
+                should_generate_token = True
 
+    response: Optional[BrowserFetchStreamResponse] = None
+    need_headful_retry = False
     async with async_playwright() as p:
         context = await p.chromium.launch_persistent_context(
             user_data_dir=str(profile_dir),
@@ -870,26 +902,37 @@ async def fetch_lmarena_stream_via_chrome(
             ],
         )
         try:
-            try:
-                await context.clear_cookies()
-            except Exception:
-                pass
-            if cf_clearance:
-                cookie_map["cf_clearance"] = cf_clearance
-            if cf_bm:
-                cookie_map["__cf_bm"] = cf_bm
-            if cfuvid:
-                cookie_map["_cfuvid"] = cfuvid
-            if provisional_user_id:
-                cookie_map["provisional_user_id"] = provisional_user_id
+            clear_cookies = bool(config.get("browser_fetch_clear_cookies", False))
+            if clear_cookies:
+                try:
+                    await context.clear_cookies()
+                except Exception:
+                    pass
 
-            cookies = [
-                {"name": name, "value": value, "domain": ".lmarena.ai", "path": "/"}
-                for name, value in cookie_map.items()
-                if name and value
-            ]
+            cookies = []
+            if clear_cookies:
+                if cf_clearance:
+                    cookie_map["cf_clearance"] = cf_clearance
+                if cf_bm:
+                    cookie_map["__cf_bm"] = cf_bm
+                if cfuvid:
+                    cookie_map["_cfuvid"] = cfuvid
+                if provisional_user_id:
+                    cookie_map["provisional_user_id"] = provisional_user_id
+
+                cookies.extend(
+                    [
+                        {"name": name, "value": value, "domain": ".lmarena.ai", "path": "/"}
+                        for name, value in cookie_map.items()
+                        if name and value
+                    ]
+                )
             cookies.extend(build_playwright_arena_auth_cookies(auth_token))
-            await context.add_cookies(cookies)
+            if cookies:
+                try:
+                    await context.add_cookies(cookies)
+                except Exception:
+                    pass
 
             page = await context.new_page()
             await page.goto("https://lmarena.ai/?mode=direct", wait_until="domcontentloaded")
@@ -900,7 +943,80 @@ async def fetch_lmarena_stream_via_chrome(
             except Exception as e:
                 debug_print(f"  ⚠️ Error handling Cloudflare challenge (Chrome fetch): {e}")
 
-            result = await page.evaluate(
+            def _is_recaptcha_validation_failed(status: int, text: object) -> bool:
+                if int(status or 0) != HTTPStatus.FORBIDDEN:
+                    return False
+                if not isinstance(text, str) or not text:
+                    return False
+                try:
+                    body = json.loads(text)
+                except Exception:
+                    return False
+                return isinstance(body, dict) and body.get("error") == "recaptcha validation failed"
+
+            async def _generate_recaptcha_v3_token(force: bool = False) -> None:
+                nonlocal payload
+                if not isinstance(payload, dict):
+                    return
+                if payload.get("recaptchaV2Token"):
+                    return
+                existing = str(payload.get("recaptchaV3Token") or "").strip()
+                if existing and not force:
+                    return
+
+                debug_print(
+                    "  🎟 Generating fresh reCAPTCHA token in-session (Chrome fetch)..."
+                    if not force
+                    else "  🔁 Regenerating reCAPTCHA token in-session (Chrome fetch)..."
+                )
+                try:
+                    # Light warm-up (improves reCAPTCHA v3 score vs firing immediately).
+                    is_unit_test = bool(os.environ.get("PYTEST_CURRENT_TEST")) and os.environ.get(
+                        "RUN_LMARENA_INTEGRATION"
+                    ) != "1"
+                    try:
+                        textarea = await get_chat_textarea_locator(page)
+                        await textarea.wait_for(state="visible", timeout=30000)
+                        await textarea.click()
+                        await page.keyboard.type("hi")
+                        if not is_unit_test:
+                            await asyncio.sleep(0.5 if not force else 0.2)
+                        await page.keyboard.press("Backspace")
+                        await page.keyboard.press("Backspace")
+                        if not is_unit_test and not force:
+                            await asyncio.sleep(1.5)
+                    except Exception:
+                        pass
+
+                    await page.wait_for_function(
+                        "window.grecaptcha && ("
+                        "(window.grecaptcha.enterprise && typeof window.grecaptcha.enterprise.execute === 'function') || "
+                        "typeof window.grecaptcha.execute === 'function'"
+                        ")",
+                        timeout=60000,
+                    )
+                    token = await page.evaluate(
+                        """({sitekey, action}) => new Promise((resolve, reject) => {
+                          const g = (window.grecaptcha?.enterprise && typeof window.grecaptcha.enterprise.execute === 'function')
+                            ? window.grecaptcha.enterprise
+                            : window.grecaptcha;
+                          if (!g || typeof g.execute !== 'function') return reject('NO_GRECAPTCHA');
+                          try {
+                            g.ready(() => {
+                              g.execute(sitekey, { action }).then(resolve).catch((err) => reject(String(err)));
+                            });
+                          } catch (e) { reject(String(e)); }
+                        })""",
+                        {"sitekey": RECAPTCHA_SITEKEY, "action": RECAPTCHA_ACTION},
+                    )
+                    if isinstance(token, str) and token:
+                        payload["recaptchaV3Token"] = token
+                except Exception as e:
+                    debug_print(f"  ??? Failed to generate fresh token (Chrome fetch): {e}")
+
+            async def _fetch() -> dict:
+                body = json.dumps(payload) if payload is not None else ""
+                result = await page.evaluate(
                 """async ({url, method, body, timeoutMs}) => {
                   const controller = new AbortController();
                   const timer = setTimeout(() => controller.abort('timeout'), timeoutMs);
@@ -912,12 +1028,12 @@ async def fetch_lmarena_stream_via_chrome(
                       credentials: 'include',
                       signal: controller.signal,
                     });
-	                    const headers = {};
-	                    try {
-	                      if (res.headers && typeof res.headers.forEach === 'function') {
-	                        res.headers.forEach((value, key) => { headers[key] = value; });
-	                      }
-	                    } catch (e) {}
+                    const headers = {};
+                    try {
+                      if (res.headers && typeof res.headers.forEach === 'function') {
+                        res.headers.forEach((value, key) => { headers[key] = value; });
+                      }
+                    } catch (e) {}
                     let text = '';
                     if (res.body) {
                       const reader = res.body.getReader();
@@ -945,6 +1061,37 @@ async def fetch_lmarena_stream_via_chrome(
                     "timeoutMs": int(timeout_seconds * 1000),
                 },
             )
+                return result if isinstance(result, dict) else {"status": 0, "headers": {}, "text": ""}
+
+            try:
+                max_recaptcha_attempts = int(config.get("chrome_fetch_recaptcha_max_attempts", 6))
+            except (TypeError, ValueError):
+                max_recaptcha_attempts = 6
+            max_recaptcha_attempts = max(1, min(max_recaptcha_attempts, 10))
+            is_unit_test = bool(os.environ.get("PYTEST_CURRENT_TEST")) and os.environ.get(
+                "RUN_LMARENA_INTEGRATION"
+            ) != "1"
+            result: dict = {"status": 0, "headers": {}, "text": ""}
+            for attempt in range(max_recaptcha_attempts):
+                if attempt == 0:
+                    if should_generate_token:
+                        await _generate_recaptcha_v3_token(force=False)
+                else:
+                    await _generate_recaptcha_v3_token(force=True)
+
+                result = await _fetch()
+                if not (
+                    isinstance(payload, dict)
+                    and not payload.get("recaptchaV2Token")
+                    and _is_recaptcha_validation_failed(
+                        int(result.get("status") or 0), result.get("text")
+                    )
+                ):
+                    break
+
+                if attempt < max_recaptcha_attempts - 1 and not is_unit_test:
+                    # Exponential backoff improves reCAPTCHA score and avoids hammering the upstream.
+                    await asyncio.sleep(min(0.8 * (2**attempt), 5.0))
 
             # Persist latest cookies/UA (helps later requests align with the browser session).
             try:
@@ -962,13 +1109,37 @@ async def fetch_lmarena_stream_via_chrome(
             except Exception:
                 pass
 
-            return BrowserFetchStreamResponse(
+            response = BrowserFetchStreamResponse(
                 int(result.get("status") or 0),
                 result.get("headers") if isinstance(result, dict) else {},
                 result.get("text") if isinstance(result, dict) else "",
             )
+            if (
+                force_headful is None
+                and auto_headful
+                and headless
+                and isinstance(payload, dict)
+                and not payload.get("recaptchaV2Token")
+                and _is_recaptcha_validation_failed(int(result.get("status") or 0), result.get("text"))
+            ):
+                need_headful_retry = True
         finally:
             await context.close()
+
+    if need_headful_retry:
+        debug_print("  ?? Retrying Chrome fetch in headful mode after reCAPTCHA failure.")
+        if isinstance(payload, dict) and not payload.get("recaptchaV2Token"):
+            payload["recaptchaV3Token"] = ""
+        return await fetch_lmarena_stream_via_chrome(
+            http_method=http_method,
+            url=url,
+            payload=payload,
+            auth_token=auth_token,
+            timeout_seconds=timeout_seconds,
+            force_headful=True,
+        )
+
+    return response
 
 
 async def fetch_lmarena_stream_via_camoufox(
@@ -1020,9 +1191,12 @@ async def fetch_lmarena_stream_via_camoufox(
 
     should_generate_token = bool(generate_token)
     if isinstance(payload, dict):
-        existing_token = str(payload.get("recaptchaV3Token") or "").strip()
-        if not existing_token:
-            should_generate_token = True
+        if payload.get("recaptchaV2Token"):
+            should_generate_token = False
+        else:
+            existing_token = str(payload.get("recaptchaV3Token") or "").strip()
+            if not existing_token:
+                should_generate_token = True
 
     async with AsyncCamoufox(
         headless=recaptcha_headless,
@@ -1031,30 +1205,37 @@ async def fetch_lmarena_stream_via_camoufox(
         user_data_dir=str(profile_dir),
     ) as context:
         try:
-            try:
-                await context.clear_cookies()
-            except Exception:
-                pass
-            
-            if cf_clearance:
-                cookie_map["cf_clearance"] = cf_clearance
-            if cf_bm:
-                cookie_map["__cf_bm"] = cf_bm
-            if cfuvid:
-                cookie_map["_cfuvid"] = cfuvid
-            if provisional_user_id:
-                cookie_map["provisional_user_id"] = provisional_user_id
+            clear_cookies = bool(config.get("browser_fetch_clear_cookies", False))
+            if clear_cookies:
+                try:
+                    await context.clear_cookies()
+                except Exception:
+                    pass
 
-            cookies = [
-                {"name": name, "value": value, "domain": ".lmarena.ai", "path": "/"}
-                for name, value in cookie_map.items()
-                if name and value
-            ]
+            cookies = []
+            if clear_cookies:
+                if cf_clearance:
+                    cookie_map["cf_clearance"] = cf_clearance
+                if cf_bm:
+                    cookie_map["__cf_bm"] = cf_bm
+                if cfuvid:
+                    cookie_map["_cfuvid"] = cfuvid
+                if provisional_user_id:
+                    cookie_map["provisional_user_id"] = provisional_user_id
+
+                cookies.extend(
+                    [
+                        {"name": name, "value": value, "domain": ".lmarena.ai", "path": "/"}
+                        for name, value in cookie_map.items()
+                        if name and value
+                    ]
+                )
             cookies.extend(build_playwright_arena_auth_cookies(auth_token))
-            try:
-                await context.add_cookies(cookies)
-            except Exception:
-                pass
+            if cookies:
+                try:
+                    await context.add_cookies(cookies)
+                except Exception:
+                    pass
 
             page = await context.new_page()
             await page.goto("https://lmarena.ai/?mode=direct", wait_until="domcontentloaded")
@@ -1139,12 +1320,12 @@ async def fetch_lmarena_stream_via_camoufox(
                       credentials: 'include',
                       signal: controller.signal,
                     });
-	                    const headers = {};
-	                    try {
-	                      if (res.headers && typeof res.headers.forEach === 'function') {
-	                        res.headers.forEach((value, key) => { headers[key] = value; });
-	                      }
-	                    } catch (e) {}
+                    const headers = {};
+                    try {
+                      if (res.headers && typeof res.headers.forEach === 'function') {
+                        res.headers.forEach((value, key) => { headers[key] = value; });
+                      }
+                    } catch (e) {}
                     let text = '';
                     if (res.body) {
                       const reader = res.body.getReader();
@@ -2342,12 +2523,34 @@ async def process_message_content(content, model_capabilities: dict) -> tuple[st
     # Fallback
     return str(content), []
 
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    try:
+        await startup_event()
+    except Exception:
+        pass
+
+    try:
+        yield
+    finally:
+        refresh_task = getattr(app.state, "periodic_refresh_task", None)
+        if refresh_task is not None:
+            refresh_task.cancel()
+            try:
+                await refresh_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+
+
+app = FastAPI(lifespan=lifespan)
 
 # --- Constants & Global State ---
 CONFIG_FILE = "config.json"
 MODELS_FILE = "models.json"
 API_KEY_HEADER = APIKeyHeader(name="Authorization")
+CONFIG_WRITE_LOCK = threading.Lock()
 
 # In-memory stores
 # { "api_key": { "conversation_id": session_data } }
@@ -2364,6 +2567,37 @@ current_token_index = 0
 conversation_tokens: Dict[str, str] = {}
 # Track failed tokens per request to avoid retrying with same token
 request_failed_tokens: Dict[str, set] = {}
+
+# --- Concurrency & Cooldown Globals ---
+GLOBAL_REQUEST_SEMAPHORE: Optional[asyncio.Semaphore] = None
+LAST_REQUEST_TIME: float = 0.0
+LAST_REQUEST_LOCK: asyncio.Lock = asyncio.Lock()
+
+@asynccontextmanager
+async def upstream_concurrency_control():
+    """Limits concurrent requests and enforces a global cooldown."""
+    if GLOBAL_REQUEST_SEMAPHORE:
+        await GLOBAL_REQUEST_SEMAPHORE.acquire()
+    try:
+        config = get_config()
+        cooldown = float(config.get("request_cooldown_seconds", 2.0))
+        is_unit_test = bool(os.environ.get("PYTEST_CURRENT_TEST")) and os.environ.get("RUN_LMARENA_INTEGRATION") != "1"
+        if is_unit_test:
+            cooldown = 0.0
+        async with LAST_REQUEST_LOCK:
+            global LAST_REQUEST_TIME
+            now = time.time()
+            elapsed = now - LAST_REQUEST_TIME
+            if elapsed < cooldown:
+                wait = cooldown - elapsed
+                debug_print(f"⏳ Global cooldown: waiting {wait:.2f}s...")
+                await asyncio.sleep(wait)
+            # Update timestamp to now (plus wait) so the next request respects the gap
+            LAST_REQUEST_TIME = time.time()
+        yield
+    finally:
+        if GLOBAL_REQUEST_SEMAPHORE:
+            GLOBAL_REQUEST_SEMAPHORE.release()
 
 # --- New Global State for reCAPTCHA ---
 RECAPTCHA_TOKEN_POOLS: Dict[str, Deque[str]] = {}
@@ -2397,6 +2631,8 @@ def get_config():
         config.setdefault("password", "admin")
         config.setdefault("auth_token", "")
         config.setdefault("auth_tokens", [])  # Multiple auth tokens
+        # If no auth tokens are configured, try to auto-load from the persistent browser profile (cookies.sqlite).
+        config.setdefault("auto_load_auth_token_from_profile", True)
         config.setdefault("cf_clearance", "")
         config.setdefault("cf_bm", "")
         config.setdefault("cfuvid", "")
@@ -2404,6 +2640,9 @@ def get_config():
         config.setdefault("user_agent", "")
         config.setdefault("browser_cookies", {})
         config.setdefault("browser_profile_dir", "")
+        # When true, we wipe cookies before Playwright/Camoufox fetches; keeping this off helps
+        # preserve a manually-validated browser profile (often required for reCAPTCHA v3 score).
+        config.setdefault("browser_fetch_clear_cookies", False)
         config.setdefault("recaptcha_headless", True)
         config.setdefault("recaptcha_headful", False)
         # LMArena sometimes requires reCAPTCHA v2 fallback when v3 fails.
@@ -2413,12 +2652,19 @@ def get_config():
         config.setdefault("recaptcha_v2_max_attempts", 2)
         # If headless browser fetch keeps failing reCAPTCHA v3, retry once in headful mode.
         config.setdefault("recaptcha_v3_auto_headful", True)
+        # Optionally force headful Chrome for grounding/search streams (can improve reCAPTCHA score on some setups).
+        config.setdefault("chrome_fetch_headful_for_search", False)
+        # How many in-session reCAPTCHA v3 attempts to allow during Chrome fetch before falling back to outer retries.
+        config.setdefault("chrome_fetch_recaptcha_max_attempts", 6)
         # reCAPTCHA tokens are single-use and can be finicky; keep the default conservative.
         config.setdefault("recaptcha_token_pool_size", 3)
         # Optional upstream transport toggles.
         config.setdefault("upstream_via_browser", False)
         config.setdefault("upstream_via_camoufox", False)
         config.setdefault("upstream_via_curl_cffi", False)
+        # When true, try Camoufox once after a reCAPTCHA 403 from Chrome fetch.
+        # Disabled by default because Camoufox token generation can be slow/time out.
+        config.setdefault("camoufox_boost_on_recaptcha_403", False)
         # Userscript-supplied reCAPTCHA tokens (manual browser assist).
         config.setdefault("recaptcha_userscript_enabled", False)
         config.setdefault("recaptcha_userscript_only", False)
@@ -2432,6 +2678,13 @@ def get_config():
         config.setdefault("userscript_proxy_poll_timeout_seconds", 25)
         # Userscript client proxy mode (external streaming client).
         config.setdefault("enable_userscript_client_proxy", False)
+        # Upstream concurrency & cooldown
+        config.setdefault("concurrent_request_limit", 1)  # Conservative default
+        config.setdefault("request_cooldown_seconds", 2.0)
+        config.setdefault("rate_limit_backoff_base", 5)
+        # Streaming retry config (primarily to survive upstream 429 bursts).
+        config.setdefault("stream_max_retries", 6)
+        config.setdefault("stream_rate_limit_max_retries", 6)
         config.setdefault("api_keys", [])
         config.setdefault("usage_stats", {})
 
@@ -2487,6 +2740,92 @@ def get_config():
             normalized_api_keys.append(normalized)
 
         config["api_keys"] = normalized_api_keys
+
+        # Back-compat: if a single `auth_token` is configured, treat it as the only entry.
+        auth_token_single = str(config.get("auth_token") or "").strip()
+        auth_tokens_value = config.get("auth_tokens", [])
+        auth_tokens: List[str] = []
+        if isinstance(auth_tokens_value, list):
+            auth_tokens = [str(t).strip() for t in auth_tokens_value if isinstance(t, str) and t.strip()]
+
+        if not auth_tokens and auth_token_single:
+            auth_tokens = [auth_token_single]
+
+        # No human assistance: if tokens are missing, try to recover from the persistent browser profile.
+        is_unit_test = bool(os.environ.get("PYTEST_CURRENT_TEST")) and os.environ.get("RUN_LMARENA_INTEGRATION") != "1"
+        if (
+            not auth_tokens
+            and not auth_token_single
+            and bool(config.get("auto_load_auth_token_from_profile", True))
+            and not is_unit_test
+        ):
+            recovered: Optional[str] = None
+
+            cookie_store = config.get("browser_cookies", {})
+            if isinstance(cookie_store, dict):
+                direct_cookie = cookie_store.get("arena-auth-prod-v1")
+                if isinstance(direct_cookie, str) and direct_cookie.strip():
+                    recovered = direct_cookie.strip()
+                else:
+                    parts: list[tuple[int, str]] = []
+                    for name, value in cookie_store.items():
+                        if not isinstance(name, str) or not name.startswith("arena-auth-prod-v1."):
+                            continue
+                        suffix = name.split(".")[-1]
+                        if not suffix.isdigit() or not isinstance(value, str) or not value:
+                            continue
+                        parts.append((int(suffix), value))
+                    if parts:
+                        recovered = "".join(v for _, v in sorted(parts, key=lambda p: p[0])).strip() or None
+
+            if not recovered:
+                override = config.get("browser_profile_dir")
+                if isinstance(override, str) and override.strip():
+                    profile_dir = Path(override).expanduser().resolve() / "chrome_grecaptcha"
+                else:
+                    profile_dir = Path(CONFIG_FILE).with_name("chrome_grecaptcha")
+                cookies_db = profile_dir / "cookies.sqlite"
+                if cookies_db.exists():
+                    try:
+                        import sqlite3
+
+                        con = sqlite3.connect(str(cookies_db))
+                        cur = con.cursor()
+                        cur.execute(
+                            "SELECT name, value FROM moz_cookies "
+                            "WHERE host LIKE '%lmarena.ai%' AND name LIKE 'arena-auth-prod-v1%'"
+                        )
+                        rows = cur.fetchall()
+                        con.close()
+
+                        direct = next(
+                            (
+                                v
+                                for n, v in rows
+                                if n == "arena-auth-prod-v1" and isinstance(v, str) and v
+                            ),
+                            None,
+                        )
+                        if isinstance(direct, str) and direct.strip():
+                            recovered = direct.strip()
+                        else:
+                            db_parts: list[tuple[int, str]] = []
+                            for n, v in rows:
+                                if not isinstance(n, str) or not n.startswith("arena-auth-prod-v1."):
+                                    continue
+                                suffix = n.split(".")[-1]
+                                if not suffix.isdigit() or not isinstance(v, str) or not v:
+                                    continue
+                                db_parts.append((int(suffix), v))
+                            if db_parts:
+                                recovered = "".join(v for _, v in sorted(db_parts, key=lambda p: p[0])).strip() or None
+                    except Exception:
+                        recovered = None
+
+            if recovered:
+                auth_tokens = [recovered]
+
+        config["auth_tokens"] = auth_tokens
     except Exception as e:
         debug_print(f"⚠️  Error setting config defaults: {e}")
     
@@ -2506,8 +2845,12 @@ def save_config(config):
     try:
         # Persist in-memory stats to the config dict before saving
         config["usage_stats"] = dict(model_usage_stats)
-        with open(CONFIG_FILE, "w") as f:
-            json.dump(config, f, indent=4)
+        config_path = Path(CONFIG_FILE)
+        tmp_path = config_path.with_suffix(config_path.suffix + ".tmp")
+        payload = json.dumps(config, indent=4)
+        with CONFIG_WRITE_LOCK:
+            tmp_path.write_text(payload, encoding="utf-8")
+            os.replace(tmp_path, config_path)
     except Exception as e:
         debug_print(f"❌ Error saving config: {e}")
 
@@ -3135,8 +3478,8 @@ async def periodic_refresh_task():
             # Continue the loop even if there's an error
             continue
 
-@app.on_event("startup")
 async def startup_event():
+    global GLOBAL_REQUEST_SEMAPHORE
     try:
         # Ensure config and models files exist
         save_config(get_config())
@@ -3144,6 +3487,13 @@ async def startup_event():
         # Load usage stats from config
         load_usage_stats()
         
+        # Initialize concurrency semaphore
+        config = get_config()
+        limit = int(config.get("concurrent_request_limit", 1))
+        limit = max(1, limit)
+        GLOBAL_REQUEST_SEMAPHORE = asyncio.Semaphore(limit)
+        debug_print(f"🚦 Concurrency limit set to {limit}")
+
         # 1. First, get initial data (cookies, models, etc.)
         # We await this so we have the cookie BEFORE trying reCAPTCHA
         await get_initial_data() 
@@ -3160,7 +3510,7 @@ async def startup_event():
             debug_print(f"⚠️  Startup reCAPTCHA prefetch failed: {e}")
         
         # 3. Start background tasks
-        asyncio.create_task(periodic_refresh_task())
+        app.state.periodic_refresh_task = asyncio.create_task(periodic_refresh_task())
         
     except Exception as e:
         debug_print(f"❌ Error during startup: {e}")
@@ -4371,13 +4721,22 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
         # (Retry PUT requests currently send an empty payload.)
         if http_method != "PUT":
             config_snapshot = get_config()
-            use_upstream_browser_fetch = bool(
-                config_snapshot.get("upstream_via_browser", False)
-                or config_snapshot.get("upstream_via_camoufox", False)
-                or config_snapshot.get("recaptcha_v2_enabled", False)
-            )
-
-            if use_userscript_proxy or (os.environ.get("PYTEST_CURRENT_TEST") and use_upstream_browser_fetch):
+            chrome_available = find_chrome_executable(config_snapshot) is not None
+            camoufox_available = get_async_camoufox() is not None
+            will_use_browser_fetch_for_stream = False
+            if stream:
+                will_use_browser_fetch_for_stream = bool(
+                    (bool(config_snapshot.get("upstream_via_camoufox", False)) and camoufox_available)
+                    or (
+                        (
+                            bool(config_snapshot.get("upstream_via_browser", False))
+                            or bool(config_snapshot.get("recaptcha_v2_enabled", False))
+                            or modality == "search"
+                        )
+                        and chrome_available
+                    )
+                )
+            if use_userscript_proxy or will_use_browser_fetch_for_stream:
                 payload["recaptchaV3Token"] = payload.get("recaptchaV3Token", "")
             else:
                 recaptcha_token = await refresh_recaptcha_token(auth_token=current_token, force_new=False)
@@ -4671,8 +5030,17 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                     return
 
                 # Retry logic for streaming
-                max_retries = 6
                 config_snapshot = get_config()
+                # Default is still 6, but allow config override (especially for 429 bursts).
+                max_retries_raw = config_snapshot.get(
+                    "stream_rate_limit_max_retries",
+                    config_snapshot.get("stream_max_retries", 6),
+                )
+                try:
+                    max_retries = int(max_retries_raw)
+                except (TypeError, ValueError):
+                    max_retries = 6
+                max_retries = max(1, min(max_retries, 50))
                 curl_allowed = bool(config_snapshot.get("upstream_via_curl_cffi", False)) and curl_requests is not None
                 chrome_available = find_chrome_executable(config_snapshot) is not None
                 camoufox_available = get_async_camoufox() is not None
@@ -4680,10 +5048,12 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                 prefer_chrome = (
                     bool(config_snapshot.get("upstream_via_browser", False))
                     or bool(config_snapshot.get("recaptcha_v2_enabled", False))
+                    or modality == "search"
                 ) and chrome_available
                 transport_mode = "camoufox" if prefer_camoufox else ("chrome" if prefer_chrome else "httpx")
                 curl_recaptcha_failures = 0
                 camoufox_boost_attempted = False
+                camoufox_boost_enabled = bool(config_snapshot.get("camoufox_boost_on_recaptcha_403", False))
                 prompt_failed_from_camoufox = False
 
                 recaptcha_v2_enabled = bool(config_snapshot.get("recaptcha_v2_enabled", False))
@@ -4719,7 +5089,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                     nonlocal transport_mode
                     while True:
                         if transport_mode == "camoufox":
-                            if isinstance(payload, dict) and "recaptchaV3Token" in payload:
+                            if isinstance(payload, dict) and not payload.get("recaptchaV2Token"):
                                 payload["recaptchaV3Token"] = ""
                             response = await fetch_lmarena_stream_via_camoufox(
                                 http_method=http_method,
@@ -4735,6 +5105,8 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                             continue
 
                         if transport_mode == "chrome":
+                            if isinstance(payload, dict) and not payload.get("recaptchaV2Token"):
+                                payload["recaptchaV3Token"] = ""
                             response = await fetch_lmarena_stream_via_chrome(
                                 http_method=http_method,
                                 url=url,
@@ -4795,7 +5167,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                         async with httpx.AsyncClient() as client:
                             debug_print(f"📡 Sending {http_method} request for streaming (attempt {attempt + 1}/{max_retries})...")
                             
-                            async with open_stream(client) as response:
+                            async with upstream_concurrency_control(), open_stream(client) as response:
                                 # Log status with human-readable message
                                 log_http_status(response.status_code, "LMArena API Stream")
                                 
@@ -4863,6 +5235,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                             not prompt_failed
                                             and isinstance(payload, dict)
                                             and "recaptchaV3Token" in payload
+                                            and transport_mode in ("httpx", "curl")
                                         ):
                                             new_recaptcha = await refresh_recaptcha_token(
                                                 auth_token=current_token, force_new=True
@@ -4966,7 +5339,12 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                             await asyncio.sleep(1)
                                             continue
 
-                                        if transport_mode == "chrome" and camoufox_available and not camoufox_boost_attempted:
+                                        if (
+                                            transport_mode == "chrome"
+                                            and camoufox_available
+                                            and camoufox_boost_enabled
+                                            and not camoufox_boost_attempted
+                                        ):
                                             camoufox_boost_attempted = True
                                             transport_mode = "camoufox"
                                             await asyncio.sleep(1)
@@ -4989,6 +5367,11 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                         if recaptcha_v2_enabled:
                                             if chrome_available:
                                                 transport_mode = "chrome"
+                                            await asyncio.sleep(1)
+                                            continue
+
+                                        if transport_mode in ("chrome", "camoufox"):
+                                            # Browser fetch mints tokens in-session; no external refresh needed.
                                             await asyncio.sleep(1)
                                             continue
 
