@@ -362,11 +362,14 @@ async def get_recaptcha_v3_token() -> Optional[str]:
         debug_print(f"❌ Unexpected error: {e}")
         return None
 
-async def refresh_recaptcha_token():
+async def refresh_recaptcha_token(force_new: bool = False):
     """Checks if the global reCAPTCHA token is expired and refreshes it if necessary."""
     global RECAPTCHA_TOKEN, RECAPTCHA_EXPIRY
     
     current_time = datetime.now(timezone.utc)
+    if force_new:
+        RECAPTCHA_TOKEN = None
+        RECAPTCHA_EXPIRY = current_time - timedelta(days=365)
     # Check if token is expired (set a refresh margin of 10 seconds)
     if RECAPTCHA_TOKEN is None or current_time > RECAPTCHA_EXPIRY - timedelta(seconds=10):
         debug_print("🔄 Recaptcha token expired or missing. Refreshing...")
@@ -2264,6 +2267,22 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                     debug_print(f"❌ No more tokens available: {e.detail}")
                                     break
                         
+                        elif response.status_code == HTTPStatus.FORBIDDEN:
+                            try:
+                                error_body = response.json()
+                            except Exception:
+                                error_body = None
+                            if isinstance(error_body, dict) and error_body.get("error") == "recaptcha validation failed":
+                                debug_print(
+                                    f"🤖 Attempt {attempt + 1}/{max_retries} - reCAPTCHA validation failed. Refreshing token..."
+                                )
+                                new_token = await refresh_recaptcha_token(force_new=True)
+                                if new_token and isinstance(payload, dict):
+                                    payload["recaptchaV3Token"] = new_token
+                                if attempt < max_retries - 1:
+                                    await asyncio.sleep(1)
+                                    continue
+
                         elif response.status_code == HTTPStatus.UNAUTHORIZED:
                             debug_print(f"🔒 Attempt {attempt + 1}/{max_retries} - Auth failed with token {current_token[:20]}...")
                             # Add current token to failed set
@@ -2335,6 +2354,23 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                         await asyncio.sleep(1)
                                         continue
                                 
+                                elif response.status_code == HTTPStatus.FORBIDDEN:
+                                    try:
+                                        body_bytes = await response.aread()
+                                        error_body = json.loads(body_bytes.decode("utf-8", errors="replace"))
+                                    except Exception:
+                                        error_body = None
+                                    if isinstance(error_body, dict) and error_body.get("error") == "recaptcha validation failed":
+                                        debug_print(
+                                            f"🤖 Stream attempt {attempt + 1}/{max_retries} - reCAPTCHA validation failed. Refreshing token..."
+                                        )
+                                        new_token = await refresh_recaptcha_token(force_new=True)
+                                        if new_token and isinstance(payload, dict):
+                                            payload["recaptchaV3Token"] = new_token
+                                        if attempt < max_retries - 1:
+                                            await asyncio.sleep(1)
+                                            continue
+
                                 elif response.status_code == HTTPStatus.UNAUTHORIZED:
                                     debug_print(f"🔒 Stream token expired")
                                     remove_auth_token(current_token)
