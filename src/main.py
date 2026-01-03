@@ -406,6 +406,246 @@ async def safe_page_evaluate(page, script: str, retries: int = 3):
         raise last_exc
     raise RuntimeError("Page.evaluate failed")
 
+
+class BrowserFetchStreamResponse:
+    def __init__(self, status_code: int, headers: Optional[dict], text: str, method: str, url: str):
+        self.status_code = int(status_code or 0)
+        self.headers = headers or {}
+        self._text = text or ""
+        self._method = str(method or "POST")
+        self._url = str(url or "")
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> bool:
+        return False
+
+    async def aclose(self) -> None:
+        return None
+
+    async def aiter_lines(self):
+        for line in self._text.splitlines():
+            yield line
+
+    async def aread(self) -> bytes:
+        return self._text.encode("utf-8")
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            request = httpx.Request(self._method, self._url or "https://lmarena.ai/")
+            response = httpx.Response(self.status_code, request=request, content=self._text.encode("utf-8"))
+            raise httpx.HTTPStatusError(f"HTTP {self.status_code}", request=request, response=response)
+
+
+async def fetch_lmarena_stream_via_chrome(
+    http_method: str,
+    url: str,
+    payload: dict,
+    auth_token: str,
+    timeout_seconds: int = 120,
+    headless: bool = True,
+    max_recaptcha_attempts: int = 3,
+) -> Optional[BrowserFetchStreamResponse]:
+    """
+    Fallback transport: perform the stream request via in-browser fetch (Chrome/Edge via Playwright).
+    This tends to align cookies/UA/TLS with what LMArena expects and can reduce reCAPTCHA flakiness.
+    """
+    try:
+        from playwright.async_api import async_playwright  # type: ignore
+    except Exception:
+        return None
+
+    chrome_path = find_chrome_executable()
+    if not chrome_path:
+        return None
+
+    config = get_config()
+
+    cookie_store = config.get("browser_cookies")
+    cookie_map: dict[str, str] = {}
+    if isinstance(cookie_store, dict):
+        for name, value in cookie_store.items():
+            if not name or not value:
+                continue
+            cookie_map[str(name)] = str(value)
+
+    cf_clearance = str(config.get("cf_clearance") or cookie_map.get("cf_clearance") or "").strip()
+    cf_bm = str(config.get("cf_bm") or cookie_map.get("__cf_bm") or "").strip()
+    cfuvid = str(config.get("cfuvid") or cookie_map.get("_cfuvid") or "").strip()
+    provisional_user_id = str(
+        config.get("provisional_user_id") or cookie_map.get("provisional_user_id") or ""
+    ).strip()
+
+    cookies: list[dict] = []
+    if cf_clearance:
+        cookies.append({"name": "cf_clearance", "value": cf_clearance, "domain": ".lmarena.ai", "path": "/"})
+    if cf_bm:
+        cookies.append({"name": "__cf_bm", "value": cf_bm, "domain": ".lmarena.ai", "path": "/"})
+    if cfuvid:
+        cookies.append({"name": "_cfuvid", "value": cfuvid, "domain": ".lmarena.ai", "path": "/"})
+    if provisional_user_id:
+        cookies.append(
+            {"name": "provisional_user_id", "value": provisional_user_id, "domain": ".lmarena.ai", "path": "/"}
+        )
+    if auth_token:
+        cookies.append(
+            {"name": "arena-auth-prod-v1", "value": auth_token, "domain": ".lmarena.ai", "path": "/"}
+        )
+
+    user_agent = str(config.get("user_agent") or "").strip()
+
+    fetch_url = url
+    if fetch_url.startswith("https://lmarena.ai"):
+        fetch_url = fetch_url[len("https://lmarena.ai") :]
+    if not fetch_url.startswith("/"):
+        fetch_url = "/" + fetch_url
+
+    def _is_recaptcha_validation_failed(status: int, text: object) -> bool:
+        if int(status or 0) != HTTPStatus.FORBIDDEN:
+            return False
+        if not isinstance(text, str) or not text:
+            return False
+        try:
+            body = json.loads(text)
+        except Exception:
+            return False
+        return isinstance(body, dict) and body.get("error") == "recaptcha validation failed"
+
+    max_recaptcha_attempts = max(1, min(int(max_recaptcha_attempts), 10))
+
+    profile_dir = Path(CONFIG_FILE).with_name("chrome_grecaptcha")
+    async with async_playwright() as p:
+        context = await p.chromium.launch_persistent_context(
+            user_data_dir=str(profile_dir),
+            executable_path=chrome_path,
+            headless=bool(headless),
+            user_agent=user_agent or None,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-first-run",
+                "--no-default-browser-check",
+            ],
+        )
+        try:
+            if cookies:
+                try:
+                    await context.add_cookies(cookies)
+                except Exception:
+                    pass
+
+            page = await context.new_page()
+            await page.goto("https://lmarena.ai/?mode=direct", wait_until="domcontentloaded", timeout=120000)
+
+            # Light warm-up (often improves reCAPTCHA v3 score vs firing immediately).
+            try:
+                await page.mouse.move(100, 100)
+                await page.mouse.wheel(0, 200)
+                await asyncio.sleep(0.8)
+            except Exception:
+                pass
+
+            async def _mint_recaptcha_v3_token() -> Optional[str]:
+                await page.wait_for_function(
+                    "window.grecaptcha && ("
+                    "(window.grecaptcha.enterprise && typeof window.grecaptcha.enterprise.execute === 'function') || "
+                    "typeof window.grecaptcha.execute === 'function'"
+                    ")",
+                    timeout=60000,
+                )
+                token = await page.evaluate(
+                    """({sitekey, action}) => new Promise((resolve, reject) => {
+                      const g = (window.grecaptcha?.enterprise && typeof window.grecaptcha.enterprise.execute === 'function')
+                        ? window.grecaptcha.enterprise
+                        : window.grecaptcha;
+                      if (!g || typeof g.execute !== 'function' || typeof g.ready !== 'function') return reject('NO_GRECAPTCHA');
+                      try {
+                        g.ready(() => {
+                          g.execute(sitekey, { action }).then(resolve).catch((err) => reject(String(err)));
+                        });
+                      } catch (e) { reject(String(e)); }
+                    })""",
+                    {"sitekey": RECAPTCHA_SITEKEY, "action": RECAPTCHA_ACTION},
+                )
+                if isinstance(token, str) and token:
+                    return token
+                return None
+
+            fetch_script = """async ({url, method, body, timeoutMs}) => {
+              const controller = new AbortController();
+              const timer = setTimeout(() => controller.abort('timeout'), timeoutMs);
+              try {
+                const res = await fetch(url, {
+                  method,
+                  headers: { 'content-type': 'text/plain;charset=UTF-8' },
+                  body,
+                  credentials: 'include',
+                  signal: controller.signal,
+                });
+                const headers = {};
+                try {
+                  if (res.headers && typeof res.headers.forEach === 'function') {
+                    res.headers.forEach((value, key) => { headers[key] = value; });
+                  }
+                } catch (e) {}
+                let text = '';
+                if (res.body) {
+                  const reader = res.body.getReader();
+                  const decoder = new TextDecoder();
+                  while (true) {
+                    const { value, done } = await reader.read();
+                    if (done) break;
+                    if (value) text += decoder.decode(value, { stream: true });
+                  }
+                  text += decoder.decode();
+                } else {
+                  text = await res.text();
+                }
+                return { status: res.status, headers, text };
+              } catch (e) {
+                return { status: 0, headers: {}, text: 'FETCH_ERROR:' + String(e) };
+              } finally {
+                clearTimeout(timer);
+              }
+            }"""
+
+            result: dict = {"status": 0, "headers": {}, "text": ""}
+            for attempt in range(max_recaptcha_attempts):
+                if isinstance(payload, dict) and not payload.get("recaptchaV2Token"):
+                    token = await _mint_recaptcha_v3_token()
+                    if token:
+                        payload["recaptchaV3Token"] = token
+
+                body = json.dumps(payload) if payload is not None else ""
+                result = await page.evaluate(
+                    fetch_script,
+                    {
+                        "url": fetch_url,
+                        "method": http_method,
+                        "body": body,
+                        "timeoutMs": int(timeout_seconds * 1000),
+                    },
+                )
+                if not _is_recaptcha_validation_failed(int(result.get("status") or 0), result.get("text")):
+                    break
+
+                if attempt < max_recaptcha_attempts - 1:
+                    await asyncio.sleep(min(0.8 * (2**attempt), 5.0))
+
+            response = BrowserFetchStreamResponse(
+                int(result.get("status") or 0),
+                result.get("headers") if isinstance(result, dict) else {},
+                result.get("text") if isinstance(result, dict) else "",
+                method=http_method,
+                url=url,
+            )
+            return response
+        except Exception as e:
+            debug_print(f"??? Chrome fetch transport failed: {e}")
+            return None
+        finally:
+            await context.close()
+
 async def get_recaptcha_v3_token() -> Optional[str]:
     """
     Retrieves reCAPTCHA v3 token using a 'Side-Channel' approach.
@@ -952,11 +1192,46 @@ def get_request_headers():
 def get_request_headers_with_token(token: str):
     """Get request headers with a specific auth token"""
     config = get_config()
-    cf_clearance = config.get("cf_clearance", "").strip()
-    return {
+    cf_clearance = str(config.get("cf_clearance") or "").strip()
+    cf_bm = str(config.get("cf_bm") or "").strip()
+    cfuvid = str(config.get("cfuvid") or "").strip()
+    provisional_user_id = str(config.get("provisional_user_id") or "").strip()
+
+    cookie_store = config.get("browser_cookies")
+    if isinstance(cookie_store, dict):
+        if not cf_clearance:
+            cf_clearance = str(cookie_store.get("cf_clearance") or "").strip()
+        if not cf_bm:
+            cf_bm = str(cookie_store.get("__cf_bm") or "").strip()
+        if not cfuvid:
+            cfuvid = str(cookie_store.get("_cfuvid") or "").strip()
+        if not provisional_user_id:
+            provisional_user_id = str(cookie_store.get("provisional_user_id") or "").strip()
+
+    cookie_parts: list[str] = []
+
+    def _add_cookie(name: str, value: str) -> None:
+        value = str(value or "").strip()
+        if value:
+            cookie_parts.append(f"{name}={value}")
+
+    _add_cookie("cf_clearance", cf_clearance)
+    _add_cookie("__cf_bm", cf_bm)
+    _add_cookie("_cfuvid", cfuvid)
+    _add_cookie("provisional_user_id", provisional_user_id)
+    _add_cookie("arena-auth-prod-v1", token)
+
+    headers: dict[str, str] = {
         "Content-Type": "text/plain;charset=UTF-8",
-        "Cookie": f"cf_clearance={cf_clearance}; arena-auth-prod-v1={token}",
+        "Cookie": "; ".join(cookie_parts),
+        "Origin": "https://lmarena.ai",
+        "Referer": "https://lmarena.ai/?mode=direct",
     }
+
+    user_agent = str(config.get("user_agent") or "").strip()
+    if user_agent:
+        headers["User-Agent"] = user_agent
+    return headers
 
 def get_next_auth_token(exclude_tokens: set = None):
     """Get next auth token using round-robin selection
@@ -2511,6 +2786,8 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
             async def generate_stream():
                 nonlocal current_token, headers
                 chunk_id = f"chatcmpl-{uuid.uuid4()}"
+                use_chrome_fetch = False
+                recaptcha_403_failures = 0
                 
                 # Retry logic for streaming
                 max_retries = 3
@@ -2522,11 +2799,25 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                     try:
                         async with httpx.AsyncClient() as client:
                             debug_print(f"📡 Sending {http_method} request for streaming (attempt {attempt + 1}/{max_retries})...")
-                            
-                            if http_method == "PUT":
-                                stream_context = client.stream('PUT', url, json=payload, headers=headers, timeout=120)
-                            else:
-                                stream_context = client.stream('POST', url, json=payload, headers=headers, timeout=120)
+                            stream_context = None
+                            if use_chrome_fetch:
+                                debug_print("🌐 Using Chrome fetch transport for streaming...")
+                                stream_context = await fetch_lmarena_stream_via_chrome(
+                                    http_method=http_method,
+                                    url=url,
+                                    payload=payload if isinstance(payload, dict) else {},
+                                    auth_token=current_token,
+                                    timeout_seconds=120,
+                                )
+                                if stream_context is None:
+                                    debug_print("⚠️ Chrome fetch transport unavailable; falling back to httpx.")
+                                    use_chrome_fetch = False
+
+                            if stream_context is None:
+                                if http_method == "PUT":
+                                    stream_context = client.stream('PUT', url, json=payload, headers=headers, timeout=120)
+                                else:
+                                    stream_context = client.stream('POST', url, json=payload, headers=headers, timeout=120)
                             
                             async with stream_context as response:
                                 # Log status with human-readable message
@@ -2553,12 +2844,18 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                     except Exception:
                                         error_body = None
                                     if isinstance(error_body, dict) and error_body.get("error") == "recaptcha validation failed":
+                                        recaptcha_403_failures += 1
                                         debug_print(
                                             f"🤖 Stream attempt {attempt + 1}/{max_retries} - reCAPTCHA validation failed. Refreshing token..."
                                         )
                                         new_token = await refresh_recaptcha_token(force_new=True)
                                         if new_token and isinstance(payload, dict):
                                             payload["recaptchaV3Token"] = new_token
+                                        if recaptcha_403_failures >= 2 and not use_chrome_fetch:
+                                            debug_print(
+                                                "🌐 Switching to Chrome fetch transport after repeated reCAPTCHA failures."
+                                            )
+                                            use_chrome_fetch = True
                                         if attempt < max_retries - 1:
                                             await asyncio.sleep(1)
                                             continue
@@ -3170,6 +3467,15 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 if __name__ == "__main__":
+    # Avoid crashes on Windows consoles with non-UTF8 code pages (e.g., GBK) when printing emojis.
+    try:
+        import sys
+
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
     print("=" * 60)
     print("🚀 LMArena Bridge Server Starting...")
     print("=" * 60)
