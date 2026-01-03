@@ -25,6 +25,7 @@ class TestStrictModelsForceChromeFetch(unittest.IsolatedAsyncioTestCase):
                     "password": "admin",
                     "cf_clearance": "",
                     "auth_tokens": ["auth-token-1"],
+                    "chrome_fetch_recaptcha_max_attempts": 6,
                     "api_keys": [{"name": "Test Key", "key": "test-key", "rpm": 999}],
                 }
             ),
@@ -96,8 +97,8 @@ class TestStrictModelsForceChromeFetch(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn("Hello", response.text)
         chrome_fetch_mock.assert_awaited()
+        self.assertEqual(chrome_fetch_mock.await_args.kwargs.get("max_recaptcha_attempts"), 6)
 
 
 if __name__ == "__main__":
     unittest.main()
-
