@@ -307,6 +307,7 @@ async def get_recaptcha_v3_token_with_chrome(config: dict) -> Optional[str]:
     cf_bm = str(config.get("cf_bm") or "").strip()
     cfuvid = str(config.get("cfuvid") or "").strip()
     provisional_user_id = str(config.get("provisional_user_id") or "").strip()
+    user_agent = str(config.get("user_agent") or "").strip()
 
     cookies = []
     if cf_clearance:
@@ -324,7 +325,8 @@ async def get_recaptcha_v3_token_with_chrome(config: dict) -> Optional[str]:
         context = await p.chromium.launch_persistent_context(
             user_data_dir=str(profile_dir),
             executable_path=chrome_path,
-            headless=True,
+            headless=False,  # Headful for better reCAPTCHA score/warmup
+            user_agent=user_agent or None,
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--no-first-run",
@@ -346,6 +348,18 @@ async def get_recaptcha_v3_token_with_chrome(config: dict) -> Optional[str]:
                         break
                     await click_turnstile(page)
                     await asyncio.sleep(2)
+            except Exception:
+                pass
+
+            # Persist updated cookies/UA from this real browser context (often refreshes arena-auth-prod-v1).
+            try:
+                fresh_cookies = await context.cookies("https://lmarena.ai")
+                try:
+                    ua_now = await page.evaluate("() => navigator.userAgent")
+                except Exception:
+                    ua_now = user_agent
+                if _upsert_browser_session_into_config(config, fresh_cookies, user_agent=ua_now):
+                    save_config(config)
             except Exception:
                 pass
 
@@ -444,7 +458,7 @@ async def fetch_lmarena_stream_via_chrome(
     payload: dict,
     auth_token: str,
     timeout_seconds: int = 120,
-    headless: bool = True,
+    headless: bool = False, # Default to Headful for better reliability
     max_recaptcha_attempts: int = 3,
 ) -> Optional[BrowserFetchStreamResponse]:
     """
@@ -542,6 +556,18 @@ async def fetch_lmarena_stream_via_chrome(
                 await page.mouse.move(100, 100)
                 await page.mouse.wheel(0, 200)
                 await asyncio.sleep(0.8)
+            except Exception:
+                pass
+
+            # Persist updated cookies/UA from this browser context (helps keep auth + cf cookies fresh).
+            try:
+                fresh_cookies = await context.cookies("https://lmarena.ai")
+                try:
+                    ua_now = await page.evaluate("() => navigator.userAgent")
+                except Exception:
+                    ua_now = user_agent
+                if _upsert_browser_session_into_config(config, fresh_cookies, user_agent=ua_now):
+                    save_config(config)
             except Exception:
                 pass
 
@@ -1159,6 +1185,70 @@ def save_config(config):
     except Exception as e:
         debug_print(f"❌ Error saving config: {e}")
 
+def _upsert_browser_session_into_config(config: dict, cookies: list[dict], user_agent: str | None = None) -> bool:
+    """
+    Persist useful browser session identity (cookies + UA) into config.json.
+    This helps keep Cloudflare + LMArena auth aligned with reCAPTCHA/browser fetch flows.
+    """
+    changed = False
+
+    cookie_store = config.get("browser_cookies")
+    if not isinstance(cookie_store, dict):
+        cookie_store = {}
+        config["browser_cookies"] = cookie_store
+        changed = True
+
+    for cookie in cookies or []:
+        name = cookie.get("name")
+        value = cookie.get("value")
+        if not name or value is None:
+            continue
+        name = str(name)
+        value = str(value)
+        if cookie_store.get(name) != value:
+            cookie_store[name] = value
+            changed = True
+
+    # Promote frequently-used cookies to top-level config keys.
+    cf_clearance = str(cookie_store.get("cf_clearance") or "").strip()
+    cf_bm = str(cookie_store.get("__cf_bm") or "").strip()
+    cfuvid = str(cookie_store.get("_cfuvid") or "").strip()
+    provisional_user_id = str(cookie_store.get("provisional_user_id") or "").strip()
+
+    if cf_clearance and config.get("cf_clearance") != cf_clearance:
+        config["cf_clearance"] = cf_clearance
+        changed = True
+    if cf_bm and config.get("cf_bm") != cf_bm:
+        config["cf_bm"] = cf_bm
+        changed = True
+    if cfuvid and config.get("cfuvid") != cfuvid:
+        config["cfuvid"] = cfuvid
+        changed = True
+    if provisional_user_id and config.get("provisional_user_id") != provisional_user_id:
+        config["provisional_user_id"] = provisional_user_id
+        changed = True
+
+    ua = str(user_agent or "").strip()
+    if ua and str(config.get("user_agent") or "").strip() != ua:
+        config["user_agent"] = ua
+        changed = True
+
+    # Keep arena-auth cookie in sync with auth token pool (so we don't require manual dashboard pastes).
+    arena_auth = str(cookie_store.get("arena-auth-prod-v1") or "").strip()
+    if arena_auth:
+        auth_tokens = config.get("auth_tokens")
+        if not isinstance(auth_tokens, list):
+            auth_tokens = []
+        if arena_auth not in auth_tokens:
+            auth_tokens.insert(0, arena_auth)
+            config["auth_tokens"] = auth_tokens
+            changed = True
+        if not str(config.get("auth_token") or "").strip():
+            config["auth_token"] = arena_auth
+            changed = True
+
+    return changed
+
 def get_models():
     try:
         with open(MODELS_FILE, "r") as f:
@@ -1184,6 +1274,13 @@ def get_request_headers():
         token = auth_tokens[0]  # Just use first token for non-API requests
     else:
         token = config.get("auth_token", "").strip()
+        if not token:
+            cookie_store = config.get("browser_cookies")
+            if isinstance(cookie_store, dict):
+                token = str(cookie_store.get("arena-auth-prod-v1") or "").strip()
+                if token:
+                    config["auth_tokens"] = [token]
+                    save_config(config)
         if not token:
             raise HTTPException(status_code=500, detail="Arena auth token not set in dashboard.")
     
@@ -1245,7 +1342,15 @@ def get_next_auth_token(exclude_tokens: set = None):
     # Get all available tokens
     auth_tokens = config.get("auth_tokens", [])
     if not auth_tokens:
-        raise HTTPException(status_code=500, detail="No auth tokens configured")
+        cookie_store = config.get("browser_cookies")
+        if isinstance(cookie_store, dict):
+            token = str(cookie_store.get("arena-auth-prod-v1") or "").strip()
+            if token:
+                config["auth_tokens"] = [token]
+                save_config(config)
+                auth_tokens = config.get("auth_tokens", [])
+        if not auth_tokens:
+            raise HTTPException(status_code=500, detail="No auth tokens configured")
     
     # Filter out excluded tokens
     if exclude_tokens:
@@ -1377,15 +1482,23 @@ async def get_initial_data():
             # Give it time to capture all JS responses
             await asyncio.sleep(5)
 
-            # Extract cf_clearance
+            # Persist cookies + UA for downstream httpx/chrome-fetch alignment.
             cookies = await page.context.cookies()
-            cf_clearance_cookie = next((c for c in cookies if c["name"] == "cf_clearance"), None)
-            
+            try:
+                user_agent = await page.evaluate("() => navigator.userAgent")
+            except Exception:
+                user_agent = None
+
             config = get_config()
-            if cf_clearance_cookie:
-                config["cf_clearance"] = cf_clearance_cookie["value"]
+            # Prefer keeping an existing UA (often set by Chrome contexts) instead of overwriting with Camoufox UA.
+            ua_for_config = None
+            if not str(config.get("user_agent") or "").strip():
+                ua_for_config = user_agent
+            if _upsert_browser_session_into_config(config, cookies, user_agent=ua_for_config):
                 save_config(config)
-                debug_print(f"✅ Saved cf_clearance token: {cf_clearance_cookie['value'][:20]}...")
+
+            if str(config.get("cf_clearance") or "").strip():
+                debug_print(f"✅ Saved cf_clearance token: {str(config.get('cf_clearance'))[:20]}...")
             else:
                 debug_print("⚠️ Could not find cf_clearance cookie.")
 
@@ -2786,7 +2899,13 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
             async def generate_stream():
                 nonlocal current_token, headers
                 chunk_id = f"chatcmpl-{uuid.uuid4()}"
+                
+                # Auto-switch to Chrome fetch for models known to be strict with reCAPTCHA
                 use_chrome_fetch = False
+                if model_public_name in ["gemini-3-pro-grounding", "gemini-exp-1206"]:
+                    debug_print(f"🔐 Strict model detected ({model_public_name}), forcing Chrome fetch transport.")
+                    use_chrome_fetch = True
+                
                 recaptcha_403_failures = 0
                 
                 # Retry logic for streaming
