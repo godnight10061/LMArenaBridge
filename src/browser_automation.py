@@ -281,7 +281,9 @@ def _windows_apply_window_mode_by_title_substring(title_substring: str, mode: st
             matched["any"] = True
 
             if normalized_mode == "hide":
-                SetWindowPos(hwnd, 0, -32000, -32000, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE)
+                # "Hide" is interpreted as "minimize" for stability: moving a window offscreen can
+                # break click-based challenge flows (Turnstile) and cause retry storms.
+                ShowWindow(hwnd, SW_MINIMIZE)
             elif normalized_mode == "minimize":
                 ShowWindow(hwnd, SW_MINIMIZE)
             elif normalized_mode == "offscreen":
