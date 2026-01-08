@@ -1,8 +1,16 @@
 import json
+import html
+import time
+
+
+def json_script_safe(obj) -> str:
+    """Return a script-safe JSON string."""
+    payload = json.dumps(obj, ensure_ascii=True, separators=(",", ":"))
+    return payload.replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
 
 
 def render_login_page(*, error: bool) -> str:
-    error_msg = '<div class="error-message">Invalid password. Please try again.</div>' if error else ''
+    error_msg = '<div class="error-message">Invalid password. Please try again.</div>' if error else ""
 
     return f"""
         <!DOCTYPE html>
@@ -115,10 +123,98 @@ def render_dashboard_page(
     token_class: str,
     cf_status: str,
     cf_class: str,
-    keys_html: str,
-    stats_html: str,
-    models_html: str,
 ) -> str:
+    def _safe_int(value: object, default: int = 0) -> int:
+        try:
+            return int(value)  # type: ignore[arg-type]
+        except Exception:
+            return default
+
+    # Render API Keys HTML
+    keys_rows = []
+    for key in config.get("api_keys", []):
+        key_name = html.escape(str(key.get("name") or "Unnamed Key"), quote=True)
+        key_value = html.escape(str(key.get("key") or ""), quote=True)
+        rpm_value = _safe_int(key.get("rpm", 60), 60)
+        try:
+            created_ts = int(key.get("created", 0) or 0)
+        except Exception:
+            created_ts = 0
+        created_date = time.strftime("%Y-%m-%d %H:%M", time.localtime(created_ts))
+        keys_rows.append(
+            f"""
+            <tr>
+                <td><strong>{key_name}</strong></td>
+                <td><code class="api-key-code">{key_value}</code></td>
+                <td><span class="badge">{rpm_value} RPM</span></td>
+                <td><small>{created_date}</small></td>
+                <td>
+                    <form action='/delete-key' method='post' style='margin:0;' onsubmit='return confirm("Delete this API key?");'>
+                        <input type='hidden' name='key_id' value='{key_value}'>
+                        <button type='submit' class='btn-delete'>Delete</button>
+                    </form>
+                </td>
+            </tr>
+            """
+        )
+    keys_html = "".join(keys_rows) if keys_rows else '<tr><td colspan="5" class="no-data">No API keys configured</td></tr>'
+
+    # Render Models HTML
+    models_cards = []
+    for model in text_models[:20]:
+        rank = html.escape(str(model.get("rank", "?")), quote=True)
+        org = html.escape(str(model.get("organization", "Unknown")), quote=True)
+        name = html.escape(str(model.get("publicName", "Unnamed")), quote=True)
+        models_cards.append(
+            f"""
+            <div class="model-card">
+                <div class="model-header">
+                    <span class="model-name">{name}</span>
+                    <span class="model-rank">Rank {rank}</span>
+                </div>
+                <div class="model-org">{org}</div>
+            </div>
+            """
+        )
+    models_html = "".join(models_cards) if models_cards else '<div class="no-data">No models found. Token may be invalid or expired.</div>'
+
+    # Render Stats HTML
+    stats_rows = []
+    sorted_stats = sorted(model_usage_stats.items(), key=lambda x: _safe_int(x[1]), reverse=True)[:10]
+    for model, count in sorted_stats:
+        model_name = html.escape(str(model), quote=True)
+        count_value = _safe_int(count)
+        stats_rows.append(f"<tr><td>{model_name}</td><td><strong>{count_value}</strong></td></tr>")
+    stats_html = "".join(stats_rows) if stats_rows else "<tr><td colspan='2' class='no-data'>No usage data yet</td></tr>"
+
+    # Prepare chart data
+    chart_data = {str(model): _safe_int(count) for model, count in sorted_stats}
+    chart_data_json = json_script_safe(chart_data)
+
+    # Escape other dynamic values
+    cf_clearance = html.escape(str(config.get("cf_clearance", "Not set")), quote=True)
+    token_status_escaped = html.escape(str(token_status or ""), quote=True)
+    cf_status_escaped = html.escape(str(cf_status or ""), quote=True)
+    token_class_escaped = html.escape(str(token_class or ""), quote=True)
+    cf_class_escaped = html.escape(str(cf_class or ""), quote=True)
+
+    # Auth tokens list
+    auth_tokens_html = "".join(
+        [
+            f"""
+            <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 10px; padding: 10px; background: #f8f9fa; border-radius: 6px;">
+                <code style="flex: 1; font-family: 'Courier New', monospace; font-size: 12px; word-break: break-all;">{html.escape(str(token)[:50], quote=True)}...</code>
+                <form action="/delete-auth-token" method="post" style="margin: 0;" onsubmit="return confirm('Delete this token?');">
+                    <input type="hidden" name="token_index" value="{i}">
+                    <button type="submit" class="btn-delete">Delete</button>
+                </form>
+            </div>
+            """
+            for i, token in enumerate(config.get("auth_tokens", []))
+        ]
+    )
+    no_tokens_msg = '<div class="no-data">No tokens configured. Add tokens below.</div>' if not config.get("auth_tokens") else ""
+
     return f"""
         <!DOCTYPE html>
         <html>
@@ -412,7 +508,7 @@ def render_dashboard_page(
                 <!-- Stats Overview -->
                 <div class="stats-grid">
                     <div class="stat-card">
-                        <div class="stat-value">{len(config['api_keys'])}</div>
+                        <div class="stat-value">{len(config.get('api_keys', []))}</div>
                         <div class="stat-label">API Keys</div>
                     </div>
                     <div class="stat-card">
@@ -429,23 +525,15 @@ def render_dashboard_page(
                 <div class="section">
                     <div class="section-header">
                         <h2>🔐 Arena Authentication Tokens</h2>
-                        <span class="status-badge {token_class}">{token_status}</span>
+                        <span class="status-badge {token_class_escaped}">{token_status_escaped}</span>
                     </div>
                     
                     <h3 style="margin-bottom: 15px; font-size: 16px;">Multiple Auth Tokens (Round-Robin)</h3>
                     <p style="color: #666; margin-bottom: 15px;">Add multiple tokens for automatic cycling. Each conversation will use a consistent token.</p>
                     
-                    {''.join([f'''
-                    <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 10px; padding: 10px; background: #f8f9fa; border-radius: 6px;">
-                        <code style="flex: 1; font-family: 'Courier New', monospace; font-size: 12px; word-break: break-all;">{token[:50]}...</code>
-                        <form action="/delete-auth-token" method="post" style="margin: 0;" onsubmit="return confirm('Delete this token?');">
-                            <input type="hidden" name="token_index" value="{i}">
-                            <button type="submit" class="btn-delete">Delete</button>
-                        </form>
-                    </div>
-                    ''' for i, token in enumerate(config.get("auth_tokens", []))])}
+                    {auth_tokens_html}
                     
-                    {('<div class="no-data">No tokens configured. Add tokens below.</div>' if not config.get("auth_tokens") else '')}
+                    {no_tokens_msg}
                     
                     <h3 style="margin-top: 25px; margin-bottom: 15px; font-size: 16px;">Add New Token</h3>
                     <form action="/add-auth-token" method="post">
@@ -461,11 +549,11 @@ def render_dashboard_page(
                 <div class="section">
                     <div class="section-header">
                         <h2>☁️ Cloudflare Clearance</h2>
-                        <span class="status-badge {cf_class}">{cf_status}</span>
+                        <span class="status-badge {cf_class_escaped}">{cf_status_escaped}</span>
                     </div>
                     <p style="color: #666; margin-bottom: 15px;">This is automatically fetched on startup. If API requests fail with 404 errors, the token may have expired.</p>
                     <code style="background: #f8f9fa; padding: 10px; display: block; border-radius: 6px; word-break: break-all; margin-bottom: 15px;">
-                        {config.get("cf_clearance", "Not set")}
+                        {cf_clearance}
                     </code>
                     <form action="/refresh-tokens" method="post" style="margin-top: 15px;">
                         <button type="submit" style="background: #28a745;">🔄 Refresh Tokens &amp; Models</button>
@@ -489,7 +577,7 @@ def render_dashboard_page(
                             </tr>
                         </thead>
                         <tbody>
-                            {keys_html if keys_html else '<tr><td colspan="5" class="no-data">No API keys configured</td></tr>'}
+                            {keys_html}
                         </tbody>
                     </table>
                     
@@ -554,7 +642,7 @@ def render_dashboard_page(
             
             <script>
                 // Prepare data for charts
-                const statsData = {json.dumps(dict(sorted(model_usage_stats.items(), key=lambda x: x[1], reverse=True)[:10]))};
+                const statsData = {chart_data_json};
                 const modelNames = Object.keys(statsData);
                 const modelCounts = Object.values(statsData);
                 

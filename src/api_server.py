@@ -70,59 +70,13 @@ def build_router(core) -> APIRouter:  # noqa: ANN001
                 status_code=500,
             )
 
-        keys_html = ""
-        for key in config["api_keys"]:
-            key_name = key.get("name") or "Unnamed Key"
-            key_value = key.get("key") or ""
-            rpm_value = key.get("rpm", 60)
-            created_date = time.strftime("%Y-%m-%d %H:%M", time.localtime(key.get("created", 0)))
-            keys_html += f"""
-                <tr>
-                    <td><strong>{key_name}</strong></td>
-                    <td><code class="api-key-code">{key_value}</code></td>
-                    <td><span class="badge">{rpm_value} RPM</span></td>
-                    <td><small>{created_date}</small></td>
-                    <td>
-                        <form action='/delete-key' method='post' style='margin:0;' onsubmit='return confirm("Delete this API key?");'>
-                            <input type='hidden' name='key_id' value='{key_value}'>
-                            <button type='submit' class='btn-delete'>Delete</button>
-                        </form>
-                    </td>
-                </tr>
-            """
-
         text_models = [m for m in models if m.get("capabilities", {}).get("outputCapabilities", {}).get("text")]
-        models_html = ""
-        for i, model in enumerate(text_models[:20]):
-            rank = model.get("rank", "?")
-            org = model.get("organization", "Unknown")
-            models_html += f"""
-                <div class="model-card">
-                    <div class="model-header">
-                        <span class="model-name">{model.get('publicName', 'Unnamed')}</span>
-                        <span class="model-rank">Rank {rank}</span>
-                    </div>
-                    <div class="model-org">{org}</div>
-                </div>
-            """
-
-        if not models_html:
-            models_html = '<div class="no-data">No models found. Token may be invalid or expired.</div>'
-
-        stats_html = ""
-        if core.model_usage_stats:
-            for model, count in sorted(core.model_usage_stats.items(), key=lambda x: x[1], reverse=True)[:10]:
-                stats_html += f"<tr><td>{model}</td><td><strong>{count}</strong></td></tr>"
-        else:
-            stats_html = "<tr><td colspan='2' class='no-data'>No usage data yet</td></tr>"
 
         token_status = "✅Configured" if config.get("auth_token") else "❌Not Set"
         token_class = "status-good" if config.get("auth_token") else "status-bad"
 
         cf_status = "✅Configured" if config.get("cf_clearance") else "❌Not Set"
         cf_class = "status-good" if config.get("cf_clearance") else "status-bad"
-
-        recent_activity = sum(1 for timestamps in core.api_key_usage.values() for t in timestamps if time.time() - t < 86400)
 
         return render_dashboard_page(
             config=config,
@@ -132,10 +86,6 @@ def build_router(core) -> APIRouter:  # noqa: ANN001
             token_class=token_class,
             cf_status=cf_status,
             cf_class=cf_class,
-            keys_html=keys_html,
-            models_html=models_html,
-            stats_html=stats_html,
-            recent_activity=recent_activity,
         )
 
     @router.post("/update-auth-token")

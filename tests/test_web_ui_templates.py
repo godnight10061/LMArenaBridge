@@ -27,15 +27,60 @@ class TestWebUiTemplates(unittest.TestCase):
             token_class="status-bad",
             cf_status="Not Set",
             cf_class="status-bad",
-            keys_html="",
-            stats_html="",
-            models_html="",
         )
 
         self.assertIn("<!DOCTYPE html>", html)
         self.assertIn("LMArena Bridge Dashboard", html)
 
+    def test_dashboard_escapes_untrusted_content(self):
+        from src import web_ui
+
+        malicious_key_name = '<img src=x onerror=alert("XSS")>'
+        malicious_token = '</code><script>window.__xss__=1</script>'
+        malicious_cf = '</script><script>window.__xss2__=1</script>'
+        malicious_model = {
+            "publicName": '<svg onload=alert(1)>',
+            "organization": '<b onclick=alert(1)>ORG</b>',
+            "rank": '1"><script>alert(1)</script>',
+            "capabilities": {"outputCapabilities": {"text": True}},
+        }
+
+        config = {
+            "api_keys": [
+                {"name": malicious_key_name, "key": "sk-test'\"<>", "rpm": 60, "created": 0},
+            ],
+            "auth_token": "",
+            "auth_tokens": [malicious_token],
+            "cf_clearance": malicious_cf,
+        }
+
+        model_usage_stats = {
+            '</script><script>window.__xss3__=1</script>': 1,
+        }
+
+        html = web_ui.render_dashboard_page(
+            config=config,
+            text_models=[malicious_model],
+            model_usage_stats=model_usage_stats,
+            token_status="Configured",
+            token_class="status-good",
+            cf_status="Configured",
+            cf_class="status-good",
+        )
+
+        # HTML contexts must escape angle brackets and quotes.
+        self.assertIn("&lt;img", html)
+        self.assertNotIn(malicious_key_name, html)
+        self.assertIn("&lt;svg", html)
+        self.assertNotIn(malicious_model["publicName"], html)
+
+        # Ensure token and cf_clearance don't inject executable markup.
+        self.assertNotIn(malicious_token, html)
+        self.assertNotIn(malicious_cf, html)
+
+        # Ensure JSON embedded in <script> cannot contain a raw </script> sequence from data.
+        self.assertNotIn('</script><script>window.__xss3__=1</script>', html)
+
 
 if __name__ == "__main__":
     unittest.main()
-
