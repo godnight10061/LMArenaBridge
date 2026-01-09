@@ -2,6 +2,7 @@ import asyncio
 import json
 import time
 import uuid
+import html
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -59,15 +60,16 @@ def build_router(core) -> APIRouter:  # noqa: ANN001
             models = core.get_models()
         except Exception as e:
             core.debug_print(f"❌ Error loading dashboard data: {e}")
+            safe_error = html.escape(str(e))
             return HTMLResponse(
                 f"""
                 <html><body style="font-family: sans-serif; padding: 40px; text-align: center;">
                     <h1>⚠️ Dashboard Error</h1>
-                    <p>Failed to load configuration: {str(e)}</p>
+                    <p>Failed to load configuration: {safe_error}</p>
                     <p><a href="/logout">Logout</a> | <a href="/dashboard">Retry</a></p>
                 </body></html>
             """,
-                status_code=500,
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 
         text_models = [m for m in models if m.get("capabilities", {}).get("outputCapabilities", {}).get("text")]
@@ -217,11 +219,11 @@ def build_router(core) -> APIRouter:  # noqa: ANN001
         while True:
             remaining = end - time.time()
             if remaining <= 0:
-                return Response(status_code=204)
+                return Response(status_code=status.HTTP_204_NO_CONTENT)
             try:
                 job_id = await asyncio.wait_for(queue.get(), timeout=remaining)
             except asyncio.TimeoutError:
-                return Response(status_code=204)
+                return Response(status_code=status.HTTP_204_NO_CONTENT)
 
             job = core._USERSCRIPT_PROXY_JOBS.get(str(job_id))
             if not isinstance(job, dict):
@@ -245,11 +247,11 @@ def build_router(core) -> APIRouter:  # noqa: ANN001
 
         job_id = str(data.get("job_id") or "").strip()
         if not job_id:
-            raise HTTPException(status_code=400, detail="Missing job_id")
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing job_id")
 
         job = core._USERSCRIPT_PROXY_JOBS.get(job_id)
         if not isinstance(job, dict):
-            raise HTTPException(status_code=404, detail="Unknown job_id")
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown job_id")
 
         status_code = data.get("status")
         if isinstance(status_code, int):
@@ -346,7 +348,7 @@ def build_router(core) -> APIRouter:  # noqa: ANN001
             }
         except Exception as e:
             core.debug_print(f"❌ Error listing models: {e}")
-            raise HTTPException(status_code=500, detail=f"Failed to load models: {str(e)}")
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to load models: {str(e)}")
 
     @router.get("/api/v1/_debug/stream")
     async def debug_stream(api_key: dict = Depends(core.rate_limit_api_key)):  # noqa: ARG001
