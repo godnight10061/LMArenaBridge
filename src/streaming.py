@@ -3,12 +3,112 @@ import json
 import time
 from typing import Any, Optional, AsyncIterator, Dict, List
 from pathlib import Path
+from http import HTTPStatus
 
 import httpx
 from camoufox.async_api import AsyncCamoufox
 
-# We expect 'core' to be the main module or a compatible object
-# providing utility functions and state.
+# Shared constants and helpers for browser-based fetch transports
+
+FETCH_SCRIPT = """async ({url, method, body, extraHeaders, timeoutMs}) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort('timeout'), timeoutMs);
+    try {
+        const res = await fetch(url, {
+            method,
+            headers: { 'content-type': 'text/plain;charset=UTF-8', ...extraHeaders },
+            body,
+            credentials: 'include',
+            signal: controller.signal
+        });
+        const headers = {};
+        try {
+            if (res.headers && typeof res.headers.forEach === 'function') {
+                res.headers.forEach((value, key) => { headers[key] = value; });
+            }
+        } catch (e) {}
+        if (window.reportChunk) {
+            await window.reportChunk(JSON.stringify({ __type: 'meta', status: res.status, headers }));
+        }
+        if (res.body) {
+            const reader = res.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = '';
+            while (true) {
+                const { value, done } = await reader.read();
+                if (value) buffer += decoder.decode(value, { stream: true });
+                if (done) buffer += decoder.decode();
+                const parts = buffer.split(/\\r?\\n/);
+                buffer = parts.pop() || '';
+                for (const line of parts) {
+                    if (line.trim() && window.reportChunk) {
+                        await window.reportChunk(line);
+                    }
+                }
+                if (done) break;
+            }
+            if (buffer.trim() && window.reportChunk) {
+                await window.reportChunk(buffer);
+            }
+        } else {
+            const text = await res.text();
+            if (window.reportChunk) await window.reportChunk(text);
+        }
+        return { __streaming: true };
+    } catch (e) {
+        return { status: """ + str(HTTPStatus.BAD_GATEWAY.value) + """, headers: {}, text: 'FETCH_ERROR:' + String(e) };
+    } finally {
+        clearTimeout(timer);
+    }
+}"""
+
+
+def is_recaptcha_validation_failed(status: int, text: object) -> bool:
+    if int(status or 0) != HTTPStatus.FORBIDDEN:
+        return False
+    if not isinstance(text, str) or not text:
+        return False
+    try:
+        body = json.loads(text)
+        return isinstance(body, dict) and body.get("error") == "recaptcha validation failed"
+    except Exception:
+        return False
+
+
+def prepare_browser_fetch_params(core, config, url, auth_token):
+    cookie_store = config.get("browser_cookies", {})
+    cookie_map: dict[str, str] = {str(k): str(v) for k, v in cookie_store.items() if k and v}
+
+    cf_clearance = str(config.get("cf_clearance") or cookie_map.get("cf_clearance") or "").strip()
+    cf_bm = str(config.get("cf_bm") or cookie_map.get("__cf_bm") or "").strip()
+    cfuvid = str(config.get("cfuvid") or cookie_map.get("_cfuvid") or "").strip()
+    provisional_user_id = str(config.get("provisional_user_id") or cookie_map.get("provisional_user_id") or "").strip()
+    grecaptcha_cookie = str(cookie_map.get("_GRECAPTCHA") or "").strip()
+
+    desired_cookies: list[dict] = []
+    if cf_clearance:
+        desired_cookies.append({"name": "cf_clearance", "value": cf_clearance, "domain": ".lmarena.ai", "path": "/"})
+    if cf_bm:
+        desired_cookies.append({"name": "__cf_bm", "value": cf_bm, "domain": ".lmarena.ai", "path": "/"})
+    if cfuvid:
+        desired_cookies.append({"name": "_cfuvid", "value": cfuvid, "domain": ".lmarena.ai", "path": "/"})
+    if provisional_user_id:
+        desired_cookies.append({"name": "provisional_user_id", "value": provisional_user_id, "domain": ".lmarena.ai", "path": "/"})
+    if grecaptcha_cookie:
+        desired_cookies.append({"name": "_GRECAPTCHA", "value": grecaptcha_cookie, "domain": ".lmarena.ai", "path": "/"})
+    if auth_token:
+        desired_cookies.append({"name": "arena-auth-prod-v1", "value": auth_token, "domain": "lmarena.ai", "path": "/"})
+
+    user_agent = core.normalize_user_agent_value(config.get("user_agent"))
+
+    fetch_url = url
+    if fetch_url.startswith("https://lmarena.ai"):
+        fetch_url = fetch_url[len("https://lmarena.ai") :]
+    if not fetch_url.startswith("/"):
+        fetch_url = "/" + fetch_url
+
+    return desired_cookies, user_agent, fetch_url
+
 
 class BrowserFetchStreamResponse:
     def __init__(
@@ -73,9 +173,9 @@ class BrowserFetchStreamResponse:
         return self._text.encode("utf-8")
 
     def raise_for_status(self) -> None:
-        if self.status_code == 0 or self.status_code >= 400:
+        if self.status_code == 0 or self.status_code >= HTTPStatus.BAD_REQUEST:
             request = httpx.Request(self._method, self._url or "https://lmarena.ai/")
-            response = httpx.Response(self.status_code or 502, request=request, content=self._text.encode("utf-8"))
+            response = httpx.Response(self.status_code or HTTPStatus.BAD_GATEWAY, request=request, content=self._text.encode("utf-8"))
             raise httpx.HTTPStatusError(f"HTTP {self.status_code}", request=request, response=response)
 
 
@@ -104,47 +204,7 @@ async def fetch_lmarena_stream_via_chrome(
     config = core.get_config()
     recaptcha_sitekey, recaptcha_action = core.get_recaptcha_settings(config)
 
-    cookie_store = config.get("browser_cookies", {})
-    cookie_map: dict[str, str] = {str(k): str(v) for k, v in cookie_store.items() if k and v}
-
-    cf_clearance = str(config.get("cf_clearance") or cookie_map.get("cf_clearance") or "").strip()
-    cf_bm = str(config.get("cf_bm") or cookie_map.get("__cf_bm") or "").strip()
-    cfuvid = str(config.get("cfuvid") or cookie_map.get("_cfuvid") or "").strip()
-    provisional_user_id = str(config.get("provisional_user_id") or cookie_map.get("provisional_user_id") or "").strip()
-    grecaptcha_cookie = str(cookie_map.get("_GRECAPTCHA") or "").strip()
-
-    desired_cookies: list[dict] = []
-    if cf_clearance:
-        desired_cookies.append({"name": "cf_clearance", "value": cf_clearance, "domain": ".lmarena.ai", "path": "/"})
-    if cf_bm:
-        desired_cookies.append({"name": "__cf_bm", "value": cf_bm, "domain": ".lmarena.ai", "path": "/"})
-    if cfuvid:
-        desired_cookies.append({"name": "_cfuvid", "value": cfuvid, "domain": ".lmarena.ai", "path": "/"})
-    if provisional_user_id:
-        desired_cookies.append({"name": "provisional_user_id", "value": provisional_user_id, "domain": ".lmarena.ai", "path": "/"})
-    if grecaptcha_cookie:
-        desired_cookies.append({"name": "_GRECAPTCHA", "value": grecaptcha_cookie, "domain": ".lmarena.ai", "path": "/"})
-    if auth_token:
-        desired_cookies.append({"name": "arena-auth-prod-v1", "value": auth_token, "domain": "lmarena.ai", "path": "/"})
-
-    user_agent = core.normalize_user_agent_value(config.get("user_agent"))
-
-    fetch_url = url
-    if fetch_url.startswith("https://lmarena.ai"):
-        fetch_url = fetch_url[len("https://lmarena.ai") :]
-    if not fetch_url.startswith("/"):
-        fetch_url = "/" + fetch_url
-
-    def _is_recaptcha_validation_failed(status: int, text: object) -> bool:
-        if int(status or 0) != 403: # HTTPStatus.FORBIDDEN
-            return False
-        if not isinstance(text, str) or not text:
-            return False
-        try:
-            body = json.loads(text)
-        except Exception:
-            return False
-        return isinstance(body, dict) and body.get("error") == "recaptcha validation failed"
+    desired_cookies, user_agent, fetch_url = prepare_browser_fetch_params(core, config, url, auth_token)
 
     max_recaptcha_attempts = max(1, min(int(max_recaptcha_attempts), 10))
     profile_dir = Path(core.CONFIG_FILE).with_name("chrome_grecaptcha")
@@ -226,8 +286,6 @@ async def fetch_lmarena_stream_via_chrome(
                 if line and line.strip(): await lines_queue.put(line)
             await page.expose_binding("reportChunk", _report_chunk)
 
-            fetch_script = """async ({url, method, body, extraHeaders, timeoutMs}) => { const controller = new AbortController(); const timer = setTimeout(() => controller.abort('timeout'), timeoutMs); try { const res = await fetch(url, { method, headers: { 'content-type': 'text/plain;charset=UTF-8', ...extraHeaders }, body, credentials: 'include', signal: controller.signal }); const headers = {}; try { if (res.headers && typeof res.headers.forEach === 'function') { res.headers.forEach((value, key) => { headers[key] = value; }); } } catch (e) {} if (window.reportChunk) { await window.reportChunk(JSON.stringify({ __type: 'meta', status: res.status, headers })); } if (res.body) { const reader = res.body.getReader(); const decoder = new TextDecoder(); let buffer = ''; while (true) { const { value, done } = await reader.read(); if (value) buffer += decoder.decode(value, { stream: true }); if (done) buffer += decoder.decode(); const parts = buffer.split(/\\r?\\n/); buffer = parts.pop() || ''; for (const line of parts) { if (line.trim() && window.reportChunk) { await window.reportChunk(line); } } if (done) break; } if (buffer.trim() && window.reportChunk) { await window.reportChunk(buffer); } } else { const text = await res.text(); if (window.reportChunk) await window.reportChunk(text); } return { __streaming: true }; } catch (e) { return { status: 502, headers: {}, text: 'FETCH_ERROR:' + String(e) }; } finally { clearTimeout(timer); } }"""
-
             result = {"status": 0, "headers": {}, "text": ""}
             for attempt in range(max_recaptcha_attempts):
                 while not lines_queue.empty(): lines_queue.get_nowait()
@@ -243,7 +301,7 @@ async def fetch_lmarena_stream_via_chrome(
                     extra_headers["X-Recaptcha-Token"] = token_for_headers
                     extra_headers["X-Recaptcha-Action"] = recaptcha_action
 
-                fetch_task = asyncio.create_task(page.evaluate(fetch_script, {"url": fetch_url, "method": http_method, "body": json.dumps(payload), "extraHeaders": extra_headers, "timeoutMs": int(timeout_seconds * 1000)}))
+                fetch_task = asyncio.create_task(page.evaluate(FETCH_SCRIPT, {"url": fetch_url, "method": http_method, "body": json.dumps(payload), "extraHeaders": extra_headers, "timeoutMs": int(timeout_seconds * 1000)}))
                 meta = None
                 while not fetch_task.done():
                     try:
@@ -254,25 +312,25 @@ async def fetch_lmarena_stream_via_chrome(
                         else:
                             if not item.startswith('{"__type":"meta"'):
                                 await lines_queue.put(item)
-                                meta = {"status": 200, "headers": {}}
+                                meta = {"status": HTTPStatus.OK, "headers": {}}
                                 break
                     except asyncio.TimeoutError: continue
                 
                 if fetch_task.done() and meta is None:
                     try:
                         res = fetch_task.result()
-                        result = res if isinstance(res, dict) and not res.get("__streaming") else {"status": 502, "text": "FETCH_DONE_WITHOUT_META"}
-                    except Exception as e: result = {"status": 502, "text": f"FETCH_EXCEPTION: {e}"}
+                        result = res if isinstance(res, dict) and not res.get("__streaming") else {"status": HTTPStatus.BAD_GATEWAY, "text": "FETCH_DONE_WITHOUT_META"}
+                    except Exception as e: result = {"status": HTTPStatus.BAD_GATEWAY, "text": f"FETCH_EXCEPTION: {e}"}
                 elif meta: result = meta
                 
                 status_code = int(result.get("status") or 0)
-                if status_code == 429 and attempt < max_recaptcha_attempts - 1:
+                if status_code == HTTPStatus.TOO_MANY_REQUESTS and attempt < max_recaptcha_attempts - 1:
                     retry_after = (result.get("headers") or {}).get("retry-after") or (result.get("headers") or {}).get("Retry-After")
                     await asyncio.sleep(core.get_rate_limit_sleep_seconds(str(retry_after) if retry_after is not None else None, attempt))
                     continue
 
-                if not _is_recaptcha_validation_failed(status_code, result.get("text")):
-                    if status_code < 400:
+                if not is_recaptcha_validation_failed(status_code, result.get("text")):
+                    if status_code < HTTPStatus.BAD_REQUEST:
                         body_text = result.get("text") if isinstance(result, dict) else None
                         if isinstance(body_text, str) and body_text:
                             return BrowserFetchStreamResponse(status_code=status_code, headers=result.get("headers", {}), text=body_text, method=http_method, url=url)
@@ -317,32 +375,8 @@ async def fetch_lmarena_stream_via_camoufox(
     core.debug_print("🦊 Attempting Camoufox fetch transport...")
     config = core.get_config()
     recaptcha_sitekey, recaptcha_action = core.get_recaptcha_settings(config)
-    cookie_store = config.get("browser_cookies", {})
-    cookie_map = {str(k): str(v) for k, v in cookie_store.items() if k and v}
 
-    cf_clearance = str(config.get("cf_clearance") or cookie_map.get("cf_clearance") or "").strip()
-    cf_bm = str(config.get("cf_bm") or cookie_map.get("__cf_bm") or "").strip()
-    cfuvid = str(config.get("cfuvid") or cookie_map.get("_cfuvid") or "").strip()
-    provisional_user_id = str(config.get("provisional_user_id") or cookie_map.get("provisional_user_id") or "").strip()
-    grecaptcha_cookie = str(cookie_map.get("_GRECAPTCHA") or "").strip()
-
-    desired_cookies = []
-    if cf_clearance: desired_cookies.append({"name": "cf_clearance", "value": cf_clearance, "domain": ".lmarena.ai", "path": "/"})
-    if cf_bm: desired_cookies.append({"name": "__cf_bm", "value": cf_bm, "domain": ".lmarena.ai", "path": "/"})
-    if cfuvid: desired_cookies.append({"name": "_cfuvid", "value": cfuvid, "domain": ".lmarena.ai", "path": "/"})
-    if provisional_user_id: desired_cookies.append({"name": "provisional_user_id", "value": provisional_user_id, "domain": ".lmarena.ai", "path": "/"})
-    if grecaptcha_cookie: desired_cookies.append({"name": "_GRECAPTCHA", "value": grecaptcha_cookie, "domain": ".lmarena.ai", "path": "/"})
-    if auth_token: desired_cookies.append({"name": "arena-auth-prod-v1", "value": auth_token, "domain": "lmarena.ai", "path": "/"})
-
-    user_agent = core.normalize_user_agent_value(config.get("user_agent"))
-    fetch_url = url[len("https://lmarena.ai"):] if url.startswith("https://lmarena.ai") else url
-    if not fetch_url.startswith("/"): fetch_url = "/" + fetch_url
-
-    def _is_recaptcha_validation_failed(status: int, text: object) -> bool:
-        if int(status or 0) != 403: return False
-        if not isinstance(text, str) or not text: return False
-        try: body = json.loads(text); return isinstance(body, dict) and body.get("error") == "recaptcha validation failed"
-        except Exception: return False
+    desired_cookies, user_agent, fetch_url = prepare_browser_fetch_params(core, config, url, auth_token)
 
     try:
         headless = bool(config.get("camoufox_fetch_headless", False))
@@ -406,8 +440,6 @@ async def fetch_lmarena_stream_via_camoufox(
                 if line and line.strip(): await lines_queue.put(line)
             await page.expose_binding("reportChunk", _report_chunk)
 
-            fetch_script = """async ({url, method, body, extraHeaders, timeoutMs}) => { const controller = new AbortController(); const timer = setTimeout(() => controller.abort('timeout'), timeoutMs); try { const res = await fetch(url, { method, headers: { 'content-type': 'text/plain;charset=UTF-8', ...extraHeaders }, body, credentials: 'include', signal: controller.signal }); const headers = {}; try { if (res.headers && typeof res.headers.forEach === 'function') { res.headers.forEach((value, key) => { headers[key] = value; }); } } catch (e) {} if (window.reportChunk) { await window.reportChunk(JSON.stringify({ __type: 'meta', status: res.status, headers })); } if (res.body) { const reader = res.body.getReader(); const decoder = new TextDecoder(); let buffer = ''; while (true) { const { value, done } = await reader.read(); if (value) buffer += decoder.decode(value, { stream: true }); if (done) buffer += decoder.decode(); const parts = buffer.split(/\\r?\\n/); buffer = parts.pop() || ''; for (const line of parts) { if (line.trim() && window.reportChunk) { await window.reportChunk(line); } } if (done) break; } if (buffer.trim() && window.reportChunk) { await window.reportChunk(buffer); } } else { const text = await res.text(); if (window.reportChunk) await window.reportChunk(text); } return { __streaming: true }; } catch (e) { return { status: 502, headers: {}, text: 'FETCH_ERROR:' + String(e) }; } finally { clearTimeout(timer); } }"""
-
             result = {"status": 0, "headers": {}, "text": ""}
             for attempt in range(max_recaptcha_attempts):
                 while not lines_queue.empty(): lines_queue.get_nowait()
@@ -423,31 +455,31 @@ async def fetch_lmarena_stream_via_camoufox(
                     extra_headers["X-Recaptcha-Token"] = token_for_headers
                     extra_headers["X-Recaptcha-Action"] = recaptcha_action
 
-                fetch_task = asyncio.create_task(page.evaluate(fetch_script, {"url": fetch_url, "method": http_method, "body": json.dumps(payload), "extraHeaders": extra_headers, "timeoutMs": int(timeout_seconds * 1000)}))
+                fetch_task = asyncio.create_task(page.evaluate(FETCH_SCRIPT, {"url": fetch_url, "method": http_method, "body": json.dumps(payload), "extraHeaders": extra_headers, "timeoutMs": int(timeout_seconds * 1000)}))
                 meta = None
                 while not fetch_task.done():
                     try:
                         item = await asyncio.wait_for(lines_queue.get(), timeout=0.1)
                         if isinstance(item, str) and item.startswith('{"__type":"meta"'): meta = json.loads(item); break
                         else:
-                            if not item.startswith('{"__type":"meta"'): await lines_queue.put(item); meta = {"status": 200, "headers": {}}; break
+                            if not item.startswith('{"__type":"meta"'): await lines_queue.put(item); meta = {"status": HTTPStatus.OK, "headers": {}}; break
                     except asyncio.TimeoutError: continue
                 
                 if fetch_task.done() and meta is None:
                     try:
                         res = fetch_task.result()
-                        result = res if isinstance(res, dict) and not res.get("__streaming") else {"status": 502, "text": "FETCH_DONE_WITHOUT_META"}
-                    except Exception as e: result = {"status": 502, "text": f"FETCH_EXCEPTION: {e}"}
+                        result = res if isinstance(res, dict) and not res.get("__streaming") else {"status": HTTPStatus.BAD_GATEWAY, "text": "FETCH_DONE_WITHOUT_META"}
+                    except Exception as e: result = {"status": HTTPStatus.BAD_GATEWAY, "text": f"FETCH_EXCEPTION: {e}"}
                 elif meta: result = meta
                 
                 status_code = int(result.get("status") or 0)
-                if status_code == 429 and attempt < max_recaptcha_attempts - 1:
+                if status_code == HTTPStatus.TOO_MANY_REQUESTS and attempt < max_recaptcha_attempts - 1:
                     retry_after = (result.get("headers") or {}).get("retry-after") or (result.get("headers") or {}).get("Retry-After")
                     await asyncio.sleep(core.get_rate_limit_sleep_seconds(str(retry_after) if retry_after is not None else None, attempt))
                     continue
 
-                if not _is_recaptcha_validation_failed(status_code, result.get("text")):
-                    if status_code < 400:
+                if not is_recaptcha_validation_failed(status_code, result.get("text")):
+                    if status_code < HTTPStatus.BAD_REQUEST:
                         body_text = result.get("text") if isinstance(result, dict) else None
                         if isinstance(body_text, str) and body_text: return BrowserFetchStreamResponse(status_code=status_code, headers=result.get("headers", {}), text=body_text, method=http_method, url=url)
                         async def _wait_for_finish():
