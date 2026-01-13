@@ -311,7 +311,11 @@ async def apply_camoufox_window_mode(
     if not _is_windows():
         return
     cfg = config or {}
-    mode = _normalize_camoufox_window_mode(cfg.get(mode_key))
+    raw_mode = cfg.get(mode_key)
+    if str(mode_key or "") == "camoufox_proxy_window_mode":
+        if raw_mode is None or not str(raw_mode).strip():
+            raw_mode = "hide"
+    mode = _normalize_camoufox_window_mode(raw_mode)
     if mode == "visible":
         return
     try:

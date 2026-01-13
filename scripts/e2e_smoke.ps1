@@ -166,6 +166,9 @@ with httpx.Client(timeout=httpx.Timeout(60.0, connect=10.0), follow_redirects=Tr
     print("[PASS] e2e_smoke")
     print("".join(content_accum).strip())
 '@ | python -
+  if ($LASTEXITCODE -ne 0) {
+    throw "e2e_smoke python check failed (exit code $LASTEXITCODE)"
+  }
 
   Write-Host "[PASS] e2e_smoke.ps1"
 } catch {
