@@ -112,7 +112,7 @@ def build_router(core) -> APIRouter:  # noqa: ANN001
                 "created": int(time.time()),
             }
             config["api_keys"].append(new_key)
-            core.save_config(config)
+            core.save_config(config, preserve_api_keys=False)
         except Exception as e:
             core.debug_print(f"❌ Error creating key: {e}")
         return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
@@ -124,7 +124,7 @@ def build_router(core) -> APIRouter:  # noqa: ANN001
         try:
             config = core.get_config()
             config["api_keys"] = [k for k in config["api_keys"] if k["key"] != key_id]
-            core.save_config(config)
+            core.save_config(config, preserve_api_keys=False)
         except Exception as e:
             core.debug_print(f"❌ Error deleting key: {e}")
         return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)

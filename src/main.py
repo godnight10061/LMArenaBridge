@@ -1048,6 +1048,72 @@ RECAPTCHA_EXPIRY: datetime = datetime.now(timezone.utc) - timedelta(days=365)
 
 # --- Helper Functions ---
 
+_DEFAULT_API_KEY_CREATED = 1704236400  # Jan 3 2024 (stable default to avoid config churn)
+
+
+def _normalize_api_keys_value(raw_value: object) -> list[dict]:
+    """
+    Normalize config `api_keys` into the canonical list-of-dicts form.
+
+    Accepts legacy shapes:
+    - "api_keys": "sk-..."
+    - "api_keys": ["sk-...", ...]
+    """
+    entries: list[object]
+    if isinstance(raw_value, list):
+        entries = list(raw_value)
+    elif isinstance(raw_value, str):
+        entries = [raw_value]
+    elif isinstance(raw_value, dict):
+        entries = [raw_value]
+    else:
+        entries = []
+
+    normalized: list[dict] = []
+    for entry in entries:
+        if isinstance(entry, str):
+            key = entry.strip()
+            if not key:
+                continue
+            normalized.append(
+                {
+                    "name": "Imported Key",
+                    "key": key,
+                    "created": _DEFAULT_API_KEY_CREATED,
+                    "rpm": 60,
+                }
+            )
+            continue
+
+        if isinstance(entry, dict):
+            key_val = entry.get("key")
+            if key_val is None and "api_key" in entry:
+                key_val = entry.get("api_key")
+            key = str(key_val or "").strip()
+            if not key:
+                continue
+
+            name = str(entry.get("name") or "Unnamed Key").strip() or "Unnamed Key"
+
+            created = entry.get("created", _DEFAULT_API_KEY_CREATED)
+            try:
+                created = int(created)
+            except Exception:
+                created = _DEFAULT_API_KEY_CREATED
+
+            rpm = entry.get("rpm", 60)
+            try:
+                rpm = int(rpm)
+            except Exception:
+                rpm = 60
+            rpm = max(1, min(rpm, 1000))
+
+            normalized.append({"name": name, "key": key, "rpm": rpm, "created": created})
+            continue
+
+    return normalized
+
+
 def get_config():
     global current_token_index, _LAST_CONFIG_FILE
     # If tests or callers swap CONFIG_FILE at runtime, reset the token round-robin index so token selection
@@ -1075,6 +1141,7 @@ def get_config():
         config.setdefault("usage_stats", {})
         config.setdefault("prune_invalid_tokens", False)
         config.setdefault("persist_arena_auth_cookie", False)
+        config["api_keys"] = _normalize_api_keys_value(config.get("api_keys"))
         
         # Normalize api_keys to prevent KeyErrors in dashboard and rate limiting
         if isinstance(config.get("api_keys"), list):
@@ -1109,11 +1176,11 @@ def load_usage_stats():
         debug_print(f"⚠️  Error loading usage stats: {e}, using empty stats")
         model_usage_stats = defaultdict(int)
 
-def save_config(config, *, preserve_auth_tokens: bool = True):
+def save_config(config, *, preserve_auth_tokens: bool = True, preserve_api_keys: bool = True):
     try:
         # Avoid clobbering user-provided auth tokens when multiple tasks write config.json concurrently.
         # Background refreshes/cookie upserts shouldn't overwrite auth tokens that may have been added via the dashboard.
-        if preserve_auth_tokens:
+        if preserve_auth_tokens or preserve_api_keys:
             try:
                 with open(CONFIG_FILE, "r") as f:
                     on_disk = json.load(f)
@@ -1121,10 +1188,13 @@ def save_config(config, *, preserve_auth_tokens: bool = True):
                 on_disk = None
 
             if isinstance(on_disk, dict):
-                if "auth_tokens" in on_disk and isinstance(on_disk.get("auth_tokens"), list):
-                    config["auth_tokens"] = list(on_disk.get("auth_tokens") or [])
-                if "auth_token" in on_disk:
-                    config["auth_token"] = str(on_disk.get("auth_token") or "")
+                if preserve_auth_tokens:
+                    if "auth_tokens" in on_disk and isinstance(on_disk.get("auth_tokens"), list):
+                        config["auth_tokens"] = list(on_disk.get("auth_tokens") or [])
+                    if "auth_token" in on_disk:
+                        config["auth_token"] = str(on_disk.get("auth_token") or "")
+                if preserve_api_keys and "api_keys" in on_disk:
+                    config["api_keys"] = _normalize_api_keys_value(on_disk.get("api_keys"))
 
         # Persist in-memory stats to the config dict before saving
         config["usage_stats"] = dict(model_usage_stats)
@@ -2323,6 +2393,7 @@ async def startup_event():
     try:
         # Ensure config and models files exist
         config = get_config()
+        generated_default_key = False
         if not config.get("api_keys"):
             config["api_keys"] = [
                 {
@@ -2332,7 +2403,8 @@ async def startup_event():
                     "created": int(time.time()),
                 }
             ]
-        save_config(config)
+            generated_default_key = True
+        save_config(config, preserve_api_keys=not generated_default_key)
         save_models(get_models())
         # Load usage stats from config
         load_usage_stats()
