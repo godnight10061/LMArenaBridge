@@ -3900,13 +3900,24 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
         api_key_str = api_key["key"]
 
         # --- NEW: Get reCAPTCHA v3 Token for Payload ---
-        # For strict models, we defer token minting to the in-browser fetch transport to avoid extra
+        # For strict models (and web-capability models), we defer token minting to in-browser transports to avoid extra
         # automation-driven token requests (which can lower scores and increase flakiness).
-        use_chrome_fetch_for_model = model_public_name in STRICT_CHROME_FETCH_MODELS
+        output_caps = {}
+        try:
+            output_caps = model_capabilities.get("outputCapabilities") if isinstance(model_capabilities, dict) else {}
+        except Exception:
+            output_caps = {}
+        if not isinstance(output_caps, dict):
+            output_caps = {}
+        web_capability_model = bool(output_caps.get("web"))
+
+        use_chrome_fetch_for_model = (model_public_name in STRICT_CHROME_FETCH_MODELS) or web_capability_model
         strict_chrome_fetch_model = use_chrome_fetch_for_model
 
         recaptcha_token = ""
         if strict_chrome_fetch_model:
+            if web_capability_model and (model_public_name not in STRICT_CHROME_FETCH_MODELS):
+                debug_print(f"🔐 Web-capability model detected ({model_public_name}), enabling browser transports.")
             # If the internal proxy is active, we MUST NOT use a cached token, as it causes 403s.
             # Instead, we pass an empty string and let the in-page minting handle it.
             if (time.time() - last_userscript_poll) < 15:
@@ -4229,8 +4240,8 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                         yield ": keep-alive\n\n"
                         await asyncio.sleep(min(1.0, end_time - time.time()))
 
-                # Only use browser transports (Chrome/Camoufox) proactively for models known to be strict with reCAPTCHA.
-                use_browser_transports = model_public_name in STRICT_CHROME_FETCH_MODELS
+                # Only use browser transports (Chrome/Camoufox) proactively for strict and web-capability models.
+                use_browser_transports = bool(strict_chrome_fetch_model)
                 prefer_chrome_transport = True
                 if use_browser_transports:
                     debug_print(f"🔐 Strict model detected ({model_public_name}), enabling browser fetch transport.")
@@ -4308,7 +4319,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                             use_userscript = False
                             cfg_now = None
                             if (
-                                model_public_name in STRICT_CHROME_FETCH_MODELS
+                                strict_chrome_fetch_model
                                 and use_browser_transports
                                 and not disable_userscript_for_request
                                 and not disable_userscript_proxy_env
