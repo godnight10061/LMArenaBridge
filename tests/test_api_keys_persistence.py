@@ -17,6 +17,15 @@ class TestApiKeysPersistence(BaseBridgeTest):
             ["sk-lmab-fixed-1", "sk-lmab-fixed-2"],
         )
 
+    async def test_get_config_imports_top_level_api_key(self) -> None:
+        self.setup_config({"api_keys": [], "api_key": "sk-lmab-legacy-fixed"})
+
+        cfg = self.main.get_config()
+
+        keys = cfg.get("api_keys")
+        self.assertIsInstance(keys, list)
+        self.assertEqual([k.get("key") for k in keys], ["sk-lmab-legacy-fixed"])
+
     async def test_save_config_preserves_api_keys_from_disk_by_default(self) -> None:
         # Stale in-memory config loaded with old keys.
         self.setup_config({"api_keys": [{"name": "Old", "key": "sk-old", "rpm": 60, "created": 1704236400}]})
@@ -36,4 +45,3 @@ class TestApiKeysPersistence(BaseBridgeTest):
 
 if __name__ == "__main__":
     unittest.main()
-

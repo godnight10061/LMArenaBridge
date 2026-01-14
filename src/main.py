@@ -457,88 +457,7 @@ async def fetch_via_proxy_queue(
             url=url,
         )
 
-    task_id = str(uuid.uuid4())
-    future = asyncio.Future()
-    proxy_pending_tasks[task_id] = future
-
-    # Add to queue
-    proxy_task_queue.append({
-        "id": task_id,
-        "url": url,
-        "method": http_method,
-        "body": json.dumps(payload) if payload else ""
-    })
-    
-    debug_print(f"📫 Added task {task_id} to Proxy Queue. Waiting for Userscript...")
-
-    try:
-        # Wait for the first chunk/response from the userscript
-        # In a full implementation, we'd handle a stream of chunks.
-        # For simplicity here, we await the *first* signal which might be the full text or start of stream.
-        # But wait, the userscript sends chunks via POST.
-        # We need a way to feed those chunks into a generator.
-        # For this MVP, let's assume the userscript sends the FULL response or we handle it via a shared buffer.
-        
-        # ACTUALLY: The `BrowserFetchStreamResponse` expects a full text or an iterator.
-        # If we want true streaming via proxy, we need a Queue, not a Future.
-        
-        # Let's upgrade `proxy_pending_tasks` to hold an asyncio.Queue for this task_id
-        # But `proxy_pending_tasks` type definition above was Future. 
-        # For this step, let's implement a simple non-streaming wait (or buffered stream) to keep it KISS as requested.
-        # If the userscript sends chunks, we can accumulate them? 
-        # No, "stream: True" needs real-time chunks.
-        
-        # Revised approach for `fetch_via_proxy_queue`:
-        # We will wait for the userscript to signal "start" or provide content.
-        # Since `BrowserFetchStreamResponse` is designed to wrap a completed text OR an async iterator,
-        # let's make it wrap an async iterator that pulls from a Queue.
-        
-        # We'll need to change `proxy_pending_tasks` value type to `asyncio.Queue` dynamically.
-        # But the endpoint `post_proxy_result` expects to set_result on a Future.
-        
-        # Let's stick to the Future for the *initial connection* / *first byte*.
-        result = await asyncio.wait_for(future, timeout=timeout_seconds)
-        
-        # If result contains "chunk", it's a stream part. 
-        # This simple implementation assumes the userscript might send the full text for now OR we accept that
-        # we only support non-streaming or buffered-streaming via this simple Future mechanism for the MVP.
-        #
-        # TO SUPPORT REAL STREAMING:
-        # We would need a dedicated WebSocket or a polling mechanism for the *response* too.
-        # Given "minimal code changes", let's assume the Userscript gathers the response and sends it back.
-        # This might delay the "first token" but ensures reliability.
-        
-        if isinstance(result, dict):
-            if "error" in result:
-                debug_print(f"❌ Proxy Task Error: {result['error']}")
-                return None
-            
-            text = result.get("text", "")
-            # If the userscript sent "chunk", we might have missed subsequent chunks if we only waited for one Future.
-            # So for this MVP, the userscript should buffer and send the full text, 
-            # OR we need a more complex "Queue" based mechanism.
-            
-            # Let's return a response with the text we got.
-            return BrowserFetchStreamResponse(
-                status_code=result.get("status", 200),
-                headers=result.get("headers", {}),
-                text=text,
-                method=http_method,
-                url=url
-            )
-            
-    except asyncio.TimeoutError:
-        debug_print(f"❌ Proxy Task {task_id} timed out. Is the Userscript running?")
-        if task_id in proxy_pending_tasks:
-            del proxy_pending_tasks[task_id]
-        if task_id in [t['id'] for t in proxy_task_queue]:
-            # Remove from queue if not picked up
-            proxy_task_queue[:] = [t for t in proxy_task_queue if t['id'] != task_id]
-        return None
-    except Exception as e:
-        debug_print(f"❌ Proxy Task Exception: {e}")
-        return None
-
+    # Proxy-only: no legacy queue fallback.
     return None
 
 async def get_recaptcha_v3_token() -> Optional[str]:
@@ -1142,6 +1061,10 @@ def get_config():
         config.setdefault("prune_invalid_tokens", False)
         config.setdefault("persist_arena_auth_cookie", False)
         config["api_keys"] = _normalize_api_keys_value(config.get("api_keys"))
+
+        # Back-compat: accept a top-level `api_key` (singular) and import it into `api_keys`.
+        if not config.get("api_keys"):
+            config["api_keys"] = _normalize_api_keys_value(config.get("api_key"))
         
         # Normalize api_keys to prevent KeyErrors in dashboard and rate limiting
         if isinstance(config.get("api_keys"), list):
@@ -1193,8 +1116,15 @@ def save_config(config, *, preserve_auth_tokens: bool = True, preserve_api_keys:
                         config["auth_tokens"] = list(on_disk.get("auth_tokens") or [])
                     if "auth_token" in on_disk:
                         config["auth_token"] = str(on_disk.get("auth_token") or "")
-                if preserve_api_keys and "api_keys" in on_disk:
-                    config["api_keys"] = _normalize_api_keys_value(on_disk.get("api_keys"))
+                if preserve_api_keys:
+                    # Back-compat: preserve a singular `api_key` too (older configs), and prefer `api_keys` when present.
+                    preserved = None
+                    if "api_keys" in on_disk:
+                        preserved = _normalize_api_keys_value(on_disk.get("api_keys"))
+                    if not preserved and "api_key" in on_disk:
+                        preserved = _normalize_api_keys_value(on_disk.get("api_key"))
+                    if preserved:
+                        config["api_keys"] = preserved
 
         # Persist in-memory stats to the config dict before saving
         config["usage_stats"] = dict(model_usage_stats)
@@ -3936,6 +3866,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
         try:
             last_message_content = messages[-1].get("content", "")
             prompt, experimental_attachments = await process_message_content(last_message_content, model_capabilities)
+            raw_user_prompt = prompt
             
             # If there's a system prompt and this is the first user message, prepend it
             if system_prompt:
@@ -4004,19 +3935,8 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                 else:
                     debug_print("🔐 Strict model: reCAPTCHA token will be minted in the Chrome fetch session.")
         else:
-            # reCAPTCHA v3 tokens can behave like single-use tokens; force a fresh token for streaming requests.
-            # For streaming, we defer this until inside generate_stream to avoid blocking initial headers.
-            if stream:
-                recaptcha_token = ""
-            else:
-                recaptcha_token = await refresh_recaptcha_token(force_new=False)
-                if not recaptcha_token:
-                    debug_print("❌ Cannot proceed, failed to get reCAPTCHA token.")
-                    raise HTTPException(
-                        status_code=503,
-                        detail="Service Unavailable: Failed to acquire reCAPTCHA token. The bridge server may be blocked."
-                    )
-                debug_print(f"🔑 Using reCAPTCHA v3 token: {recaptcha_token[:20]}...")
+            # Proxy-only transport: reCAPTCHA tokens are minted in-page by the Userscript Proxy.
+            recaptcha_token = ""
         # -----------------------------------------------
         
         # Generate conversation ID from context (API key + model + first user message)
@@ -4067,6 +3987,75 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
             http_method = "PUT"
         elif not session:
             debug_print("🆕 Creating NEW conversation session")
+            outbound_prompt = prompt
+
+            # If the bridge has no in-memory session (e.g. after restart) but the client provided prior turns,
+            # embed the transcript into the first outbound prompt so the model can answer consistently.
+            try:
+                has_prior_turns = any(
+                    (m.get("role") in ("user", "assistant"))
+                    for m in (messages[:-1] or [])
+                    if (m.get("role") != "system")
+                )
+            except Exception:
+                has_prior_turns = False
+
+            if has_prior_turns and not experimental_attachments:
+                def _stringify_transcript_content(value: object) -> str:
+                    if isinstance(value, str):
+                        return value
+                    if isinstance(value, list):
+                        parts: list[str] = []
+                        for item in value:
+                            if not isinstance(item, dict):
+                                continue
+                            if item.get("type") == "text" and isinstance(item.get("text"), str):
+                                parts.append(item.get("text") or "")
+                            elif item.get("type") == "image_url":
+                                parts.append("[image]")
+                            elif isinstance(item.get("text"), str):
+                                parts.append(item.get("text") or "")
+                        merged = "\n".join([p for p in parts if str(p or "").strip()])
+                        if merged:
+                            return merged
+                    try:
+                        return json.dumps(value, ensure_ascii=False)
+                    except Exception:
+                        return str(value)
+
+                non_system_messages = [m for m in (messages or []) if m.get("role") != "system"]
+                # Keep the transcript bounded to avoid hitting LMArena prompt limits on long chats.
+                if len(non_system_messages) > 20:
+                    non_system_messages = non_system_messages[-20:]
+
+                transcript_blocks: list[str] = []
+                last_index = len(non_system_messages) - 1
+                for idx, msg in enumerate(non_system_messages):
+                    role = str(msg.get("role") or "").strip().lower()
+                    if role == "user" and idx == last_index:
+                        content = raw_user_prompt
+                    else:
+                        content = _stringify_transcript_content(msg.get("content", ""))
+                    content = str(content or "").strip()
+                    if not content:
+                        continue
+                    label = "User" if role == "user" else "Assistant" if role == "assistant" else (role or "Message")
+                    transcript_blocks.append(f"{label}:\n{content}")
+
+                if transcript_blocks:
+                    outbound_prompt = "Conversation transcript:\n\n" + "\n\n".join(transcript_blocks)
+                    if system_prompt:
+                        outbound_prompt = f"{system_prompt}\n\n{outbound_prompt}"
+                    # Re-validate length with transcript expansion.
+                    if len(outbound_prompt) > 113567:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=(
+                                f"Prompt too long ({len(outbound_prompt)} characters) after including chat history. "
+                                "Please reduce the message size."
+                            ),
+                        )
+                    debug_print("⚠️ No in-memory session; embedding provided message history into prompt.")
             # New conversation - Generate all IDs at once (like the browser does)
             session_id = str(uuid7())
             user_msg_id = str(uuid7())
@@ -4086,7 +4075,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                 "modelAMessageId": model_msg_id,
                 "modelBMessageId": model_b_msg_id,
                 "userMessage": {
-                    "content": prompt,
+                    "content": outbound_prompt,
                     "experimental_attachments": experimental_attachments,
                     "metadata": {}
                 },
@@ -4140,13 +4129,9 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
         try:
             current_token = get_next_auth_token(exclude_tokens=failed_tokens)
         except HTTPException:
-            # For strict models we can still proceed via browser fetch transports, which may have a valid
-            # arena-auth cookie already stored in the persistent profile. For non-strict models we need a token.
-            if strict_chrome_fetch_model:
-                debug_print("⚠️ No auth token configured; proceeding with browser-only transports.")
-                current_token = ""
-            else:
-                raise
+            # Proxy-only: requests can proceed via the in-browser session cookie (anonymous or authenticated).
+            debug_print("⚠️ No auth token configured; proceeding with Userscript Proxy only.")
+            current_token = ""
 
         # Strict models: if round-robin picked a placeholder/invalid-looking token but there is a better token
         # available, switch to the first plausible token without mutating user config.
@@ -4312,27 +4297,14 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                         yield ": keep-alive\n\n"
                         await asyncio.sleep(min(1.0, end_time - time.time()))
 
-                # Only use browser transports (Chrome/Camoufox) proactively for strict and web-capability models.
-                use_browser_transports = bool(strict_chrome_fetch_model)
-                prefer_chrome_transport = True
-                if use_browser_transports:
-                    debug_print(f"🔐 Strict model detected ({model_public_name}), enabling browser fetch transport.")
-
-                # Non-strict models: mint a fresh side-channel token before the first upstream attempt so we don't
-                # send an empty `recaptchaV3Token` (which commonly yields 403 "recaptcha validation failed").
-                if (not use_browser_transports) and (not str(recaptcha_token or "").strip()):
-                    try:
-                        refresh_task = asyncio.create_task(refresh_recaptcha_token(force_new=True))
-                        async for ka in wait_for_task(refresh_task):
-                            yield ka
-                        new_token = refresh_task.result()
-                    except Exception:
-                        new_token = None
-                    if new_token:
-                        recaptcha_token = new_token
-                        if isinstance(payload, dict):
-                            payload["recaptchaV3Token"] = new_token
-                        headers = get_request_headers_with_token(current_token, recaptcha_token)
+                # Proxy-only transport: always mint reCAPTCHA tokens in-page via the Userscript Proxy.
+                # (Side-channel tokens + direct httpx have proven unreliable and are intentionally disabled.)
+                use_browser_transports = False
+                prefer_chrome_transport = False
+                recaptcha_token = ""
+                if isinstance(payload, dict):
+                    payload["recaptchaV3Token"] = ""
+                headers = get_request_headers_with_token(current_token, recaptcha_token)
                 
                 recaptcha_403_failures = 0
                 no_delta_failures = 0
@@ -4385,17 +4357,10 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                             stream_context = None
                             transport_used = "httpx"
                             
-                            # Prefer the userscript proxy only when it is actually polling (or when a poller connects
-                            # shortly after the request starts). This avoids hanging strict-model requests when no
-                            # proxy is running, while still supporting "late" pollers (tests/reconnects).
+                            # Userscript Proxy is the only supported transport for upstream requests.
                             use_userscript = False
                             cfg_now = None
-                            if (
-                                strict_chrome_fetch_model
-                                and use_browser_transports
-                                and not disable_userscript_for_request
-                                and not disable_userscript_proxy_env
-                            ):
+                            if not disable_userscript_proxy_env:
                                 try:
                                     cfg_now = get_config()
                                 except Exception:
@@ -4424,58 +4389,57 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                             yield ": keep-alive\n\n"
                                             await asyncio.sleep(0.05)
 
-                                if proxy_active:
-                                    use_userscript = True
-                                    debug_print("🌐 Userscript Proxy is ACTIVE. Preferring Proxy over direct/Chrome fetch.")
-                                # Default behavior: mint in-page (higher success rate than side-channel cached tokens).
-                                # Optional: allow pre-filling a cached token for speed via config flag.
-                                try:
-                                    prefill_cached = bool((cfg_now or {}).get("userscript_proxy_prefill_cached_recaptcha", False))
-                                except Exception:
-                                    prefill_cached = False
-                                if (
-                                    prefill_cached
-                                    and isinstance(payload, dict)
-                                    and not force_proxy_recaptcha_mint
-                                    and not str(payload.get("recaptchaV3Token") or "").strip()
-                                ):
-                                    try:
-                                        cached = get_cached_recaptcha_token()
-                                    except Exception:
-                                        cached = ""
-                                    if cached:
-                                        debug_print(f"🔐 Using cached reCAPTCHA v3 token for proxy (len={len(str(cached))})")
-                                        payload["recaptchaV3Token"] = cached
+                                use_userscript = bool(proxy_active)
 
-                            if use_userscript:
-                                debug_print(
-                                    f"📫 Delegating request to Userscript Proxy (poll active {int(time.time() - last_userscript_poll)}s ago)..."
-                                )
-                                proxy_auth_token = str(current_token or "").strip()
-                                try:
-                                    # Preserve expired base64 Supabase session cookies: they can often be refreshed
-                                    # in-page via their embedded refresh_token (no user interaction).
-                                    if (
-                                        proxy_auth_token
-                                        and not str(proxy_auth_token).startswith("base64-")
-                                        and is_arena_auth_token_expired(proxy_auth_token, skew_seconds=0)
-                                    ):
-                                        proxy_auth_token = ""
-                                except Exception:
-                                    pass
-                                stream_context = await fetch_via_proxy_queue(
-                                    url=url,
-                                    payload=payload if isinstance(payload, dict) else {},
-                                    http_method=http_method,
-                                    timeout_seconds=300,
-                                    streaming=True,
-                                    auth_token=proxy_auth_token,
-                                )
-                                if stream_context is None:
-                                    debug_print("⚠️ Userscript Proxy returned None (timeout?). Falling back...")
-                                    use_userscript = False
-                                else:
-                                    transport_used = "userscript"
+                            if not use_userscript:
+                                error_chunk = {
+                                    "error": {
+                                        "message": "Userscript proxy is required for streaming. Start the Camoufox proxy worker/userscript bridge and retry.",
+                                        "type": "proxy_unavailable",
+                                        "code": HTTPStatus.SERVICE_UNAVAILABLE,
+                                    }
+                                }
+                                yield f"data: {json.dumps(error_chunk)}\n\n"
+                                yield "data: [DONE]\n\n"
+                                return
+
+                            debug_print("🌐 Userscript Proxy is ACTIVE. Using Userscript Proxy for streaming.")
+                            debug_print(
+                                f"📫 Delegating request to Userscript Proxy (poll active {int(time.time() - last_userscript_poll)}s ago)..."
+                            )
+                            proxy_auth_token = str(current_token or "").strip()
+                            try:
+                                # Preserve expired base64 Supabase session cookies: they can often be refreshed
+                                # in-page via their embedded refresh_token (no user interaction).
+                                if (
+                                    proxy_auth_token
+                                    and not str(proxy_auth_token).startswith("base64-")
+                                    and is_arena_auth_token_expired(proxy_auth_token, skew_seconds=0)
+                                ):
+                                    proxy_auth_token = ""
+                            except Exception:
+                                pass
+                            stream_context = await fetch_via_proxy_queue(
+                                url=url,
+                                payload=payload if isinstance(payload, dict) else {},
+                                http_method=http_method,
+                                timeout_seconds=300,
+                                streaming=True,
+                                auth_token=proxy_auth_token,
+                            )
+                            if stream_context is None:
+                                error_chunk = {
+                                    "error": {
+                                        "message": "Userscript proxy request timed out or returned no response.",
+                                        "type": "proxy_timeout",
+                                        "code": HTTPStatus.GATEWAY_TIMEOUT,
+                                    }
+                                }
+                                yield f"data: {json.dumps(error_chunk)}\n\n"
+                                yield "data: [DONE]\n\n"
+                                return
+
+                            transport_used = "userscript"
 
                             # Strict models: when we're about to fall back to buffered browser fetch transports (not the
                             # streaming proxy), a side-channel token can avoid hangs while grecaptcha loads in-page.
@@ -5556,84 +5520,44 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
         
         # Handle non-streaming mode with retry
         try:
-            response = None
-            if time.time() - last_userscript_poll < 15:
-                debug_print(f"🌐 Userscript Proxy is ACTIVE. Delegating non-streaming request...")
-                response = await fetch_via_proxy_queue(
-                    url=url,
-                    payload=payload if isinstance(payload, dict) else {},
-                    http_method=http_method,
-                    timeout_seconds=120,
-                    auth_token=current_token,
+            if not _userscript_proxy_is_active():
+                raise HTTPException(
+                    status_code=503,
+                    detail="Userscript proxy is required for non-streaming requests. Start the Camoufox proxy worker/userscript bridge and retry.",
                 )
-                if response:
-                    # Raise for status to trigger the standard error handling block below if needed
-                    response.raise_for_status()
-                else:
-                    debug_print("⚠️ Userscript Proxy returned None. Falling back...")
 
-            if response is None:
-                if use_chrome_fetch_for_model:
-                    debug_print(f"🌐 Using Chrome fetch transport for non-streaming strict model ({model_public_name})...")
-                    # Chrome fetch transport has its own internal reCAPTCHA retries, 
-                    # but we add an outer loop here to handle token rotation (401) and rate limits (429).
-                    max_chrome_retries = 3
-                    for chrome_attempt in range(max_chrome_retries):
-                        response = await fetch_lmarena_stream_via_chrome(
-                            http_method=http_method,
-                            url=url,
-                            payload=payload if isinstance(payload, dict) else {},
-                            auth_token=current_token,
-                            timeout_seconds=120,
-                        )
-                        
-                        if response is None:
-                            debug_print(f"⚠️ Chrome fetch transport failed (attempt {chrome_attempt+1}). Trying Camoufox...")
-                            response = await fetch_lmarena_stream_via_camoufox(
-                                http_method=http_method,
-                                url=url,
-                                payload=payload if isinstance(payload, dict) else {},
-                                auth_token=current_token,
-                                timeout_seconds=120,
-                            )
-                            if response is None:
-                                break # Critical error
-                        
-                        if response.status_code == HTTPStatus.UNAUTHORIZED:
-                            debug_print(f"🔒 Token {current_token[:20]}... expired in Chrome fetch (attempt {chrome_attempt+1})")
-                            failed_tokens.add(current_token)
-                            # (Pruning disabled)
-                            if chrome_attempt < max_chrome_retries - 1:
-                                try:
-                                    current_token = get_next_auth_token(exclude_tokens=failed_tokens)
-                                    debug_print(f"🔄 Rotating to next token: {current_token[:20]}...")
-                                    continue
-                                except HTTPException:
-                                    break
-                        elif response.status_code == HTTPStatus.TOO_MANY_REQUESTS:
-                            debug_print(f"⏱️  Rate limit in Chrome fetch (attempt {chrome_attempt+1})")
-                            if chrome_attempt < max_chrome_retries - 1:
-                                sleep_seconds = get_rate_limit_sleep_seconds(response.headers.get("Retry-After"), chrome_attempt)
-                                await asyncio.sleep(sleep_seconds)
-                                continue
-                        
-                        # If success or non-retryable error, break and use this response
-                        break
-                else:
-                    response = await make_request_with_retry(url, payload, http_method)
-            
-            if response is None:
-                debug_print("⚠️ Browser transports returned None; falling back to direct httpx.")
-                response = await make_request_with_retry(url, payload, http_method)
+            debug_print("🌐 Userscript Proxy is ACTIVE. Delegating non-streaming request...")
+            proxy_auth_token = str(current_token or "").strip()
+            try:
+                if (
+                    proxy_auth_token
+                    and not str(proxy_auth_token).startswith("base64-")
+                    and is_arena_auth_token_expired(proxy_auth_token, skew_seconds=0)
+                ):
+                    proxy_auth_token = ""
+            except Exception:
+                pass
 
+            if isinstance(payload, dict):
+                payload["recaptchaV3Token"] = ""
+
+            response = await fetch_via_proxy_queue(
+                url=url,
+                payload=payload if isinstance(payload, dict) else {},
+                http_method=http_method,
+                timeout_seconds=120,
+                auth_token=proxy_auth_token,
+            )
             if response is None:
                 raise HTTPException(
-                    status_code=502,
-                    detail="Failed to fetch response from LMArena (transport returned None)",
+                    status_code=504,
+                    detail="Userscript proxy request timed out or returned no response.",
                 )
-                
+
+            response.raise_for_status()
+                 
             log_http_status(response.status_code, "LMArena API Response")
-            
+             
             # Use aread() to ensure we buffer streaming-capable responses (like BrowserFetchStreamResponse)
             response_bytes = await response.aread()
             response_text_body = response_bytes.decode("utf-8", errors="replace")
