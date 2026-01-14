@@ -106,10 +106,6 @@ async def api_chat_completions(core, request, api_key):
         if not isinstance(messages, list):
             debug_print("❌ 'messages' must be an array")
             raise HTTPException(status_code=400, detail="'messages' must be an array.")
-        
-        if len(messages) == 0:
-            debug_print("❌ 'messages' array is empty")
-            raise HTTPException(status_code=400, detail="'messages' array cannot be empty.")
 
         # Find model ID from public name
         try:
@@ -275,7 +271,25 @@ async def api_chat_completions(core, request, api_key):
         # Check if conversation exists for this API key (robust to tests patching chat_sessions to a plain dict)
         per_key_sessions = chat_sessions.setdefault(api_key_str, {})
         session = per_key_sessions.get(conversation_id)
-        
+
+        def upsert_chat_session(existing_session, user_message_id, user_content, assistant_message):  # noqa: ANN001
+            if not existing_session:
+                per_key_sessions[conversation_id] = {
+                    "conversation_id": session_id,
+                    "model": model_public_name,
+                    "messages": [
+                        {"id": user_message_id, "role": "user", "content": user_content},
+                        assistant_message,
+                    ],
+                }
+                debug_print(f"💾 Saved new session for conversation {conversation_id}")
+                return per_key_sessions[conversation_id]
+
+            existing_session["messages"].append({"id": user_message_id, "role": "user", "content": user_content})
+            existing_session["messages"].append(assistant_message)
+            debug_print(f"💾 Updated existing session for conversation {conversation_id}")
+            return existing_session
+
         # Detect retry: if session exists and last message is same user message (no assistant response after it)
         is_retry = False
         retry_message_id = None
@@ -436,11 +450,10 @@ async def api_chat_completions(core, request, api_key):
 
         debug_print(f"\n🚀 Making API request to LMArena...")
         debug_print(f"⏱️  Timeout set to: 120 seconds")
-        
+
         # Initialize failed tokens tracking for this request
-        request_id = str(uuid.uuid4())
         failed_tokens = set()
-        
+
         # Get initial auth token using round-robin (excluding any failed ones)
         current_token = ""
         try:
@@ -502,11 +515,8 @@ async def api_chat_completions(core, request, api_key):
             for attempt in range(max_retries):
                 try:
                     async with httpx.AsyncClient() as client:
-                        if http_method == "PUT":
-                            response = await client.put(url, json=payload, headers=headers, timeout=120)
-                        else:
-                            response = await client.post(url, json=payload, headers=headers, timeout=120)
-                        
+                        response = await client.request(http_method, url, json=payload, headers=headers, timeout=120)
+
                         # Log status with human-readable message
                         log_http_status(response.status_code, "LMArena API")
                         
@@ -638,8 +648,7 @@ async def api_chat_completions(core, request, api_key):
 
                     # Stop retrying after a configurable deadline or too many attempts to avoid infinite hangs.
                     if (time.monotonic() - stream_started_at) > stream_total_timeout_seconds or attempt > 20:
-                        yield f"data: {json.dumps(openai_error_payload('Upstream retry timeout or max attempts exceeded while streaming from LMArena.', 'upstream_timeout', HTTPStatus.GATEWAY_TIMEOUT))}\n\n"
-                        yield SSE_DONE
+                        yield f"data: {json.dumps(openai_error_payload('Upstream retry timeout or max attempts exceeded while streaming from LMArena.', 'upstream_timeout', HTTPStatus.GATEWAY_TIMEOUT))}\n\n{SSE_DONE}"
                         return
                     # Reset response data for each attempt
                     response_text = ""
@@ -688,8 +697,7 @@ async def api_chat_completions(core, request, api_key):
                                 use_userscript = bool(proxy_active)
 
                             if not use_userscript:
-                                yield f"data: {json.dumps(openai_error_payload('Userscript proxy is required for streaming. Start the Camoufox proxy worker/userscript bridge and retry.', 'proxy_unavailable', HTTPStatus.SERVICE_UNAVAILABLE))}\n\n"
-                                yield SSE_DONE
+                                yield f"data: {json.dumps(openai_error_payload('Userscript proxy is required for streaming. Start the Camoufox proxy worker/userscript bridge and retry.', 'proxy_unavailable', HTTPStatus.SERVICE_UNAVAILABLE))}\n\n{SSE_DONE}"
                                 return
 
                             debug_print("🌐 Userscript Proxy is ACTIVE. Using Userscript Proxy for streaming.")
@@ -717,8 +725,7 @@ async def api_chat_completions(core, request, api_key):
                                 auth_token=proxy_auth_token,
                             )
                             if stream_context is None:
-                                yield f"data: {json.dumps(openai_error_payload('Userscript proxy request timed out or returned no response.', 'proxy_timeout', HTTPStatus.GATEWAY_TIMEOUT))}\n\n"
-                                yield SSE_DONE
+                                yield f"data: {json.dumps(openai_error_payload('Userscript proxy request timed out or returned no response.', 'proxy_timeout', HTTPStatus.GATEWAY_TIMEOUT))}\n\n{SSE_DONE}"
                                 return
 
                             transport_used = "userscript"
@@ -905,10 +912,7 @@ async def api_chat_completions(core, request, api_key):
 
                             if stream_context is None:
                                 client = await stack.enter_async_context(httpx.AsyncClient())
-                                if http_method == "PUT":
-                                    stream_context = client.stream('PUT', url, json=payload, headers=headers, timeout=120)
-                                else:
-                                    stream_context = client.stream('POST', url, json=payload, headers=headers, timeout=120)
+                                stream_context = client.stream(http_method, url, json=payload, headers=headers, timeout=120)
                                 transport_used = "httpx"
 
                             # Userscript proxy jobs report their upstream HTTP status asynchronously.
@@ -1012,8 +1016,7 @@ async def api_chat_completions(core, request, api_key):
                                 if response.status_code == HTTPStatus.TOO_MANY_REQUESTS:
                                     retry_429_count += 1
                                     if retry_429_count > 3:
-                                        yield f"data: {json.dumps(openai_error_payload('Too Many Requests (429) from upstream. Retries exhausted.', 'rate_limit_error', HTTPStatus.TOO_MANY_REQUESTS))}\n\n"
-                                        yield SSE_DONE
+                                        yield f"data: {json.dumps(openai_error_payload('Too Many Requests (429) from upstream. Retries exhausted.', 'rate_limit_error', HTTPStatus.TOO_MANY_REQUESTS))}\n\n{SSE_DONE}"
                                         return
 
                                     retry_after = None
@@ -1151,8 +1154,7 @@ async def api_chat_completions(core, request, api_key):
                                     else:
                                         retry_403_count += 1
                                         if retry_403_count > 5:
-                                            yield f"data: {json.dumps(openai_error_payload('Forbidden (403) from upstream. Retries exhausted.', 'forbidden_error', HTTPStatus.FORBIDDEN))}\n\n"
-                                            yield SSE_DONE
+                                            yield f"data: {json.dumps(openai_error_payload('Forbidden (403) from upstream. Retries exhausted.', 'forbidden_error', HTTPStatus.FORBIDDEN))}\n\n{SSE_DONE}"
                                             return
 
                                         body_text = ""
@@ -1188,8 +1190,7 @@ async def api_chat_completions(core, request, api_key):
                                                     debug_print(
                                                         "? Too many reCAPTCHA failures in userscript proxy. Failing fast."
                                                     )
-                                                    yield f"data: {json.dumps(openai_error_payload('Forbidden: reCAPTCHA validation failed repeatedly in userscript proxy.', 'recaptcha_error', HTTPStatus.FORBIDDEN))}\n\n"
-                                                    yield SSE_DONE
+                                                    yield f"data: {json.dumps(openai_error_payload('Forbidden: reCAPTCHA validation failed repeatedly in userscript proxy.', 'recaptcha_error', HTTPStatus.FORBIDDEN))}\n\n{SSE_DONE}"
                                                     return
 
                                             if isinstance(payload, dict):
@@ -1330,8 +1331,7 @@ async def api_chat_completions(core, request, api_key):
                                         continue
                                     except HTTPException:
                                         debug_print("No more tokens available for streaming request.")
-                                        yield f"data: {json.dumps(openai_error_payload('Unauthorized: Your LMArena auth token has expired or is invalid. Please get a new auth token from the dashboard.', 'authentication_error', HTTPStatus.UNAUTHORIZED))}\n\n"
-                                        yield SSE_DONE
+                                        yield f"data: {json.dumps(openai_error_payload('Unauthorized: Your LMArena auth token has expired or is invalid. Please get a new auth token from the dashboard.', 'authentication_error', HTTPStatus.UNAUTHORIZED))}\n\n{SSE_DONE}"
                                         return
                                 
                                 log_http_status(response.status_code, "Stream Connection")
@@ -1407,8 +1407,7 @@ async def api_chat_completions(core, request, api_key):
                                         recaptcha_403_failures += 1
                                         if recaptcha_403_failures >= 5:
                                             debug_print("❌ Too many reCAPTCHA failures (detected in body). Failing fast.")
-                                            yield f"data: {json.dumps(openai_error_payload(f'Forbidden: reCAPTCHA validation failed. Upstream hint: {upstream_hint[:200]}', 'recaptcha_error', HTTPStatus.FORBIDDEN))}\n\n"
-                                            yield SSE_DONE
+                                            yield f"data: {json.dumps(openai_error_payload(f'Forbidden: reCAPTCHA validation failed. Upstream hint: {upstream_hint[:200]}', 'recaptcha_error', HTTPStatus.FORBIDDEN))}\n\n{SSE_DONE}"
                                             return
                                 elif unhandled_preview:
                                     debug_print(f"   Upstream preview: {unhandled_preview[0][:200]}")
@@ -1420,8 +1419,7 @@ async def api_chat_completions(core, request, api_key):
                                         "Upstream failure: The request produced no content after multiple retries. "
                                         f"Last hint: {upstream_hint[:200] if upstream_hint else 'None'}"
                                     )
-                                    yield f"data: {json.dumps(openai_error_payload(msg, 'upstream_error', HTTPStatus.BAD_GATEWAY))}\n\n"
-                                    yield SSE_DONE
+                                    yield f"data: {json.dumps(openai_error_payload(msg, 'upstream_error', HTTPStatus.BAD_GATEWAY))}\n\n{SSE_DONE}"
                                     return
 
                                 # If the userscript proxy actually returned an upstream HTTP error, don't spin forever
@@ -1441,16 +1439,14 @@ async def api_chat_completions(core, request, api_key):
                                             current_token = get_next_auth_token(exclude_tokens=failed_tokens)
                                             headers = get_request_headers_with_token(current_token, recaptcha_token)
                                         except HTTPException:
-                                            yield f"data: {json.dumps(openai_error_payload('Unauthorized: Your LMArena auth token has expired or is invalid. Please get a new auth token from the dashboard.', 'authentication_error', HTTPStatus.UNAUTHORIZED))}\n\n"
-                                            yield SSE_DONE
+                                            yield f"data: {json.dumps(openai_error_payload('Unauthorized: Your LMArena auth token has expired or is invalid. Please get a new auth token from the dashboard.', 'authentication_error', HTTPStatus.UNAUTHORIZED))}\n\n{SSE_DONE}"
                                             return
 
                                     if proxy_status == HTTPStatus.FORBIDDEN:
                                         recaptcha_403_failures += 1
                                         if recaptcha_403_failures >= 5:
                                             debug_print("❌ Too many reCAPTCHA failures in userscript proxy. Failing fast.")
-                                            yield f"data: {json.dumps(openai_error_payload('Forbidden: reCAPTCHA validation failed repeatedly in userscript proxy.', 'recaptcha_error', HTTPStatus.FORBIDDEN))}\n\n"
-                                            yield SSE_DONE
+                                            yield f"data: {json.dumps(openai_error_payload('Forbidden: reCAPTCHA validation failed repeatedly in userscript proxy.', 'recaptcha_error', HTTPStatus.FORBIDDEN))}\n\n{SSE_DONE}"
                                             return
 
                                         # Common case: the proxy session gets flagged (reCAPTCHA). Retry with a fresh
@@ -1515,8 +1511,7 @@ async def api_chat_completions(core, request, api_key):
                                     # If we still can't wait within the remaining deadline, fail now instead of sending
                                     # keep-alives indefinitely.
                                     if (time.monotonic() - stream_started_at + float(sleep_seconds)) > stream_total_timeout_seconds:
-                                        yield f"data: {json.dumps(openai_error_payload(f'Upstream rate limit (429) would exceed stream deadline ({int(sleep_seconds)}s backoff).', 'rate_limit_error', HTTPStatus.TOO_MANY_REQUESTS))}\n\n"
-                                        yield SSE_DONE
+                                        yield f"data: {json.dumps(openai_error_payload(f'Upstream rate limit (429) would exceed stream deadline ({int(sleep_seconds)}s backoff).', 'rate_limit_error', HTTPStatus.TOO_MANY_REQUESTS))}\n\n{SSE_DONE}"
                                         return
 
                                     async for ka in sse_sleep_with_keepalive(core, sleep_seconds):
@@ -1537,27 +1532,8 @@ async def api_chat_completions(core, request, api_key):
                             if citations:
                                 unique_citations, _ = format_citations(citations)
                                 assistant_message["citations"] = unique_citations
-                            
-                            if not session:
-                                chat_sessions[api_key_str][conversation_id] = {
-                                    "conversation_id": session_id,
-                                    "model": model_public_name,
-                                    "messages": [
-                                        {"id": user_msg_id, "role": "user", "content": prompt},
-                                        assistant_message
-                                    ]
-                                }
-                                debug_print(f"💾 Saved new session for conversation {conversation_id}")
-                            else:
-                                # Append new messages to history
-                                chat_sessions[api_key_str][conversation_id]["messages"].append(
-                                    {"id": user_msg_id, "role": "user", "content": prompt}
-                                )
-                                chat_sessions[api_key_str][conversation_id]["messages"].append(
-                                    assistant_message
-                                )
-                                debug_print(f"💾 Updated existing session for conversation {conversation_id}")
-                            
+                            session = upsert_chat_session(session, user_msg_id, prompt, assistant_message)
+
                             yield SSE_DONE
                             debug_print(f"✅ Stream completed - {len(response_text)} chars sent")
                             return  # Success, exit retry loop
@@ -1569,8 +1545,7 @@ async def api_chat_completions(core, request, api_key):
                             if current_retry_attempt > max_retries:
                                 error_msg = "LMArena API error 429: Too many requests. Max retries exceeded. Terminating stream."
                                 debug_print(f"❌ {error_msg}")
-                                yield f"data: {json.dumps(openai_error_payload(error_msg, 'api_error', e.response.status_code))}\n\n"
-                                yield SSE_DONE
+                                yield f"data: {json.dumps(openai_error_payload(error_msg, 'api_error', e.response.status_code))}\n\n{SSE_DONE}"
                                 return
 
                             retry_after_header = e.response.headers.get("Retry-After")
@@ -1589,8 +1564,7 @@ async def api_chat_completions(core, request, api_key):
                             if current_retry_attempt > max_retries:
                                 error_msg = "LMArena API error 403: Forbidden. Max retries exceeded. Terminating stream."
                                 debug_print(f"❌ {error_msg}")
-                                yield f"data: {json.dumps(openai_error_payload(error_msg, 'api_error', e.response.status_code))}\n\n"
-                                yield SSE_DONE
+                                yield f"data: {json.dumps(openai_error_payload(error_msg, 'api_error', e.response.status_code))}\n\n{SSE_DONE}"
                                 return
                             
                             debug_print(
@@ -1608,8 +1582,7 @@ async def api_chat_completions(core, request, api_key):
                             if current_retry_attempt > max_retries:
                                 error_msg = "LMArena API error 401: Unauthorized. Max retries exceeded. Terminating stream."
                                 debug_print(f"❌ {error_msg}")
-                                yield f"data: {json.dumps(openai_error_payload(error_msg, 'api_error', e.response.status_code))}\n\n"
-                                yield SSE_DONE
+                                yield f"data: {json.dumps(openai_error_payload(error_msg, 'api_error', e.response.status_code))}\n\n{SSE_DONE}"
                                 return
                             # The original code has `continue` here, which leads to an additional keepalive sleep.
                             # This is fine for 401 to allow token rotation and retry.
@@ -1638,10 +1611,9 @@ async def api_chat_completions(core, request, api_key):
                                 error_msg = f"LMArena API error: {e.response.status_code}"
                             
                             error_type = "api_error"
-                            
+
                             debug_print(f"❌ {error_msg}")
-                            yield f"data: {json.dumps(openai_error_payload(error_msg, error_type, e.response.status_code))}\n\n"
-                            yield SSE_DONE
+                            yield f"data: {json.dumps(openai_error_payload(error_msg, error_type, e.response.status_code))}\n\n{SSE_DONE}"
                             return
                     except Exception as e:
                         debug_print(f"❌ Stream error: {str(e)}")
@@ -1651,8 +1623,7 @@ async def api_chat_completions(core, request, api_key):
                         # But legitimate internal errors should probably surface.
                         # Let's retry on network-like errors if we can distinguish them.
                         # For now, yield error.
-                        yield f"data: {json.dumps(openai_error_payload(str(e), 'internal_error', 'internal_error'))}\n\n"
-                        yield SSE_DONE
+                        yield f"data: {json.dumps(openai_error_payload(str(e), 'internal_error', 'internal_error'))}\n\n{SSE_DONE}"
                         return
             return StreamingResponse(generate_stream(), media_type="text/event-stream")
         
@@ -1859,25 +1830,7 @@ async def api_chat_completions(core, request, api_key):
                 unique_citations, citation_footnotes = format_citations(citations)
                 assistant_message["citations"] = unique_citations
 
-            if not session:
-                chat_sessions[api_key_str][conversation_id] = {
-                    "conversation_id": session_id,
-                    "model": model_public_name,
-                    "messages": [
-                        {"id": user_msg_id, "role": "user", "content": prompt},
-                        assistant_message
-                    ]
-                }
-                debug_print(f"💾 Saved new session for conversation {conversation_id}")
-            else:
-                # Append new messages to history
-                chat_sessions[api_key_str][conversation_id]["messages"].append(
-                    {"id": user_msg_id, "role": "user", "content": prompt}
-                )
-                chat_sessions[api_key_str][conversation_id]["messages"].append(
-                    assistant_message
-                )
-                debug_print(f"💾 Updated existing session for conversation {conversation_id}")
+            session = upsert_chat_session(session, user_msg_id, prompt, assistant_message)
 
             # Build message object with reasoning and citations if present
             message_obj = {
