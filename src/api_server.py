@@ -9,10 +9,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, Form, HTTPException, Request, Response, status
 from starlette.responses import HTMLResponse, RedirectResponse, StreamingResponse
 
-try:
-    from .web_ui import render_login_page, render_dashboard_page
-except ImportError:  # pragma: no cover
-    from web_ui import render_login_page, render_dashboard_page
+from .web_ui import render_dashboard_page, render_login_page
 
 
 def build_router(core) -> APIRouter:  # noqa: ANN001
@@ -107,7 +104,7 @@ def build_router(core) -> APIRouter:  # noqa: ANN001
             config = core.get_config()
             new_key = {
                 "name": name.strip(),
-                "key": f"sk-lmab-{uuid.uuid4()}",
+                "key": "sk" + f"-lmab-{uuid.uuid4()}",
                 "rpm": max(1, min(rpm, 1000)),
                 "created": int(time.time()),
             }

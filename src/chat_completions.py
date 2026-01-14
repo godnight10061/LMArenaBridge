@@ -265,9 +265,6 @@ async def api_chat_completions(core, request, api_key):
         debug_print(f"💭 Auto-generated Conversation ID: {conversation_id}")
         debug_print(f"🔑 Conversation key: {conversation_key[:100]}...")
 
-        # Headers are prepared after selecting an auth token (or when falling back to browser-only transports).
-        headers: dict[str, str] = {}
-        
         # Check if conversation exists for this API key (robust to tests patching chat_sessions to a plain dict)
         per_key_sessions = chat_sessions.setdefault(api_key_str, {})
         session = per_key_sessions.get(conversation_id)
@@ -501,100 +498,15 @@ async def api_chat_completions(core, request, api_key):
             # tokens (they cause immediate 401s and prevent the proxy from minting a fresh anonymous session).
             if strict_chrome_fetch_model and current_token and not is_probably_valid_arena_auth_token(current_token):
                 current_token = ""
-        headers = get_request_headers_with_token(current_token, recaptcha_token)
         if current_token:
             debug_print(f"🔑 Using token (round-robin): {current_token[:20]}...")
         else:
             debug_print("🔑 No auth token configured (will rely on browser session cookies).")
-        
-        # Retry logic wrapper
-        async def make_request_with_retry(url, payload, http_method, max_retries=3):
-            """Make request with automatic retry on 429/401 errors"""
-            nonlocal current_token, headers, failed_tokens, recaptcha_token
-            
-            for attempt in range(max_retries):
-                try:
-                    async with httpx.AsyncClient() as client:
-                        response = await client.request(http_method, url, json=payload, headers=headers, timeout=120)
 
-                        # Log status with human-readable message
-                        log_http_status(response.status_code, "LMArena API")
-                        
-                        # Check for retry-able errors
-                        if response.status_code == HTTPStatus.TOO_MANY_REQUESTS:
-                            debug_print(f"⏱️  Attempt {attempt + 1}/{max_retries} - Rate limit with token {current_token[:20]}...")
-                            retry_after = response.headers.get("Retry-After")
-                            sleep_seconds = get_rate_limit_sleep_seconds(retry_after, attempt)
-                            debug_print(f"  Retry-After header: {retry_after!r}")
-                            
-                            if attempt < max_retries - 1:
-                                try:
-                                    # Try with next token (excluding failed ones)
-                                    current_token = get_next_auth_token(exclude_tokens=failed_tokens)
-                                    headers = get_request_headers_with_token(current_token, recaptcha_token)
-                                    debug_print(f"🔄 Retrying with next token: {current_token[:20]}...")
-                                    await asyncio.sleep(sleep_seconds)
-                                    continue
-                                except HTTPException as e:
-                                    debug_print(f"❌ No more tokens available: {e.detail}")
-                                    break
-                        
-                        elif response.status_code == HTTPStatus.FORBIDDEN:
-                            try:
-                                error_body = response.json()
-                            except Exception:
-                                error_body = None
-                            if isinstance(error_body, dict) and error_body.get("error") == "recaptcha validation failed":
-                                debug_print(
-                                    f"🤖 Attempt {attempt + 1}/{max_retries} - reCAPTCHA validation failed. Refreshing token..."
-                                )
-                                new_token = await refresh_recaptcha_token(force_new=True)
-                                if new_token and isinstance(payload, dict):
-                                    payload["recaptchaV3Token"] = new_token
-                                    recaptcha_token = new_token
-                                if attempt < max_retries - 1:
-                                    headers = get_request_headers_with_token(current_token, recaptcha_token)
-                                    await asyncio.sleep(1)
-                                    continue
-
-                        elif response.status_code == HTTPStatus.UNAUTHORIZED:
-                            debug_print(f"🔒 Attempt {attempt + 1}/{max_retries} - Auth failed with token {current_token[:20]}...")
-                            # Add current token to failed set
-                            failed_tokens.add(current_token)
-                            # (Pruning disabled)
-                            debug_print(f"📝 Failed tokens so far: {len(failed_tokens)}")
-                            
-                            if attempt < max_retries - 1:
-                                try:
-                                    # Try with next available token (excluding failed ones)
-                                    current_token = get_next_auth_token(exclude_tokens=failed_tokens)
-                                    headers = get_request_headers_with_token(current_token, recaptcha_token)
-                                    debug_print(f"🔄 Retrying with next token: {current_token[:20]}...")
-                                    await asyncio.sleep(1)  # Brief delay
-                                    continue
-                                except HTTPException as e:
-                                    debug_print(f"❌ No more tokens available: {e.detail}")
-                                    break
-                        
-                        # If we get here, return the response (success or non-retryable error)
-                        response.raise_for_status()
-                        return response
-                        
-                except httpx.HTTPStatusError as e:
-                    # Only handle 429 and 401, let other errors through
-                    if e.response.status_code not in [429, 401]:
-                        raise
-                    # If last attempt, raise the error
-                    if attempt == max_retries - 1:
-                        raise
-            
-            # Should not reach here, but just in case
-            raise HTTPException(status_code=503, detail="Max retries exceeded")
-        
         # Handle streaming mode
         if stream:
             async def generate_stream():
-                nonlocal current_token, headers, failed_tokens, recaptcha_token
+                nonlocal current_token, failed_tokens, recaptcha_token
                 
                 # Safety: don't keep client sockets open forever on repeated upstream failures.
                 try:
@@ -612,21 +524,13 @@ async def api_chat_completions(core, request, api_key):
 
                 # Proxy-only transport: always mint reCAPTCHA tokens in-page via the Userscript Proxy.
                 # (Side-channel tokens + direct httpx have proven unreliable and are intentionally disabled.)
-                use_browser_transports = False
-                prefer_chrome_transport = False
                 recaptcha_token = ""
                 if isinstance(payload, dict):
                     payload["recaptchaV3Token"] = ""
-                headers = get_request_headers_with_token(current_token, recaptcha_token)
-                
+
                 recaptcha_403_failures = 0
                 no_delta_failures = 0
                 attempt = 0
-                recaptcha_403_consecutive = 0
-                recaptcha_403_last_transport: Optional[str] = None
-                strict_token_prefill_attempted = False
-                disable_userscript_for_request = False
-                force_proxy_recaptcha_mint = False
                 disable_userscript_proxy_env = bool(os.environ.get("LM_BRIDGE_DISABLE_USERSCRIPT_PROXY"))
 
                 retry_429_count = 0
@@ -730,191 +634,6 @@ async def api_chat_completions(core, request, api_key):
 
                             transport_used = "userscript"
 
-                            # Strict models: when we're about to fall back to buffered browser fetch transports (not the
-                            # streaming proxy), a side-channel token can avoid hangs while grecaptcha loads in-page.
-                            if (
-                                stream_context is None
-                                and use_browser_transports
-                                and not use_userscript
-                                and isinstance(payload, dict)
-                                and not strict_token_prefill_attempted
-                                and not str(payload.get("recaptchaV3Token") or "").strip()
-                            ):
-                                strict_token_prefill_attempted = True
-                                try:
-                                    refresh_task = asyncio.create_task(refresh_recaptcha_token(force_new=True))
-                                except Exception:
-                                    refresh_task = None
-                                if refresh_task is not None:
-                                    async for ka in sse_wait_for_task_with_keepalive(core, refresh_task):
-                                        yield ka
-                                    try:
-                                        new_token = refresh_task.result()
-                                    except Exception:
-                                        new_token = None
-                                    if new_token:
-                                        payload["recaptchaV3Token"] = new_token
-
-                            if stream_context is None and use_browser_transports:
-                                browser_fetch_attempts = 5
-                                try:
-                                    browser_fetch_attempts = int(get_config().get("chrome_fetch_recaptcha_max_attempts", 5))
-                                except Exception:
-                                    browser_fetch_attempts = 5
-
-                                # If we have a cached side-channel reCAPTCHA token, prefer passing it into the browser
-                                # fetch transports (they will reuse it on the first attempt and only mint in-page if
-                                # needed). This helps when in-page grecaptcha is slow/flaky.
-                                if isinstance(payload, dict) and not str(payload.get("recaptchaV3Token") or "").strip():
-                                    try:
-                                        cached_token = get_cached_recaptcha_token()
-                                    except Exception:
-                                        cached_token = ""
-                                    if cached_token:
-                                        payload["recaptchaV3Token"] = cached_token
-
-                                async def _try_chrome_fetch() -> Optional[BrowserFetchStreamResponse]:
-                                    debug_print("🌐 Using Chrome fetch transport for streaming...")
-                                    try:
-                                        auth_for_browser = str(current_token or "").strip()
-                                        try:
-                                            cand = str(core.EPHEMERAL_ARENA_AUTH_TOKEN or "").strip()
-                                        except Exception:
-                                            cand = ""
-                                        if cand:
-                                            try:
-                                                if (
-                                                    is_probably_valid_arena_auth_token(cand)
-                                                    and not is_arena_auth_token_expired(cand, skew_seconds=0)
-                                                    and (
-                                                        (not auth_for_browser)
-                                                        or (not is_probably_valid_arena_auth_token(auth_for_browser))
-                                                        or is_arena_auth_token_expired(auth_for_browser, skew_seconds=0)
-                                                    )
-                                                ):
-                                                    auth_for_browser = cand
-                                            except Exception:
-                                                auth_for_browser = cand
-
-                                        try:
-                                            chrome_outer_timeout = float(get_config().get("chrome_fetch_outer_timeout_seconds", 120))
-                                        except Exception:
-                                            chrome_outer_timeout = 120.0
-                                        chrome_outer_timeout = max(20.0, min(chrome_outer_timeout, 300.0))
-
-                                        return await asyncio.wait_for(
-                                            fetch_lmarena_stream_via_chrome(
-                                                http_method=http_method,
-                                                url=url,
-                                                payload=payload if isinstance(payload, dict) else {},
-                                                auth_token=auth_for_browser,
-                                                timeout_seconds=120,
-                                                max_recaptcha_attempts=browser_fetch_attempts,
-                                            ),
-                                            timeout=chrome_outer_timeout,
-                                        )
-                                    except asyncio.TimeoutError:
-                                        debug_print("⚠️ Chrome fetch transport timed out (launch/nav hang).")
-                                        return None
-                                    except Exception as e:
-                                        debug_print(f"⚠️ Chrome fetch transport error: {e}")
-                                        return None
-
-                                async def _try_camoufox_fetch() -> Optional[BrowserFetchStreamResponse]:
-                                    debug_print("🦊 Using Camoufox fetch transport for streaming...")
-                                    try:
-                                        auth_for_browser = str(current_token or "").strip()
-                                        try:
-                                            cand = str(core.EPHEMERAL_ARENA_AUTH_TOKEN or "").strip()
-                                        except Exception:
-                                            cand = ""
-                                        if cand:
-                                            try:
-                                                if (
-                                                    is_probably_valid_arena_auth_token(cand)
-                                                    and not is_arena_auth_token_expired(cand, skew_seconds=0)
-                                                    and (
-                                                        (not auth_for_browser)
-                                                        or (not is_probably_valid_arena_auth_token(auth_for_browser))
-                                                        or is_arena_auth_token_expired(auth_for_browser, skew_seconds=0)
-                                                    )
-                                                ):
-                                                    auth_for_browser = cand
-                                            except Exception:
-                                                auth_for_browser = cand
-
-                                        try:
-                                            camoufox_outer_timeout = float(
-                                                get_config().get("camoufox_fetch_outer_timeout_seconds", 180)
-                                            )
-                                        except Exception:
-                                            camoufox_outer_timeout = 180.0
-                                        camoufox_outer_timeout = max(20.0, min(camoufox_outer_timeout, 300.0))
-
-                                        return await asyncio.wait_for(
-                                            fetch_lmarena_stream_via_camoufox(
-                                                http_method=http_method,
-                                                url=url,
-                                                payload=payload if isinstance(payload, dict) else {},
-                                                auth_token=auth_for_browser,
-                                                timeout_seconds=120,
-                                                max_recaptcha_attempts=browser_fetch_attempts,
-                                            ),
-                                            timeout=camoufox_outer_timeout,
-                                        )
-                                    except asyncio.TimeoutError:
-                                        debug_print("⚠️ Camoufox fetch transport timed out (launch/nav hang).")
-                                        return None
-                                    except Exception as e:
-                                        debug_print(f"⚠️ Camoufox fetch transport error: {e}")
-                                        return None
-
-                                if prefer_chrome_transport:
-                                    chrome_task = asyncio.create_task(_try_chrome_fetch())
-                                    async for ka in sse_wait_for_task_with_keepalive(core, chrome_task):
-                                        yield ka
-                                    try:
-                                        stream_context = chrome_task.result()
-                                    except Exception:
-                                        stream_context = None
-                                    if stream_context is not None:
-                                        transport_used = "chrome"
-                                    if stream_context is None:
-                                        camoufox_task = asyncio.create_task(_try_camoufox_fetch())
-                                        async for ka in sse_wait_for_task_with_keepalive(core, camoufox_task):
-                                            yield ka
-                                        try:
-                                            stream_context = camoufox_task.result()
-                                        except Exception:
-                                            stream_context = None
-                                        if stream_context is not None:
-                                            transport_used = "camoufox"
-                                else:
-                                    camoufox_task = asyncio.create_task(_try_camoufox_fetch())
-                                    async for ka in sse_wait_for_task_with_keepalive(core, camoufox_task):
-                                        yield ka
-                                    try:
-                                        stream_context = camoufox_task.result()
-                                    except Exception:
-                                        stream_context = None
-                                    if stream_context is not None:
-                                        transport_used = "camoufox"
-                                    if stream_context is None:
-                                        chrome_task = asyncio.create_task(_try_chrome_fetch())
-                                        async for ka in sse_wait_for_task_with_keepalive(core, chrome_task):
-                                            yield ka
-                                        try:
-                                            stream_context = chrome_task.result()
-                                        except Exception:
-                                            stream_context = None
-                                        if stream_context is not None:
-                                            transport_used = "chrome"
-
-                            if stream_context is None:
-                                client = await stack.enter_async_context(httpx.AsyncClient())
-                                stream_context = client.stream(http_method, url, json=payload, headers=headers, timeout=120)
-                                transport_used = "httpx"
-
                             # Userscript proxy jobs report their upstream HTTP status asynchronously.
                             # Wait for the status (or completion) before branching on status_code, while still
                             # keeping the client connection alive.
@@ -965,7 +684,6 @@ async def api_chat_completions(core, request, api_key):
                                             debug_print(
                                                 f"⚠️ Userscript proxy did not pick up job within {int(pickup_timeout_seconds)}s."
                                             )
-                                            disable_userscript_for_request = True
                                             try:
                                                 await push_proxy_chunk(
                                                     proxy_job_id,
@@ -986,10 +704,7 @@ async def api_chat_completions(core, request, api_key):
                                             debug_print(
                                                 f"⚠️ Userscript proxy did not report upstream status within {int(proxy_status_timeout_seconds)}s."
                                             )
-                                            # Treat the proxy as unavailable for the rest of this request and fall back
-                                            # to other transports (Chrome/Camoufox/httpx). Otherwise we'd keep queuing
-                                            # jobs that will never be picked up and stall for a long time.
-                                            disable_userscript_for_request = True
+                                            # Stop waiting on this job and retry with a fresh proxy request.
                                             try:
                                                 await push_proxy_chunk(
                                                     proxy_job_id,
@@ -1051,7 +766,6 @@ async def api_chat_completions(core, request, api_key):
                                             current_token = get_next_auth_token(
                                                 exclude_tokens=rotation_exclude, allow_ephemeral_fallback=False
                                             )
-                                            headers = get_request_headers_with_token(current_token, recaptcha_token)
                                             token_rotated = True
                                             debug_print(f"🔄 Retrying stream with next token: {current_token[:20]}...")
                                         except HTTPException:
@@ -1183,7 +897,6 @@ async def api_chat_completions(core, request, api_key):
                                             # The proxy is our only truly streaming browser transport. Prefer retrying
                                             # it with a fresh in-page token mint over switching to buffered browser
                                             # fetch fallbacks (which can stall SSE).
-                                            force_proxy_recaptcha_mint = True
                                             if is_recaptcha_failure:
                                                 recaptcha_403_failures += 1
                                                 if recaptcha_403_failures >= 5:
@@ -1201,88 +914,7 @@ async def api_chat_completions(core, request, api_key):
                                                 yield ka
                                             continue
 
-                                        if is_recaptcha_failure:
-                                            # Track consecutive reCAPTCHA failures so we can escalate to browser
-                                            # transports even for non-strict models.
-                                            recaptcha_403_failures += 1
-                                            if recaptcha_403_last_transport == transport_used:
-                                                recaptcha_403_consecutive += 1
-                                            else:
-                                                recaptcha_403_consecutive = 1
-                                                recaptcha_403_last_transport = transport_used
-
-                                            if transport_used in ("chrome", "camoufox"):
-                                                try:
-                                                    debug_print(
-                                                        "Refreshing token/cookies (side-channel) after browser fetch 403..."
-                                                    )
-                                                    refresh_task = asyncio.create_task(
-                                                        refresh_recaptcha_token(force_new=True)
-                                                    )
-                                                    async for ka in sse_wait_for_task_with_keepalive(core, refresh_task):
-                                                        yield ka
-                                                    new_token = refresh_task.result()
-                                                except Exception:
-                                                    new_token = None
-                                                # Prefer reusing a fresh side-channel token on the next attempt; if we
-                                                # couldn't get one, fall back to in-page minting.
-                                                if isinstance(payload, dict):
-                                                    payload["recaptchaV3Token"] = new_token or ""
-                                            else:
-                                                debug_print("Refreshing token (side-channel)...")
-                                                try:
-                                                    refresh_task = asyncio.create_task(
-                                                        refresh_recaptcha_token(force_new=True)
-                                                    )
-                                                    async for ka in sse_wait_for_task_with_keepalive(core, refresh_task):
-                                                        yield ka
-                                                    new_token = refresh_task.result()
-                                                except Exception:
-                                                    new_token = None
-                                                if new_token and isinstance(payload, dict):
-                                                    payload["recaptchaV3Token"] = new_token
-
-                                            if recaptcha_403_consecutive >= 2 and transport_used == "chrome":
-                                                debug_print(
-                                                    "Switching to Camoufox-first after repeated Chrome reCAPTCHA failures."
-                                                )
-                                                use_browser_transports = True
-                                                prefer_chrome_transport = False
-                                                recaptcha_403_consecutive = 0
-                                                recaptcha_403_last_transport = None
-                                            elif recaptcha_403_consecutive >= 2 and transport_used != "chrome":
-                                                debug_print(
-                                                    "🌐 Switching to Chrome fetch transport after repeated reCAPTCHA failures."
-                                                )
-                                                use_browser_transports = True
-                                                prefer_chrome_transport = True
-                                                recaptcha_403_consecutive = 0
-                                                recaptcha_403_last_transport = None
-
-                                            async for ka in sse_sleep_with_keepalive(core, 1.5):
-                                                yield ka
-                                            continue
-
-                                        # If 403 but not recaptcha, might be other auth issue, but let's retry anyway
-                                        async for ka in sse_sleep_with_keepalive(core, 2.0):
-                                            yield ka
-                                        continue
-
                                 elif response.status_code == HTTPStatus.UNAUTHORIZED:
-                                    if strict_chrome_fetch_model and use_browser_transports:
-                                        # Strict-model requests can recover from 401s by minting a fresh anonymous
-                                        # session inside the browser (Camoufox/userscript proxy). Rotating through
-                                        # expired config tokens here just produces repeated 401s and forces manual
-                                        # token paste. Prefer browser-session retry instead.
-                                        debug_print("🔒 Upstream 401 in strict browser mode. Retrying with browser session (no token)...")
-                                        current_token = ""
-                                        headers = get_request_headers_with_token(current_token, recaptcha_token)
-                                        if isinstance(payload, dict):
-                                            payload["recaptchaV3Token"] = ""
-                                        async for ka in sse_sleep_with_keepalive(core, 2.0):
-                                            yield ka
-                                        continue
-
                                     debug_print(f"🔒 Stream token expired")
                                     # Add current token to failed set
                                     if current_token:
@@ -1312,8 +944,7 @@ async def api_chat_completions(core, request, api_key):
                                     if refreshed_token:
                                         core.EPHEMERAL_ARENA_AUTH_TOKEN = refreshed_token
                                         current_token = refreshed_token
-                                        headers = get_request_headers_with_token(current_token, recaptcha_token)
-                                        # Ensure the next browser attempt mints a fresh token for the refreshed session.
+                                        # Ensure the next attempt mints a fresh token for the refreshed session.
                                         if isinstance(payload, dict):
                                             payload["recaptchaV3Token"] = ""
                                         debug_print("🔄 Refreshed arena-auth-prod-v1 session after 401. Retrying...")
@@ -1324,7 +955,6 @@ async def api_chat_completions(core, request, api_key):
                                     try:
                                         # Try with next available token (excluding failed ones)
                                         current_token = get_next_auth_token(exclude_tokens=failed_tokens)
-                                        headers = get_request_headers_with_token(current_token, recaptcha_token)
                                         debug_print(f"🔄 Retrying stream with next token: {current_token[:20]}...")
                                         async for ka in sse_sleep_with_keepalive(core, 1.0):
                                             yield ka
@@ -1437,7 +1067,6 @@ async def api_chat_completions(core, request, api_key):
 
                                         try:
                                             current_token = get_next_auth_token(exclude_tokens=failed_tokens)
-                                            headers = get_request_headers_with_token(current_token, recaptcha_token)
                                         except HTTPException:
                                             yield f"data: {json.dumps(openai_error_payload('Unauthorized: Your LMArena auth token has expired or is invalid. Please get a new auth token from the dashboard.', 'authentication_error', HTTPStatus.UNAUTHORIZED))}\n\n{SSE_DONE}"
                                             return
@@ -1450,8 +1079,7 @@ async def api_chat_completions(core, request, api_key):
                                             return
 
                                         # Common case: the proxy session gets flagged (reCAPTCHA). Retry with a fresh
-                                        # in-page token mint rather than switching to buffered browser fetch fallbacks.
-                                        force_proxy_recaptcha_mint = True
+                                        # in-page token mint.
                                         debug_print("🚫 Userscript proxy upstream 403: retrying userscript (fresh reCAPTCHA).")
                                         if isinstance(payload, dict):
                                             payload["recaptchaV3Token"] = ""

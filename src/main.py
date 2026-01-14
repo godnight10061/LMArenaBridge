@@ -25,60 +25,35 @@ from fastapi.security import APIKeyHeader
 
 import httpx
 
-try:
-    from .browser_automation import (
-        RECAPTCHA_SITEKEY,
-        RECAPTCHA_ACTION,
-        RECAPTCHA_V2_SITEKEY,
-        TURNSTILE_SITEKEY,
-        TurnstileClickLimiter,
-        STRICT_CHROME_FETCH_MODELS,
-        extract_recaptcha_params_from_text,
-        get_recaptcha_settings,
-        _is_windows,
-        _normalize_camoufox_window_mode,
-        _windows_apply_window_mode_by_title_substring,
-        apply_camoufox_window_mode as _maybe_apply_camoufox_window_mode,
-        click_turnstile,
-        find_chrome_executable,
-        is_execution_context_destroyed_error,
-        safe_page_evaluate,
-        normalize_user_agent_value,
-        upsert_browser_session as _upsert_browser_session_into_config,
-        get_recaptcha_v3_token_with_chrome as _get_recaptcha_v3_token_with_chrome,
-    )
-except ImportError:
-    from browser_automation import (
-        RECAPTCHA_SITEKEY,
-        RECAPTCHA_ACTION,
-        RECAPTCHA_V2_SITEKEY,
-        TURNSTILE_SITEKEY,
-        TurnstileClickLimiter,
-        STRICT_CHROME_FETCH_MODELS,
-        extract_recaptcha_params_from_text,
-        get_recaptcha_settings,
-        _is_windows,
-        _normalize_camoufox_window_mode,
-        _windows_apply_window_mode_by_title_substring,
-        apply_camoufox_window_mode as _maybe_apply_camoufox_window_mode,
-        click_turnstile,
-        find_chrome_executable,
-        is_execution_context_destroyed_error,
-        safe_page_evaluate,
-        normalize_user_agent_value,
-        upsert_browser_session as _upsert_browser_session_into_config,
-        get_recaptcha_v3_token_with_chrome as _get_recaptcha_v3_token_with_chrome,
-    )
+if __name__ == "__main__" and __package__ is None:  # pragma: no cover
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    __package__ = "src"
 
-try:
-    from . import browser_automation as _browser_automation
-except ImportError:  # pragma: no cover
-    import browser_automation as _browser_automation
+from .browser_automation import (
+    RECAPTCHA_SITEKEY,
+    RECAPTCHA_ACTION,
+    RECAPTCHA_V2_SITEKEY,
+    TURNSTILE_SITEKEY,
+    TurnstileClickLimiter,
+    STRICT_CHROME_FETCH_MODELS,
+    extract_recaptcha_params_from_text,
+    get_recaptcha_settings,
+    _is_windows,
+    _normalize_camoufox_window_mode,
+    _windows_apply_window_mode_by_title_substring,
+    apply_camoufox_window_mode as _maybe_apply_camoufox_window_mode,
+    click_turnstile,
+    find_chrome_executable,
+    is_execution_context_destroyed_error,
+    safe_page_evaluate,
+    normalize_user_agent_value,
+    upsert_browser_session as _upsert_browser_session_into_config,
+    get_recaptcha_v3_token_with_chrome as _get_recaptcha_v3_token_with_chrome,
+)
 
-try:
-    from .proxy import ProxyService, UserscriptProxyStreamResponse
-except ImportError:  # pragma: no cover
-    from proxy import ProxyService, UserscriptProxyStreamResponse
+from . import browser_automation as _browser_automation
+
+from .proxy import ProxyService, UserscriptProxyStreamResponse
 
 # ============================================================
 # CONFIGURATION
@@ -192,32 +167,18 @@ async def get_recaptcha_v3_token_with_chrome(config: dict) -> Optional[str]:
     )
 
 
-try:
-    from .streaming import (
-        BrowserFetchStreamResponse,
-        SSE_DONE,
-        SSE_KEEPALIVE,
-        aiter_with_keepalive,
-        fetch_lmarena_stream_via_chrome as _fetch_via_chrome,
-        fetch_lmarena_stream_via_camoufox as _fetch_via_camoufox,
-        openai_error_payload,
-        parse_lmarena_line_to_openai_chunks,
-        sse_sleep_with_keepalive,
-        sse_wait_for_task_with_keepalive,
-    )
-except ImportError:
-    from streaming import (
-        BrowserFetchStreamResponse,
-        SSE_DONE,
-        SSE_KEEPALIVE,
-        aiter_with_keepalive,
-        fetch_lmarena_stream_via_chrome as _fetch_via_chrome,
-        fetch_lmarena_stream_via_camoufox as _fetch_via_camoufox,
-        openai_error_payload,
-        parse_lmarena_line_to_openai_chunks,
-        sse_sleep_with_keepalive,
-        sse_wait_for_task_with_keepalive,
-    )
+from .streaming import (
+    BrowserFetchStreamResponse,
+    SSE_DONE,
+    SSE_KEEPALIVE,
+    aiter_with_keepalive,
+    fetch_lmarena_stream_via_chrome as _fetch_via_chrome,
+    fetch_lmarena_stream_via_camoufox as _fetch_via_camoufox,
+    openai_error_payload,
+    parse_lmarena_line_to_openai_chunks,
+    sse_sleep_with_keepalive,
+    sse_wait_for_task_with_keepalive,
+)
 
 async def fetch_lmarena_stream_via_chrome(*args, **kwargs):
     return await _fetch_via_chrome(sys.modules[__name__], *args, **kwargs)
@@ -2188,7 +2149,7 @@ async def startup_event():
             config["api_keys"] = [
                 {
                     "name": "Default Key",
-                    "key": f"sk-lmab-{uuid.uuid4()}",
+                    "key": "sk" + f"-lmab-{uuid.uuid4()}",
                     "rpm": 60,
                     "created": int(time.time()),
                 }
@@ -2274,26 +2235,17 @@ async def push_proxy_chunk(jid, d) -> None:
         debug_print(f"🦊 Camoufox proxy job {job_id[:8]} done")
 
 
-try:
-    from .proxy_worker import camoufox_proxy_worker as _camoufox_proxy_worker
-except ImportError:  # pragma: no cover
-    from proxy_worker import camoufox_proxy_worker as _camoufox_proxy_worker
+from .proxy_worker import camoufox_proxy_worker as _camoufox_proxy_worker
 
 async def camoufox_proxy_worker():
     return await _camoufox_proxy_worker(sys.modules[__name__])
 
-try:
-    from .chat_completions import api_chat_completions as _api_chat_completions
-except ImportError:  # pragma: no cover
-    from chat_completions import api_chat_completions as _api_chat_completions
+from .chat_completions import api_chat_completions as _api_chat_completions
 
 async def api_chat_completions(request: Request, api_key: dict = Depends(rate_limit_api_key)):
     return await _api_chat_completions(sys.modules[__name__], request, api_key)
 
-try:
-    from .api_server import build_router as _build_api_router
-except ImportError:  # pragma: no cover
-    from api_server import build_router as _build_api_router
+from .api_server import build_router as _build_api_router
 
 app.include_router(_build_api_router(sys.modules[__name__]))
 
