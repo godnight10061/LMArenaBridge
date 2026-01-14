@@ -46,7 +46,6 @@ async def api_chat_completions(core, request, api_key):
     refresh_arena_auth_token_via_supabase = core.refresh_arena_auth_token_via_supabase
     refresh_recaptcha_token = core.refresh_recaptcha_token
     save_config = core.save_config
-    sse_openai_error_and_done = core.sse_openai_error_and_done
     sse_sleep_with_keepalive = core.sse_sleep_with_keepalive
     sse_wait_for_task_with_keepalive = core.sse_wait_for_task_with_keepalive
     time = core.time
@@ -740,11 +739,8 @@ async def api_chat_completions(core, request, api_key):
                                 except Exception:
                                     refresh_task = None
                                 if refresh_task is not None:
-                                    while True:
-                                        done, _ = await asyncio.wait({refresh_task}, timeout=1.0)
-                                        if refresh_task in done:
-                                            break
-                                        yield SSE_KEEPALIVE
+                                    async for ka in sse_wait_for_task_with_keepalive(core, refresh_task):
+                                        yield ka
                                     try:
                                         new_token = refresh_task.result()
                                     except Exception:
@@ -868,54 +864,42 @@ async def api_chat_completions(core, request, api_key):
 
                                 if prefer_chrome_transport:
                                     chrome_task = asyncio.create_task(_try_chrome_fetch())
-                                    while True:
-                                        done, _ = await asyncio.wait({chrome_task}, timeout=1.0)
-                                        if chrome_task in done:
-                                            try:
-                                                stream_context = chrome_task.result()
-                                            except Exception:
-                                                stream_context = None
-                                            break
-                                        yield SSE_KEEPALIVE
+                                    async for ka in sse_wait_for_task_with_keepalive(core, chrome_task):
+                                        yield ka
+                                    try:
+                                        stream_context = chrome_task.result()
+                                    except Exception:
+                                        stream_context = None
                                     if stream_context is not None:
                                         transport_used = "chrome"
                                     if stream_context is None:
                                         camoufox_task = asyncio.create_task(_try_camoufox_fetch())
-                                        while True:
-                                            done, _ = await asyncio.wait({camoufox_task}, timeout=1.0)
-                                            if camoufox_task in done:
-                                                try:
-                                                    stream_context = camoufox_task.result()
-                                                except Exception:
-                                                    stream_context = None
-                                                break
-                                            yield SSE_KEEPALIVE
+                                        async for ka in sse_wait_for_task_with_keepalive(core, camoufox_task):
+                                            yield ka
+                                        try:
+                                            stream_context = camoufox_task.result()
+                                        except Exception:
+                                            stream_context = None
                                         if stream_context is not None:
                                             transport_used = "camoufox"
                                 else:
                                     camoufox_task = asyncio.create_task(_try_camoufox_fetch())
-                                    while True:
-                                        done, _ = await asyncio.wait({camoufox_task}, timeout=1.0)
-                                        if camoufox_task in done:
-                                            try:
-                                                stream_context = camoufox_task.result()
-                                            except Exception:
-                                                stream_context = None
-                                            break
-                                        yield SSE_KEEPALIVE
+                                    async for ka in sse_wait_for_task_with_keepalive(core, camoufox_task):
+                                        yield ka
+                                    try:
+                                        stream_context = camoufox_task.result()
+                                    except Exception:
+                                        stream_context = None
                                     if stream_context is not None:
                                         transport_used = "camoufox"
                                     if stream_context is None:
                                         chrome_task = asyncio.create_task(_try_chrome_fetch())
-                                        while True:
-                                            done, _ = await asyncio.wait({chrome_task}, timeout=1.0)
-                                            if chrome_task in done:
-                                                try:
-                                                    stream_context = chrome_task.result()
-                                                except Exception:
-                                                    stream_context = None
-                                                break
-                                            yield SSE_KEEPALIVE
+                                        async for ka in sse_wait_for_task_with_keepalive(core, chrome_task):
+                                            yield ka
+                                        try:
+                                            stream_context = chrome_task.result()
+                                        except Exception:
+                                            stream_context = None
                                         if stream_context is not None:
                                             transport_used = "chrome"
 

@@ -202,7 +202,6 @@ try:
         fetch_lmarena_stream_via_camoufox as _fetch_via_camoufox,
         openai_error_payload,
         parse_lmarena_line_to_openai_chunks,
-        sse_openai_error_and_done,
         sse_sleep_with_keepalive,
         sse_wait_for_task_with_keepalive,
     )
@@ -216,7 +215,6 @@ except ImportError:
         fetch_lmarena_stream_via_camoufox as _fetch_via_camoufox,
         openai_error_payload,
         parse_lmarena_line_to_openai_chunks,
-        sse_openai_error_and_done,
         sse_sleep_with_keepalive,
         sse_wait_for_task_with_keepalive,
     )

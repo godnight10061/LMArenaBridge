@@ -82,14 +82,6 @@ def openai_error_payload(message: str, type: str, code: object) -> dict:  # noqa
     return {"error": {"message": str(message), "type": str(type), "code": code}}
 
 
-def sse_data(obj: dict) -> str:
-    return f"data: {json.dumps(obj)}\n\n"
-
-
-def sse_openai_error_and_done(message: str, type: str, code: object) -> tuple[str, str]:  # noqa: A002
-    return sse_data(openai_error_payload(message, type, code)), SSE_DONE
-
-
 async def sse_wait_for_task_with_keepalive(core, task, *, interval_seconds: float = 1.0) -> AsyncIterator[str]:  # noqa: ANN001
     interval = float(max(0.05, interval_seconds))
     while True:
