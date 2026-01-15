@@ -8,6 +8,8 @@ from http import HTTPStatus
 import httpx
 from camoufox.async_api import AsyncCamoufox
 
+from .browser_automation import build_lmarena_context_cookies, extract_lmarena_cookie_values
+
 # Shared constants and helpers for browser-based fetch transports
 
 SSE_KEEPALIVE = ": keep-alive\n\n"
@@ -136,28 +138,8 @@ async def aiter_with_keepalive(core, it, *, timeout_seconds: float = 1.0) -> Asy
 
 
 def prepare_browser_fetch_params(core, config, url, auth_token):
-    cookie_store = config.get("browser_cookies", {})
-    cookie_map: dict[str, str] = {str(k): str(v) for k, v in cookie_store.items() if k and v}
-
-    cf_clearance = str(config.get("cf_clearance") or cookie_map.get("cf_clearance") or "").strip()
-    cf_bm = str(config.get("cf_bm") or cookie_map.get("__cf_bm") or "").strip()
-    cfuvid = str(config.get("cfuvid") or cookie_map.get("_cfuvid") or "").strip()
-    provisional_user_id = str(config.get("provisional_user_id") or cookie_map.get("provisional_user_id") or "").strip()
-    grecaptcha_cookie = str(cookie_map.get("_GRECAPTCHA") or "").strip()
-
-    desired_cookies: list[dict] = []
-    if cf_clearance:
-        desired_cookies.append({"name": "cf_clearance", "value": cf_clearance, "domain": ".lmarena.ai", "path": "/"})
-    if cf_bm:
-        desired_cookies.append({"name": "__cf_bm", "value": cf_bm, "domain": ".lmarena.ai", "path": "/"})
-    if cfuvid:
-        desired_cookies.append({"name": "_cfuvid", "value": cfuvid, "domain": ".lmarena.ai", "path": "/"})
-    if provisional_user_id:
-        desired_cookies.append({"name": "provisional_user_id", "value": provisional_user_id, "domain": ".lmarena.ai", "path": "/"})
-    if grecaptcha_cookie:
-        desired_cookies.append({"name": "_GRECAPTCHA", "value": grecaptcha_cookie, "domain": ".lmarena.ai", "path": "/"})
-    if auth_token:
-        desired_cookies.append({"name": "arena-auth-prod-v1", "value": auth_token, "domain": "lmarena.ai", "path": "/"})
+    cookie_values = extract_lmarena_cookie_values(config)
+    desired_cookies = build_lmarena_context_cookies(cookie_values, auth_token=auth_token, include_grecaptcha=True)
 
     user_agent = core.normalize_user_agent_value(config.get("user_agent"))
 

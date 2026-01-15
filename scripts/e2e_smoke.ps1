@@ -267,6 +267,38 @@ with httpx.Client(timeout=httpx.Timeout(60.0, connect=10.0), follow_redirects=Tr
     if not saw_done:
         fail("Did not receive [DONE] sentinel")
 
+    # Userscript proxy endpoints (should be safe even when using internal Camoufox proxy worker).
+    r_poll = client.post(base + "/api/v1/userscript/poll", json={"timeout_seconds": 0}, headers=headers, timeout=10.0)
+    if r_poll.status_code != 204:
+        fail(f"/api/v1/userscript/poll expected 204, got {r_poll.status_code}: {r_poll.text[:200]}")
+
+    r_push_missing = client.post(base + "/api/v1/userscript/push", json={"done": True}, headers=headers, timeout=10.0)
+    if r_push_missing.status_code != 400:
+        fail(f"/api/v1/userscript/push (missing job_id) expected 400, got {r_push_missing.status_code}: {r_push_missing.text[:200]}")
+
+    r_push_unknown = client.post(base + "/api/v1/userscript/push", json={"job_id": "unknown-job", "done": True}, headers=headers, timeout=10.0)
+    if r_push_unknown.status_code != 404:
+        fail(f"/api/v1/userscript/push (unknown job_id) expected 404, got {r_push_unknown.status_code}: {r_push_unknown.text[:200]}")
+
+    # Non-streaming path should still work (buffers upstream stream).
+    payload2 = dict(payload)
+    payload2["stream"] = False
+    payload2.pop("stream_options", None)
+    r3 = client.post(base + "/api/v1/chat/completions", json=payload2, headers=headers, timeout=timeout_seconds)
+    if r3.status_code != 200:
+        fail(f"/api/v1/chat/completions (non-stream) HTTP {r3.status_code}: {r3.text[:2000]}")
+    try:
+        obj3 = r3.json()
+    except Exception:
+        fail(f"/api/v1/chat/completions (non-stream) invalid JSON: {r3.text[:2000]}")
+    try:
+        choices3 = obj3.get("choices") or []
+        content3 = (((choices3[0] or {}).get("message") or {}) or {}).get("content") if choices3 else ""
+    except Exception:
+        content3 = ""
+    if not isinstance(content3, str) or not content3.strip():
+        fail("Non-stream response missing choices[0].message.content")
+
     print("[PASS] e2e_smoke")
     print("".join(content_accum).strip())
 '@ | python -

@@ -1,5 +1,4 @@
 import asyncio
-import builtins as _builtins
 import json
 import os
 import re
@@ -34,9 +33,13 @@ from .browser_automation import (
     RECAPTCHA_ACTION,
     RECAPTCHA_V2_SITEKEY,
     TURNSTILE_SITEKEY,
+    _safe_print as safe_print,
     TurnstileClickLimiter,
     STRICT_CHROME_FETCH_MODELS,
+    build_lmarena_cookie_header,
+    build_lmarena_context_cookies,
     extract_recaptcha_params_from_text,
+    extract_lmarena_cookie_values,
     get_recaptcha_settings,
     _is_windows,
     _normalize_camoufox_window_mode,
@@ -121,33 +124,6 @@ def get_general_backoff_seconds(attempt: int) -> int:
     """Compute general exponential backoff seconds."""
     attempt = max(0, int(attempt))
     return int(min(2 * (2**attempt), 30))
-
-def safe_print(*args, **kwargs) -> None:
-    """
-    Print without crashing on Windows console encoding issues (e.g., GBK can't encode emoji).
-    This must never raise, because it's used inside request handlers/streaming generators.
-    """
-    try:
-        _builtins.print(*args, **kwargs)
-    except UnicodeEncodeError:
-        file = kwargs.get("file") or sys.stdout
-        sep = kwargs.get("sep", " ")
-        end = kwargs.get("end", "\n")
-        flush = bool(kwargs.get("flush", False))
-
-        try:
-            text = sep.join(str(a) for a in args) + end
-            encoding = getattr(file, "encoding", None) or getattr(sys.stdout, "encoding", None) or "utf-8"
-            safe_text = text.encode(encoding, errors="backslashreplace").decode(encoding, errors="ignore")
-            file.write(safe_text)
-            if flush:
-                try:
-                    file.flush()
-                except Exception:
-                    pass
-        except Exception:
-            return
-
 
 # Ensure all module-level `print(...)` calls are resilient to Windows console encoding issues.
 # (Some environments default to GBK, which cannot encode emoji.)
@@ -1017,38 +993,12 @@ def get_request_headers():
 def get_request_headers_with_token(token: str, recaptcha_v3_token: Optional[str] = None):
     """Get request headers with a specific auth token and optional reCAPTCHA v3 token"""
     config = get_config()
-    cf_clearance = str(config.get("cf_clearance") or "").strip()
-    cf_bm = str(config.get("cf_bm") or "").strip()
-    cfuvid = str(config.get("cfuvid") or "").strip()
-    provisional_user_id = str(config.get("provisional_user_id") or "").strip()
-
-    cookie_store = config.get("browser_cookies")
-    if isinstance(cookie_store, dict):
-        if not cf_clearance:
-            cf_clearance = str(cookie_store.get("cf_clearance") or "").strip()
-        if not cf_bm:
-            cf_bm = str(cookie_store.get("__cf_bm") or "").strip()
-        if not cfuvid:
-            cfuvid = str(cookie_store.get("_cfuvid") or "").strip()
-        if not provisional_user_id:
-            provisional_user_id = str(cookie_store.get("provisional_user_id") or "").strip()
-
-    cookie_parts: list[str] = []
-
-    def _add_cookie(name: str, value: str) -> None:
-        value = str(value or "").strip()
-        if value:
-            cookie_parts.append(f"{name}={value}")
-
-    _add_cookie("cf_clearance", cf_clearance)
-    _add_cookie("__cf_bm", cf_bm)
-    _add_cookie("_cfuvid", cfuvid)
-    _add_cookie("provisional_user_id", provisional_user_id)
-    _add_cookie("arena-auth-prod-v1", token)
+    cookie_values = extract_lmarena_cookie_values(config)
+    cookie_header = build_lmarena_cookie_header(cookie_values, auth_token=token)
 
     headers: dict[str, str] = {
         "Content-Type": "text/plain;charset=UTF-8",
-        "Cookie": "; ".join(cookie_parts),
+        "Cookie": cookie_header,
         "Origin": "https://lmarena.ai",
         "Referer": "https://lmarena.ai/?mode=direct",
     }

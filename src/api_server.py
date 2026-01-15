@@ -190,28 +190,10 @@ def build_router(core) -> APIRouter:  # noqa: ANN001
         timeout_seconds = max(0, min(timeout_seconds, 60))
 
         core._PROXY_SERVICE.cleanup_jobs(cfg)
-
-        queue = core._PROXY_SERVICE.queue
-        end = time.time() + float(timeout_seconds)
-        while True:
-            remaining = end - time.time()
-            if remaining <= 0:
-                return Response(status_code=status.HTTP_204_NO_CONTENT)
-            try:
-                job_id = await asyncio.wait_for(queue.get(), timeout=remaining)
-            except asyncio.TimeoutError:
-                return Response(status_code=status.HTTP_204_NO_CONTENT)
-
-            job = core._USERSCRIPT_PROXY_JOBS.get(str(job_id))
-            if not isinstance(job, dict):
-                continue
-            try:
-                picked = job.get("picked_up_event")
-                if isinstance(picked, asyncio.Event) and not picked.is_set():
-                    picked.set()
-            except Exception:
-                pass
-            return {"job_id": str(job_id), "payload": job.get("payload") or {}}
+        job = await core._PROXY_SERVICE.poll_next_job(timeout_seconds=float(timeout_seconds))
+        if not job:
+            return Response(status_code=status.HTTP_204_NO_CONTENT)
+        return {"job_id": str(job.get("job_id") or ""), "payload": job.get("payload") or {}}
 
     @router.post("/api/v1/userscript/push")
     async def userscript_push(request: Request):
@@ -226,40 +208,33 @@ def build_router(core) -> APIRouter:  # noqa: ANN001
         if not job_id:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing job_id")
 
-        job = core._USERSCRIPT_PROXY_JOBS.get(job_id)
-        if not isinstance(job, dict):
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown job_id")
-
         status_code = data.get("status")
-        if isinstance(status_code, int):
-            job["status_code"] = int(status_code)
-            status_event = job.get("status_event")
-            if isinstance(status_event, asyncio.Event):
-                status_event.set()
+        if not isinstance(status_code, int):
+            status_code = None
+
         headers = data.get("headers")
-        if isinstance(headers, dict):
-            job["headers"] = headers
+        if not isinstance(headers, dict):
+            headers = None
 
         error = data.get("error")
-        if error:
-            job["error"] = str(error)
+        if error is not None:
+            error = str(error)
 
-        lines = data.get("lines") or []
-        if isinstance(lines, list):
-            for line in lines:
-                if line is None:
-                    continue
-                await job["lines_queue"].put(str(line))
+        lines = data.get("lines")
+        if not isinstance(lines, list):
+            lines = None
 
-        if bool(data.get("done")):
-            job["done"] = True
-            done_event = job.get("done_event")
-            if isinstance(done_event, asyncio.Event):
-                done_event.set()
-            status_event = job.get("status_event")
-            if isinstance(status_event, asyncio.Event):
-                status_event.set()
-            await job["lines_queue"].put(None)
+        done = bool(data.get("done"))
+        ok = await core._PROXY_SERVICE.push_job_update(
+            job_id=job_id,
+            status=status_code,
+            headers=headers,
+            error=error,
+            lines=lines,
+            done=done,
+        )
+        if not ok:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown job_id")
 
         return {"status": "ok"}
 

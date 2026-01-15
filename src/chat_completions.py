@@ -3,45 +3,30 @@ from __future__ import annotations
 async def api_chat_completions(core, request, api_key):
 
     # Bind globals from the owning module (src.main) so test patch points remain stable.
-    AsyncExitStack = core.AsyncExitStack
     HTTPException = core.HTTPException
     HTTPStatus = core.HTTPStatus
     Optional = core.Optional
     SSE_DONE = core.SSE_DONE
     SSE_KEEPALIVE = core.SSE_KEEPALIVE
     STRICT_CHROME_FETCH_MODELS = core.STRICT_CHROME_FETCH_MODELS
-    StreamingResponse = core.StreamingResponse
     _USERSCRIPT_PROXY_JOBS = core._USERSCRIPT_PROXY_JOBS
     _userscript_proxy_is_active = core._userscript_proxy_is_active
-    aiter_with_keepalive = core.aiter_with_keepalive
     asyncio = core.asyncio
-    chat_sessions = core.chat_sessions
     debug_print = core.debug_print
     fetch_via_proxy_queue = core.fetch_via_proxy_queue
-    get_cached_recaptcha_token = core.get_cached_recaptcha_token
     get_config = core.get_config
-    get_general_backoff_seconds = core.get_general_backoff_seconds
-    get_models = core.get_models
     get_next_auth_token = core.get_next_auth_token
     get_rate_limit_sleep_seconds = core.get_rate_limit_sleep_seconds
-    get_request_headers_with_token = core.get_request_headers_with_token
     httpx = core.httpx
     is_arena_auth_token_expired = core.is_arena_auth_token_expired
     is_probably_valid_arena_auth_token = core.is_probably_valid_arena_auth_token
     json = core.json
     last_userscript_poll = core.last_userscript_poll
     log_http_status = core.log_http_status
-    maybe_refresh_expired_auth_tokens = core.maybe_refresh_expired_auth_tokens
     model_usage_stats = core.model_usage_stats
     openai_error_payload = core.openai_error_payload
-    os = core.os
     print = core.print
-    process_message_content = core.process_message_content
     push_proxy_chunk = core.push_proxy_chunk
-    parse_lmarena_line_to_openai_chunks = core.parse_lmarena_line_to_openai_chunks
-    refresh_arena_auth_token_via_lmarena_http = core.refresh_arena_auth_token_via_lmarena_http
-    refresh_arena_auth_token_via_supabase = core.refresh_arena_auth_token_via_supabase
-    save_config = core.save_config
     sse_sleep_with_keepalive = core.sse_sleep_with_keepalive
     time = core.time
     uuid = core.uuid
@@ -104,7 +89,7 @@ async def api_chat_completions(core, request, api_key):
 
         # Find model ID from public name
         try:
-            models = get_models()
+            models = core.get_models()
             debug_print(f"📚 Total models loaded: {len(models)}")
         except Exception as e:
             debug_print(f"❌ Failed to load models: {e}")
@@ -158,7 +143,7 @@ async def api_chat_completions(core, request, api_key):
             # Save stats immediately after incrementing
             config = get_config()
             config["usage_stats"] = dict(model_usage_stats)
-            save_config(config)
+            core.save_config(config)
         except Exception as e:
             # Don't fail the request if usage logging fails
             debug_print(f"⚠️  Failed to log usage stats: {e}")
@@ -173,7 +158,7 @@ async def api_chat_completions(core, request, api_key):
         # Process last message content (may include images)
         try:
             last_message_content = messages[-1].get("content", "")
-            prompt, experimental_attachments = await process_message_content(last_message_content, model_capabilities)
+            prompt, experimental_attachments = await core.process_message_content(last_message_content, model_capabilities)
             raw_user_prompt = prompt
             
             # If there's a system prompt and this is the first user message, prepend it
@@ -237,7 +222,7 @@ async def api_chat_completions(core, request, api_key):
             else:
                 # Best-effort: use a cached token so browser transports don't have to wait on grecaptcha to load.
                 # (They can still mint in-session if needed.)
-                recaptcha_token = get_cached_recaptcha_token()
+                recaptcha_token = core.get_cached_recaptcha_token()
                 if recaptcha_token:
                     debug_print("🔐 Strict model: using cached reCAPTCHA v3 token in payload.")
                 else:
@@ -261,7 +246,7 @@ async def api_chat_completions(core, request, api_key):
         debug_print(f"🔑 Conversation key: {conversation_key[:100]}...")
 
         # Check if conversation exists for this API key (robust to tests patching chat_sessions to a plain dict)
-        per_key_sessions = chat_sessions.setdefault(api_key_str, {})
+        per_key_sessions = core.chat_sessions.setdefault(api_key_str, {})
         session = per_key_sessions.get(conversation_id)
 
         def upsert_chat_session(existing_session, user_message_id, user_content, assistant_message):  # noqa: ANN001
@@ -483,7 +468,7 @@ async def api_chat_completions(core, request, api_key):
         # in-memory only (do not rewrite the user's config.json auth tokens).
         if (not current_token) or (not is_probably_valid_arena_auth_token(current_token)):
             try:
-                refreshed = await maybe_refresh_expired_auth_tokens(exclude_tokens=failed_tokens)
+                refreshed = await core.maybe_refresh_expired_auth_tokens(exclude_tokens=failed_tokens)
             except Exception:
                 refreshed = None
             if refreshed:
@@ -526,7 +511,7 @@ async def api_chat_completions(core, request, api_key):
                 recaptcha_403_failures = 0
                 no_delta_failures = 0
                 attempt = 0
-                disable_userscript_proxy_env = bool(os.environ.get("LM_BRIDGE_DISABLE_USERSCRIPT_PROXY"))
+                disable_userscript_proxy_env = bool(core.os.environ.get("LM_BRIDGE_DISABLE_USERSCRIPT_PROXY"))
 
                 retry_429_count = 0
                 retry_403_count = 0
@@ -556,7 +541,7 @@ async def api_chat_completions(core, request, api_key):
                     unhandled_preview: list[str] = []
 
                     try:
-                        async with AsyncExitStack() as stack:
+                        async with core.AsyncExitStack() as stack:
                             debug_print(f"📡 Sending {http_method} request for streaming (attempt {attempt})...")
                             stream_context = None
                             transport_used = "httpx"
@@ -925,14 +910,12 @@ async def api_chat_completions(core, request, api_key):
                                         if not isinstance(cfg_now, dict):
                                             cfg_now = {}
                                         try:
-                                            refreshed_token = await refresh_arena_auth_token_via_lmarena_http(
-                                                current_token, cfg_now
-                                            )
+                                            refreshed_token = await core.refresh_arena_auth_token_via_lmarena_http(current_token, cfg_now)
                                         except Exception:
                                             refreshed_token = None
                                         if not refreshed_token:
                                             try:
-                                                refreshed_token = await refresh_arena_auth_token_via_supabase(current_token)
+                                                refreshed_token = await core.refresh_arena_auth_token_via_supabase(current_token)
                                             except Exception:
                                                 refreshed_token = None
 
@@ -962,7 +945,7 @@ async def api_chat_completions(core, request, api_key):
                                 log_http_status(response.status_code, "Stream Connection")
                                 response.raise_for_status()
                                 
-                                async for maybe_line in aiter_with_keepalive(core, response.aiter_lines().__aiter__()):
+                                async for maybe_line in core.aiter_with_keepalive(core, response.aiter_lines().__aiter__()):
                                     if maybe_line is None:
                                         yield SSE_KEEPALIVE
                                         continue
@@ -975,7 +958,7 @@ async def api_chat_completions(core, request, api_key):
                                         "reasoning_text": reasoning_text,
                                         "citations": citations,
                                     }
-                                    chunks = parse_lmarena_line_to_openai_chunks(
+                                    chunks = core.parse_lmarena_line_to_openai_chunks(
                                         line, chunk_id, model_public_name, stream_state
                                     )
                                     # Sync back state for upstream failure detection logic
@@ -1107,7 +1090,7 @@ async def api_chat_completions(core, request, api_key):
                                         current_token = get_next_auth_token(
                                             exclude_tokens=rotation_exclude, allow_ephemeral_fallback=False
                                         )
-                                        headers = get_request_headers_with_token(current_token, recaptcha_token)
+                                        headers = core.get_request_headers_with_token(current_token, recaptcha_token)
                                         token_rotated = True
                                         debug_print(f"🔄 Retrying stream with next token (after proxy 429): {current_token[:20]}...")
                                     except HTTPException:
@@ -1194,7 +1177,7 @@ async def api_chat_completions(core, request, api_key):
                                 f"🚫 LMArena API returned 403 (Forbidden). "
                                 f"Retrying with exponential backoff (attempt {current_retry_attempt}/{max_retries})."
                             )
-                            sleep_seconds = get_general_backoff_seconds(current_retry_attempt)
+                            sleep_seconds = core.get_general_backoff_seconds(current_retry_attempt)
                             async for ka in sse_sleep_with_keepalive(core, sleep_seconds):
                                 yield ka
                             continue # Continue to the next iteration of the while True loop
@@ -1248,7 +1231,7 @@ async def api_chat_completions(core, request, api_key):
                         # For now, yield error.
                         yield f"data: {json.dumps(openai_error_payload(str(e), 'internal_error', 'internal_error'))}\n\n{SSE_DONE}"
                         return
-            return StreamingResponse(generate_stream(), media_type="text/event-stream")
+            return core.StreamingResponse(generate_stream(), media_type="text/event-stream")
         
         # Handle non-streaming mode with retry
         try:

@@ -120,6 +120,72 @@ def normalize_user_agent_value(user_agent: object) -> str:
         return ""
     return ua
 
+def _cookie_map_from_config(config: dict) -> dict[str, str]:
+    cookie_store = (config or {}).get("browser_cookies")
+    if not isinstance(cookie_store, dict):
+        return {}
+    return {str(k): str(v) for k, v in cookie_store.items() if k and v}
+
+def extract_lmarena_cookie_values(config: dict) -> dict[str, str]:
+    """
+    Extract relevant cookie values from config.json fields and `browser_cookies`.
+
+    Prefers explicit config keys (e.g. `cf_clearance`) and falls back to `browser_cookies`.
+    """
+    cfg = config or {}
+    cookie_map = _cookie_map_from_config(cfg)
+    return {
+        "cf_clearance": str(cfg.get("cf_clearance") or cookie_map.get("cf_clearance") or "").strip(),
+        "cf_bm": str(cfg.get("cf_bm") or cookie_map.get("__cf_bm") or "").strip(),
+        "cfuvid": str(cfg.get("cfuvid") or cookie_map.get("_cfuvid") or "").strip(),
+        "provisional_user_id": str(cfg.get("provisional_user_id") or cookie_map.get("provisional_user_id") or "").strip(),
+        "grecaptcha": str(cookie_map.get("_GRECAPTCHA") or "").strip(),
+    }
+
+def build_lmarena_cookie_header(cookie_values: dict[str, str], *, auth_token: str) -> str:
+    parts: list[str] = []
+
+    def add(name: str, value: str) -> None:
+        value = str(value or "").strip()
+        if value:
+            parts.append(f"{name}={value}")
+
+    cv = cookie_values or {}
+    add("cf_clearance", cv.get("cf_clearance", ""))
+    add("__cf_bm", cv.get("cf_bm", ""))
+    add("_cfuvid", cv.get("cfuvid", ""))
+    add("provisional_user_id", cv.get("provisional_user_id", ""))
+    add("arena-auth-prod-v1", auth_token)
+    return "; ".join(parts)
+
+def build_lmarena_context_cookies(
+    cookie_values: dict[str, str],
+    *,
+    auth_token: str = "",
+    include_grecaptcha: bool = True,
+) -> list[dict]:
+    cv = cookie_values or {}
+    desired: list[dict] = []
+    cf_clearance = str(cv.get("cf_clearance") or "").strip()
+    cf_bm = str(cv.get("cf_bm") or "").strip()
+    cfuvid = str(cv.get("cfuvid") or "").strip()
+    provisional_user_id = str(cv.get("provisional_user_id") or "").strip()
+    grecaptcha_cookie = str(cv.get("grecaptcha") or "").strip()
+
+    if cf_clearance:
+        desired.append({"name": "cf_clearance", "value": cf_clearance, "domain": ".lmarena.ai", "path": "/"})
+    if cf_bm:
+        desired.append({"name": "__cf_bm", "value": cf_bm, "domain": ".lmarena.ai", "path": "/"})
+    if cfuvid:
+        desired.append({"name": "_cfuvid", "value": cfuvid, "domain": ".lmarena.ai", "path": "/"})
+    if provisional_user_id:
+        desired.append({"name": "provisional_user_id", "value": provisional_user_id, "domain": ".lmarena.ai", "path": "/"})
+    if include_grecaptcha and grecaptcha_cookie:
+        desired.append({"name": "_GRECAPTCHA", "value": grecaptcha_cookie, "domain": ".lmarena.ai", "path": "/"})
+    if auth_token:
+        desired.append({"name": "arena-auth-prod-v1", "value": str(auth_token).strip(), "domain": "lmarena.ai", "path": "/"})
+    return desired
+
 def upsert_browser_session(config: dict, cookies: list[dict], user_agent: str | None = None) -> bool:
     """
     Persist useful browser session identity (cookies + UA) into config.json.

@@ -8,28 +8,14 @@ async def camoufox_proxy_worker(core):
 
     # Bind globals from the owning module (src.main) so test patch points remain stable.
     AsyncCamoufox = core.AsyncCamoufox
-    CONFIG_FILE = core.CONFIG_FILE
     Path = core.Path
-    RECAPTCHA_ACTION = core.RECAPTCHA_ACTION
-    RECAPTCHA_SITEKEY = core.RECAPTCHA_SITEKEY
-    RECAPTCHA_V2_SITEKEY = core.RECAPTCHA_V2_SITEKEY
-    TURNSTILE_SITEKEY = core.TURNSTILE_SITEKEY
-    TurnstileClickLimiter = core.TurnstileClickLimiter
-    _PROXY_SERVICE = core._PROXY_SERVICE
-    _USERSCRIPT_PROXY_JOBS = core._USERSCRIPT_PROXY_JOBS
     _capture_ephemeral_arena_auth_token_from_cookies = core._capture_ephemeral_arena_auth_token_from_cookies
-    _maybe_apply_camoufox_window_mode = core._maybe_apply_camoufox_window_mode
     _touch_userscript_poll = core._touch_userscript_poll
     asyncio = core.asyncio
     click_turnstile = core.click_turnstile
     debug_print = core.debug_print
     get_config = core.get_config
-    get_recaptcha_settings = core.get_recaptcha_settings
     is_arena_auth_token_expired = core.is_arena_auth_token_expired
-    is_probably_valid_arena_auth_token = core.is_probably_valid_arena_auth_token
-    json = core.json
-    maybe_build_arena_auth_cookie_from_signup_response_body = core.maybe_build_arena_auth_cookie_from_signup_response_body
-    normalize_user_agent_value = core.normalize_user_agent_value
     os = core.os
     push_proxy_chunk = core.push_proxy_chunk
     time = core.time
@@ -44,11 +30,11 @@ async def camoufox_proxy_worker(core):
     context = None
     page = None
 
-    proxy_recaptcha_sitekey = RECAPTCHA_SITEKEY
-    proxy_recaptcha_action = RECAPTCHA_ACTION
+    proxy_recaptcha_sitekey = core.RECAPTCHA_SITEKEY
+    proxy_recaptcha_action = core.RECAPTCHA_ACTION
     last_signup_attempt_at: float = 0.0
     
-    queue = _PROXY_SERVICE.queue
+    queue = core._PROXY_SERVICE.queue
 
     while True:
         try:
@@ -82,10 +68,10 @@ async def camoufox_proxy_worker(core):
                 page = None
 
                 cfg = get_config()
-                recaptcha_sitekey, recaptcha_action = get_recaptcha_settings(cfg)
+                recaptcha_sitekey, recaptcha_action = core.get_recaptcha_settings(cfg)
                 proxy_recaptcha_sitekey = recaptcha_sitekey
                 proxy_recaptcha_action = recaptcha_action
-                user_agent = normalize_user_agent_value(cfg.get("user_agent"))
+                user_agent = core.normalize_user_agent_value(cfg.get("user_agent"))
                 
                 headless_value = cfg.get("camoufox_proxy_headless", None)
                 headless = bool(headless_value) if headless_value is not None else False
@@ -103,7 +89,7 @@ async def camoufox_proxy_worker(core):
                     pass
                 if profile_dir is None:
                     try:
-                        profile_dir = Path(CONFIG_FILE).with_name("grecaptcha")
+                        profile_dir = Path(core.CONFIG_FILE).with_name("grecaptcha")
                     except Exception:
                         pass
 
@@ -149,30 +135,8 @@ async def camoufox_proxy_worker(core):
                     pass
 
                 # Inject only a minimal set of cookies (do not overwrite browser-managed state).
-                cookie_store = cfg.get("browser_cookies")
-                cookie_map: dict[str, str] = {}
-                if isinstance(cookie_store, dict):
-                    for name, value in cookie_store.items():
-                        if not name or not value:
-                            continue
-                        cookie_map[str(name)] = str(value)
-
-                cf_clearance = str(cfg.get("cf_clearance") or cookie_map.get("cf_clearance") or "").strip()
-                cf_bm = str(cfg.get("cf_bm") or cookie_map.get("__cf_bm") or "").strip()
-                cfuvid = str(cfg.get("cfuvid") or cookie_map.get("_cfuvid") or "").strip()
-                provisional_user_id = str(cfg.get("provisional_user_id") or cookie_map.get("provisional_user_id") or "").strip()
-
-                desired_cookies: list[dict] = []
-                if cf_clearance:
-                    desired_cookies.append({"name": "cf_clearance", "value": cf_clearance, "domain": ".lmarena.ai", "path": "/"})
-                if cf_bm:
-                    desired_cookies.append({"name": "__cf_bm", "value": cf_bm, "domain": ".lmarena.ai", "path": "/"})
-                if cfuvid:
-                    desired_cookies.append({"name": "_cfuvid", "value": cfuvid, "domain": ".lmarena.ai", "path": "/"})
-                if provisional_user_id:
-                    desired_cookies.append(
-                        {"name": "provisional_user_id", "value": provisional_user_id, "domain": ".lmarena.ai", "path": "/"}
-                    )
+                cookie_values = core.extract_lmarena_cookie_values(cfg)
+                desired_cookies = core.build_lmarena_context_cookies(cookie_values, include_grecaptcha=False)
 
                 if desired_cookies:
                     try:
@@ -241,7 +205,7 @@ async def camoufox_proxy_worker(core):
                                 if not t:
                                     continue
                                 try:
-                                    if is_probably_valid_arena_auth_token(t) and not is_arena_auth_token_expired(
+                                    if core.is_probably_valid_arena_auth_token(t) and not is_arena_auth_token_expired(
                                         t, skew_seconds=0
                                     ):
                                         candidate = t
@@ -288,7 +252,7 @@ async def camoufox_proxy_worker(core):
                     except ValueError:
                         return
                     try:
-                        payload = json.loads(payload_json)
+                        payload = core.json.loads(payload_json)
                     except Exception:
                         payload = {"error": "proxy console payload decode error", "done": True}
                     try:
@@ -314,7 +278,7 @@ async def camoufox_proxy_worker(core):
                     pass
 
                 # MINIMAL FIX: apply window mode AFTER potential initial Turnstile solve.
-                await _maybe_apply_camoufox_window_mode(
+                await core._maybe_apply_camoufox_window_mode(
                     page,
                     cfg,
                     mode_key="camoufox_proxy_window_mode",
@@ -370,7 +334,7 @@ async def camoufox_proxy_worker(core):
                 last_signup_attempt_at = now
 
                 # Turnstile clicking is expensive/noisy; keep it throttled and budgeted per signup attempt.
-                turnstile_limiter = TurnstileClickLimiter(max_clicks=12, cooldown_seconds=5.0)
+                turnstile_limiter = core.TurnstileClickLimiter(max_clicks=12, cooldown_seconds=5.0)
 
                 async def _maybe_click_turnstile(*, allow_without_challenge: bool = False) -> None:
                     nonlocal page, turnstile_limiter
@@ -571,7 +535,7 @@ async def camoufox_proxy_worker(core):
                 err = ""
                 try:
                     mint_info = await asyncio.wait_for(
-                        page.evaluate(render_turnstile_js, {"sitekey": TURNSTILE_SITEKEY}),
+                        page.evaluate(render_turnstile_js, {"sitekey": core.TURNSTILE_SITEKEY}),
                         timeout=30.0,
                     )
                 except Exception as e:
@@ -657,7 +621,7 @@ async def camoufox_proxy_worker(core):
                 except Exception:
                     body_text = ""
                 try:
-                    derived_cookie = maybe_build_arena_auth_cookie_from_signup_response_body(body_text)
+                    derived_cookie = core.maybe_build_arena_auth_cookie_from_signup_response_body(body_text)
                 except Exception:
                     derived_cookie = None
                 if derived_cookie:
@@ -706,7 +670,7 @@ async def camoufox_proxy_worker(core):
                 continue
             
             job_id = str(job_id or "").strip()
-            job = _USERSCRIPT_PROXY_JOBS.get(job_id)
+            job = core._USERSCRIPT_PROXY_JOBS.get(job_id)
             if not isinstance(job, dict):
                 continue
             
@@ -1023,7 +987,7 @@ async def camoufox_proxy_worker(core):
                             "payload": job.get("payload") or {},
                             "sitekey": proxy_recaptcha_sitekey,
                             "action": proxy_recaptcha_action,
-                            "sitekeyV2": RECAPTCHA_V2_SITEKEY,
+                            "sitekeyV2": core.RECAPTCHA_V2_SITEKEY,
                             "grecaptchaTimeoutMs": 60000,
                             "grecaptchaPollMs": 250,
                             "timeoutMs": 180000,
