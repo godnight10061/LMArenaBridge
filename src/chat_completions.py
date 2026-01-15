@@ -49,9 +49,7 @@ async def api_chat_completions(core, request, api_key):
             footnotes += f"{i}. [{c.get('title', 'Untitled')}]({c.get('url', '')})\n"
         return unique, footnotes
 
-    debug_print("\n" + "="*80)
-    debug_print("🔵 NEW API REQUEST RECEIVED")
-    debug_print("="*80)
+    debug_print("\n" + "=" * 80 + "\n🔵 NEW API REQUEST RECEIVED\n" + "=" * 80)
     
     try:
         # Parse request body with error handling
@@ -64,33 +62,24 @@ async def api_chat_completions(core, request, api_key):
             debug_print(f"❌ Failed to read request body: {e}")
             raise HTTPException(status_code=400, detail=f"Failed to read request body: {str(e)}")
         
-        debug_print(f"📥 Request body keys: {list(body.keys())}")
-        
         # Validate required fields
         model_public_name = body.get("model")
         messages = body.get("messages", [])
         stream = body.get("stream", False)
-        
-        debug_print(f"🌊 Stream mode: {stream}")
-        debug_print(f"🤖 Requested model: {model_public_name}")
-        debug_print(f"💬 Number of messages: {len(messages)}")
-        
+        debug_print(f"🌊 Stream={stream} | 🤖 Model={model_public_name} | 💬 Messages={len(messages)}")
+
         if not model_public_name:
-            debug_print("❌ Missing 'model' in request")
             raise HTTPException(status_code=400, detail="Missing 'model' in request body.")
-        
+
         if not messages:
-            debug_print("❌ Missing 'messages' in request")
             raise HTTPException(status_code=400, detail="Missing 'messages' in request body.")
-        
+
         if not isinstance(messages, list):
-            debug_print("❌ 'messages' must be an array")
             raise HTTPException(status_code=400, detail="'messages' must be an array.")
 
         # Find model ID from public name
         try:
             models = core.get_models()
-            debug_print(f"📚 Total models loaded: {len(models)}")
         except Exception as e:
             debug_print(f"❌ Failed to load models: {e}")
             raise HTTPException(
@@ -241,9 +230,7 @@ async def api_chat_completions(core, request, api_key):
         conversation_key = f"{api_key_str}_{model_public_name}_{first_user_message[:100]}"
         conversation_id = hashlib.sha256(conversation_key.encode()).hexdigest()[:16]
         
-        debug_print(f"🔑 API Key: {api_key_str[:20]}...")
-        debug_print(f"💭 Auto-generated Conversation ID: {conversation_id}")
-        debug_print(f"🔑 Conversation key: {conversation_key[:100]}...")
+        debug_print(f"💭 Conversation ID: {conversation_id}")
 
         # Check if conversation exists for this API key (robust to tests patching chat_sessions to a plain dict)
         per_key_sessions = core.chat_sessions.setdefault(api_key_str, {})
@@ -259,12 +246,10 @@ async def api_chat_completions(core, request, api_key):
                         assistant_message,
                     ],
                 }
-                debug_print(f"💾 Saved new session for conversation {conversation_id}")
                 return per_key_sessions[conversation_id]
 
             existing_session["messages"].append({"id": user_message_id, "role": "user", "content": user_content})
             existing_session["messages"].append(assistant_message)
-            debug_print(f"💾 Updated existing session for conversation {conversation_id}")
             return existing_session
 
         # Detect retry: if session exists and last message is same user message (no assistant response after it)
@@ -1278,135 +1263,50 @@ async def api_chat_completions(core, request, api_key):
             response_text_body = response_bytes.decode("utf-8", errors="replace")
             
             debug_print(f"📏 Response length: {len(response_text_body)} characters")
-            debug_print(f"📋 Response headers: {dict(response.headers)}")
-            
-            debug_print(f"🔍 Processing response...")
-            debug_print(f"📄 First 500 chars of response:\n{response_text_body[:500]}")
-            
-            # Process response in lmarena format
-            # Format: ag:"thinking" for reasoning, a0:"text chunk" for content, ac:{...} for citations, ad:{...} for metadata
-            response_text = ""
-            reasoning_text = ""
-            citations = []
-            finish_reason = None
-            line_count = 0
-            text_chunks_found = 0
-            reasoning_chunks_found = 0
-            citation_chunks_found = 0
-            metadata_found = 0
-            
-            debug_print(f"📊 Parsing response lines...")
             
             error_message = None
-            for line in response_text_body.splitlines():
-                line_count += 1
-                line = line.strip()
-                if line.startswith("data: "):
-                    line = line[6:].strip()
+            parser_chunk_id = "chatcmpl-nonstream"
+            stream_state = {"response_text": "", "reasoning_text": "", "citations": []}
+            for raw_line in response_text_body.splitlines():
+                line = str(raw_line or "").strip()
+                if line.startswith("data:"):
+                    line = line[5:].lstrip()
                 if not line:
                     continue
-                
-                # Parse thinking/reasoning chunks: ag:"thinking text"
-                if line.startswith("ag:"):
-                    chunk_data = line[3:]  # Remove "ag:" prefix
-                    reasoning_chunks_found += 1
-                    try:
-                        # Parse as JSON string (includes quotes)
-                        reasoning_chunk = json.loads(chunk_data)
-                        reasoning_text += reasoning_chunk
-                        if reasoning_chunks_found <= 3:  # Log first 3 reasoning chunks
-                            debug_print(f"  🧠 Reasoning chunk {reasoning_chunks_found}: {repr(reasoning_chunk[:50])}")
-                    except json.JSONDecodeError as e:
-                        debug_print(f"  ⚠️ Failed to parse reasoning chunk on line {line_count}: {chunk_data[:100]} - {e}")
-                        continue
-                
-                # Parse text chunks: a0:"Hello "
-                elif line.startswith("a0:"):
-                    chunk_data = line[3:]  # Remove "a0:" prefix
-                    text_chunks_found += 1
-                    try:
-                        # Parse as JSON string (includes quotes)
-                        text_chunk = json.loads(chunk_data)
-                        response_text += text_chunk
-                        if text_chunks_found <= 3:  # Log first 3 chunks
-                            debug_print(f"  ✅ Chunk {text_chunks_found}: {repr(text_chunk[:50])}")
-                    except json.JSONDecodeError as e:
-                        debug_print(f"  ⚠️ Failed to parse text chunk on line {line_count}: {chunk_data[:100]} - {e}")
-                        continue
-                
-                # Parse image generation: a2:[{...}] (for image models)
-                elif line.startswith("a2:"):
-                    image_data = line[3:]  # Remove "a2:" prefix
-                    try:
-                        image_list = json.loads(image_data)
-                        # OpenAI format expects URL in content
-                        if isinstance(image_list, list) and len(image_list) > 0:
-                            image_obj = image_list[0]
-                            if image_obj.get('type') == 'image':
-                                image_url = image_obj.get('image', '')
-                                # Format as markdown
-                                response_text = f"![Generated Image]({image_url})"
-                    except json.JSONDecodeError as e:
-                        debug_print(f"  ⚠️ Failed to parse image data on line {line_count}: {image_data[:100]} - {e}")
-                        continue
-                
-                # Parse citations/tool calls: ac:{...} (for search models)
-                elif line.startswith("ac:"):
-                    citation_data = line[3:]  # Remove "ac:" prefix
-                    citation_chunks_found += 1
-                    try:
-                        citation_obj = json.loads(citation_data)
-                        # Extract source information from argsTextDelta
-                        if 'argsTextDelta' in citation_obj:
-                            args_data = json.loads(citation_obj['argsTextDelta'])
-                            if 'source' in args_data:
-                                source = args_data['source']
-                                # Can be a single source or array of sources
-                                if isinstance(source, list):
-                                    citations.extend(source)
-                                elif isinstance(source, dict):
-                                    citations.append(source)
-                        if citation_chunks_found <= 3:  # Log first 3 citations
-                            debug_print(f"  🔗 Citation chunk {citation_chunks_found}: {citation_obj.get('toolCallId')}")
-                    except json.JSONDecodeError as e:
-                        debug_print(f"  ⚠️ Failed to parse citation chunk on line {line_count}: {citation_data[:100]} - {e}")
-                        continue
-                
-                # Parse error messages: a3:"An error occurred"
-                elif line.startswith("a3:"):
-                    error_data = line[3:]  # Remove "a3:" prefix
+
+                if line.startswith("a3:"):
+                    error_data = line[3:]
                     try:
                         error_message = json.loads(error_data)
-                        debug_print(f"  ❌ Error message received: {error_message}")
-                    except json.JSONDecodeError as e:
-                        debug_print(f"  ⚠️ Failed to parse error message on line {line_count}: {error_data[:100]} - {e}")
+                    except Exception:
                         error_message = error_data
-                
-                # Parse metadata: ad:{"finishReason":"stop"}
-                elif line.startswith("ad:"):
-                    metadata_data = line[3:]  # Remove "ad:" prefix
-                    metadata_found += 1
-                    try:
-                        metadata = json.loads(metadata_data)
-                        finish_reason = metadata.get("finishReason")
-                        debug_print(f"  📋 Metadata found: finishReason={finish_reason}")
-                    except json.JSONDecodeError as e:
-                        debug_print(f"  ⚠️ Failed to parse metadata on line {line_count}: {metadata_data[:100]} - {e}")
-                        continue
-                elif line.strip():  # Non-empty line that doesn't match expected format
-                    if line_count <= 5:  # Log first 5 unexpected lines
-                        debug_print(f"  ❓ Unexpected line format {line_count}: {line[:100]}")
+                    continue
 
-            debug_print(f"\n📊 Parsing Summary:")
-            debug_print(f"  - Total lines: {line_count}")
-            debug_print(f"  - Reasoning chunks found: {reasoning_chunks_found}")
-            debug_print(f"  - Text chunks found: {text_chunks_found}")
-            debug_print(f"  - Citation chunks found: {citation_chunks_found}")
-            debug_print(f"  - Metadata entries: {metadata_found}")
-            debug_print(f"  - Final response length: {len(response_text)} chars")
-            debug_print(f"  - Final reasoning length: {len(reasoning_text)} chars")
-            debug_print(f"  - Citations found: {len(citations)}")
-            debug_print(f"  - Finish reason: {finish_reason}")
+                # Preserve existing image behavior for image models: overwrite any text with a markdown image.
+                if line.startswith("a2:"):
+                    image_data = line[3:]
+                    try:
+                        image_list = json.loads(image_data)
+                    except Exception:
+                        image_list = None
+                    if isinstance(image_list, list) and image_list:
+                        image_obj = image_list[0] if isinstance(image_list[0], dict) else None
+                        if isinstance(image_obj, dict) and image_obj.get("type") == "image":
+                            image_url = str(image_obj.get("image") or "").strip()
+                            if image_url:
+                                stream_state["response_text"] = f"![Generated Image]({image_url})"
+                    continue
+
+                try:
+                    core.parse_lmarena_line_to_openai_chunks(line, parser_chunk_id, model_public_name, stream_state)
+                except Exception:
+                    continue
+
+            response_text = str(stream_state.get("response_text") or "")
+            reasoning_text = str(stream_state.get("reasoning_text") or "")
+            citations = stream_state.get("citations") or []
+            if not isinstance(citations, list):
+                citations = []
             
             if not response_text:
                 debug_print(f"\n⚠️  WARNING: Empty response text!")
@@ -1481,9 +1381,6 @@ async def api_chat_completions(core, request, api_key):
                 }],
                 "usage": usage_obj
             }
-            
-            debug_print(f"\n✅ REQUEST COMPLETED SUCCESSFULLY")
-            debug_print("="*80 + "\n")
             
             return final_response
 
