@@ -62,6 +62,8 @@ STRICT_CHROME_FETCH_MODELS = {
     "gemini-exp-1206",
 }
 
+WEBDRIVER_STEALTH_INIT_SCRIPT = "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+
 # ============================================================ 
 # HELPERS
 # ============================================================ 
@@ -236,6 +238,102 @@ def upsert_browser_session(config: dict, cookies: list[dict], user_agent: str | 
         changed = True
 
     return changed
+
+async def maybe_add_webdriver_stealth_script(context) -> None:  # noqa: ANN001
+    try:
+        await context.add_init_script(WEBDRIVER_STEALTH_INIT_SCRIPT)
+    except Exception:
+        return
+
+async def maybe_add_lmarena_cookies_to_persistent_context(  # noqa: ANN001
+    context,
+    cookies: list[dict],
+    *,
+    url: str = "https://lmarena.ai",
+) -> None:
+    if not cookies:
+        return
+    try:
+        existing = await context.cookies(url)
+    except Exception:
+        existing = []
+    existing_names = {str(c.get("name") or "") for c in (existing or []) if c.get("name")}
+    skip = {"cf_clearance", "__cf_bm", "_GRECAPTCHA"}
+    cookies_to_add: list[dict] = []
+    for c in cookies:
+        name = str(c.get("name") or "")
+        if not name:
+            continue
+        if name == "arena-auth-prod-v1" or (name not in skip and name not in existing_names):
+            cookies_to_add.append(c)
+    if not cookies_to_add:
+        return
+    try:
+        await context.add_cookies(cookies_to_add)
+    except Exception:
+        pass
+
+async def maybe_capture_and_persist_lmarena_session(  # noqa: ANN001
+    context,
+    page,
+    *,
+    config: dict,
+    save_config_callback: Callable[[dict], Any] | None = None,
+    capture_cookies_callback: Callable[[list[dict]], Any] | None = None,
+    url: str = "https://lmarena.ai",
+    user_agent_fallback: str = "",
+) -> None:
+    try:
+        cookies = await context.cookies(url)
+    except Exception:
+        return
+
+    if capture_cookies_callback is not None:
+        try:
+            capture_cookies_callback(cookies)
+        except Exception:
+            pass
+
+    ua_now = user_agent_fallback
+    try:
+        ua_now = await page.evaluate("() => navigator.userAgent") or user_agent_fallback
+    except Exception:
+        pass
+
+    changed = False
+    try:
+        changed = upsert_browser_session(config, cookies, user_agent=ua_now)
+    except Exception:
+        pass
+
+    if changed and save_config_callback is not None:
+        try:
+            save_config_callback(config)
+        except Exception:
+            pass
+
+async def maybe_wait_for_cloudflare_challenge(  # noqa: ANN001
+    page,
+    *,
+    max_attempts: int = 5,
+    sleep_seconds: float = 2.0,
+) -> None:
+    try:
+        attempts = max(0, int(max_attempts))
+    except Exception:
+        attempts = 0
+    if attempts <= 0:
+        return
+
+    for _ in range(attempts):
+        try:
+            title = await page.title()
+            if "Just a moment" not in str(title or ""):
+                break
+            await click_turnstile(page)
+            await asyncio.sleep(float(sleep_seconds))
+        except Exception:
+            break
 
 def extract_recaptcha_params_from_text(text: str) -> tuple[Optional[str], Optional[str]]:
     if not isinstance(text, str) or not text:
@@ -632,24 +730,11 @@ async def get_recaptcha_v3_token_with_chrome(
 
     profile_dir = Path(str(config_file or "config.json")).with_name("chrome_grecaptcha")
 
-    cf_clearance = str(config.get("cf_clearance") or "").strip()
-    cf_bm = str(config.get("cf_bm") or "").strip()
-    cfuvid = str(config.get("cfuvid") or "").strip()
-    provisional_user_id = str(config.get("provisional_user_id") or "").strip()
     user_agent = normalize_user_agent_value(config.get("user_agent"))
     recaptcha_sitekey, recaptcha_action = get_recaptcha_settings(config)
 
-    cookies = []
-    if cf_clearance:
-        cookies.append({"name": "cf_clearance", "value": cf_clearance, "domain": ".lmarena.ai", "path": "/"})
-    if cf_bm:
-        cookies.append({"name": "__cf_bm", "value": cf_bm, "domain": ".lmarena.ai", "path": "/"})
-    if cfuvid:
-        cookies.append({"name": "_cfuvid", "value": cfuvid, "domain": ".lmarena.ai", "path": "/"})
-    if provisional_user_id:
-        cookies.append(
-            {"name": "provisional_user_id", "value": provisional_user_id, "domain": ".lmarena.ai", "path": "/"}
-        )
+    cookie_values = extract_lmarena_cookie_values(config)
+    cookies = build_lmarena_context_cookies(cookie_values, auth_token="", include_grecaptcha=False)
 
     async with async_playwright() as p:
         context = await p.chromium.launch_persistent_context(
@@ -664,58 +749,15 @@ async def get_recaptcha_v3_token_with_chrome(
             ],
         )
         try:
-            try:
-                await context.add_init_script(
-                    "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
-                )
-            except Exception:
-                pass
+            await maybe_add_webdriver_stealth_script(context)
 
             if cookies:
-                try:
-                    existing_names: set[str] = set()
-                    try:
-                        existing = await context.cookies("https://lmarena.ai")
-                        for c in existing or []:
-                            name = c.get("name")
-                            if name:
-                                existing_names.add(str(name))
-                    except Exception:
-                        existing_names = set()
-
-                    cookies_to_add: list[dict] = []
-                    for c in cookies:
-                        name = str(c.get("name") or "")
-                        if not name:
-                            continue
-                        if name == "arena-auth-prod-v1":
-                            cookies_to_add.append(c)
-                            continue
-
-                        if name in ("cf_clearance", "__cf_bm", "_GRECAPTCHA"):
-                            continue
-
-                        if name in existing_names:
-                            continue
-                        cookies_to_add.append(c)
-
-                    if cookies_to_add:
-                        await context.add_cookies(cookies_to_add)
-                except Exception:
-                    pass
+                await maybe_add_lmarena_cookies_to_persistent_context(context, cookies)
 
             page = await context.new_page()
             await page.goto("https://lmarena.ai/?mode=direct", wait_until="domcontentloaded", timeout=120000)
 
-            try:
-                for _ in range(5):
-                    title = await page.title()
-                    if "Just a moment" not in title:
-                        break
-                    await click_turnstile(page)
-                    await asyncio.sleep(2)
-            except Exception:
-                pass
+            await maybe_wait_for_cloudflare_challenge(page, max_attempts=5, sleep_seconds=2.0)
 
             try:
                 await page.mouse.move(100, 100)
@@ -727,18 +769,13 @@ async def get_recaptcha_v3_token_with_chrome(
             except Exception:
                 pass
 
-            try:
-                fresh_cookies = await context.cookies("https://lmarena.ai")
-                try:
-                    ua_now = await page.evaluate("() => navigator.userAgent")
-                except Exception:
-                    ua_now = user_agent
-                
-                if upsert_browser_session(config, fresh_cookies, user_agent=ua_now):
-                    if save_config_callback:
-                        save_config_callback(config)
-            except Exception:
-                pass
+            await maybe_capture_and_persist_lmarena_session(
+                context,
+                page,
+                config=config,
+                save_config_callback=save_config_callback,
+                user_agent_fallback=user_agent,
+            )
 
             await page.wait_for_function(
                 "window.grecaptcha && ("

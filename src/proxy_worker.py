@@ -130,7 +130,7 @@ async def camoufox_proxy_worker(core):
                     context = await browser.new_context(user_agent=user_agent or None)
                 
                 try:
-                    await context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
+                    await core._browser_automation.maybe_add_webdriver_stealth_script(context)
                 except Exception:
                     pass
 
@@ -140,24 +140,14 @@ async def camoufox_proxy_worker(core):
 
                 if desired_cookies:
                     try:
-                        existing_names: set[str] = set()
                         try:
                             existing = await context.cookies("https://lmarena.ai")
-                            for c in existing or []:
-                                name = c.get("name")
-                                if name:
-                                    existing_names.add(str(name))
                         except Exception:
-                            existing_names = set()
-
-                        cookies_to_add: list[dict] = []
-                        for c in desired_cookies:
-                            name = str(c.get("name") or "")
-                            if not name:
-                                continue
-                            if name in existing_names:
-                                continue
-                            cookies_to_add.append(c)
+                            existing = []
+                        existing_names = {str(c.get("name") or "") for c in (existing or []) if c.get("name")}
+                        cookies_to_add = [
+                            c for c in desired_cookies if str(c.get("name") or "") not in existing_names
+                        ]
                         if cookies_to_add:
                             await context.add_cookies(cookies_to_add)
                     except Exception:
