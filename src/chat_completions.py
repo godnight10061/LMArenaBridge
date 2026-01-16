@@ -625,7 +625,6 @@ async def api_chat_completions(core, request, api_key):
                                         )
                                     except Exception:
                                         pickup_timeout_seconds = 10.0
-                                    pickup_timeout_seconds = max(0.5, min(pickup_timeout_seconds, 15.0))
 
                                     try:
                                         proxy_status_timeout_seconds = float(
@@ -634,6 +633,9 @@ async def api_chat_completions(core, request, api_key):
                                     except Exception:
                                         proxy_status_timeout_seconds = 180.0
                                     proxy_status_timeout_seconds = max(5.0, min(proxy_status_timeout_seconds, 300.0))
+                                    pickup_timeout_seconds = max(
+                                        0.5, min(pickup_timeout_seconds, float(proxy_status_timeout_seconds or 180.0))
+                                    )
  
                                     started = time.monotonic()
                                     proxy_status_timed_out = False
@@ -1025,14 +1027,48 @@ async def api_chat_completions(core, request, api_key):
                                     # of `response.status_code` (which can be stale for userscript jobs).
                                     if proxy_status == HTTPStatus.UNAUTHORIZED:
                                         debug_print("🔒 Userscript proxy upstream 401. Rotating auth token...")
-                                        failed_tokens.add(current_token)
+                                        if current_token:
+                                            failed_tokens.add(current_token)
                                         # (Pruning disabled)
 
-                                        try:
-                                            current_token = get_next_auth_token(exclude_tokens=failed_tokens)
-                                        except HTTPException:
-                                            yield f"data: {json.dumps(openai_error_payload('Unauthorized: Your LMArena auth token has expired or is invalid. Please get a new auth token from the dashboard.', 'authentication_error', HTTPStatus.UNAUTHORIZED))}\n\n{SSE_DONE}"
-                                            return
+                                        # Best-effort: refresh the current base64 session in-memory before rotating.
+                                        refreshed_token: Optional[str] = None
+                                        if current_token:
+                                            try:
+                                                cfg_now = get_config()
+                                            except Exception:
+                                                cfg_now = {}
+                                            if not isinstance(cfg_now, dict):
+                                                cfg_now = {}
+                                            try:
+                                                refreshed_token = await core.refresh_arena_auth_token_via_lmarena_http(
+                                                    current_token, cfg_now
+                                                )
+                                            except Exception:
+                                                refreshed_token = None
+                                            if not refreshed_token:
+                                                try:
+                                                    refreshed_token = await core.refresh_arena_auth_token_via_supabase(
+                                                        current_token
+                                                    )
+                                                except Exception:
+                                                    refreshed_token = None
+
+                                        if refreshed_token:
+                                            core.EPHEMERAL_ARENA_AUTH_TOKEN = refreshed_token
+                                            current_token = refreshed_token
+                                            # Ensure the next attempt mints a fresh token for the refreshed session.
+                                            if isinstance(payload, dict):
+                                                payload["recaptchaV3Token"] = ""
+                                            debug_print(
+                                                "🔄 Refreshed arena-auth-prod-v1 session after userscript 401. Retrying..."
+                                            )
+                                        else:
+                                            try:
+                                                current_token = get_next_auth_token(exclude_tokens=failed_tokens)
+                                            except HTTPException:
+                                                yield f"data: {json.dumps(openai_error_payload('Unauthorized: Your LMArena auth token has expired or is invalid. Please get a new auth token from the dashboard.', 'authentication_error', HTTPStatus.UNAUTHORIZED))}\n\n{SSE_DONE}"
+                                                return
 
                                     if proxy_status == HTTPStatus.FORBIDDEN:
                                         recaptcha_403_failures += 1
@@ -1241,26 +1277,53 @@ async def api_chat_completions(core, request, api_key):
             if isinstance(payload, dict):
                 payload["recaptchaV3Token"] = ""
 
-            response = await fetch_via_proxy_queue(
-                url=url,
-                payload=payload if isinstance(payload, dict) else {},
-                http_method=http_method,
-                timeout_seconds=120,
-                auth_token=proxy_auth_token,
-            )
-            if response is None:
-                raise HTTPException(
-                    status_code=504,
-                    detail="Userscript proxy request timed out or returned no response.",
+            response = None
+            response_text_body = ""
+            max_proxy_attempts = 4
+            proxy_attempt = 0
+            while proxy_attempt < max_proxy_attempts:
+                proxy_attempt += 1
+                response = await fetch_via_proxy_queue(
+                    url=url,
+                    payload=payload if isinstance(payload, dict) else {},
+                    http_method=http_method,
+                    timeout_seconds=120,
+                    auth_token=proxy_auth_token,
                 )
+                if response is None:
+                    raise HTTPException(
+                        status_code=504,
+                        detail="Userscript proxy request timed out or returned no response.",
+                    )
 
-            response.raise_for_status()
-                 
-            log_http_status(response.status_code, "LMArena API Response")
-             
-            # Use aread() to ensure we buffer streaming-capable responses (like BrowserFetchStreamResponse)
-            response_bytes = await response.aread()
-            response_text_body = response_bytes.decode("utf-8", errors="replace")
+                try:
+                    response.raise_for_status()
+                except httpx.HTTPStatusError as e:
+                    # Non-streaming proxy calls can sporadically hit reCAPTCHA 403s; retry a few times with fresh mints.
+                    if e.response.status_code == HTTPStatus.FORBIDDEN and proxy_attempt < max_proxy_attempts:
+                        if isinstance(payload, dict):
+                            payload["recaptchaV3Token"] = ""
+                            payload.pop("recaptchaV2Token", None)
+                        async for _ in sse_sleep_with_keepalive(core, core.get_general_backoff_seconds(proxy_attempt)):
+                            pass
+                        continue
+                    raise
+
+                log_http_status(response.status_code, "LMArena API Response")
+
+                # Use aread() to ensure we buffer streaming-capable responses (like BrowserFetchStreamResponse)
+                response_bytes = await response.aread()
+                response_text_body = response_bytes.decode("utf-8", errors="replace")
+                if response_text_body.strip():
+                    break
+                if proxy_attempt < max_proxy_attempts:
+                    if isinstance(payload, dict):
+                        payload["recaptchaV3Token"] = ""
+                        payload.pop("recaptchaV2Token", None)
+                    async for _ in sse_sleep_with_keepalive(core, core.get_general_backoff_seconds(proxy_attempt)):
+                        pass
+                    continue
+                break
             
             debug_print(f"📏 Response length: {len(response_text_body)} characters")
             

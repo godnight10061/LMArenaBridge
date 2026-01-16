@@ -222,52 +222,77 @@ with httpx.Client(timeout=httpx.Timeout(60.0, connect=10.0), follow_redirects=Tr
         "stream_options": {"include_usage": True},
     }
 
-    saw_done = False
-    got_content = False
-    content_accum: list[str] = []
-    captured_data: list[str] = []
+    def run_stream(payload: dict) -> str:
+        saw_done = False
+        got_content = False
+        content_accum: list[str] = []
+        captured_data: list[str] = []
 
-    stream_headers = dict(headers)
-    stream_headers["Accept"] = "text/event-stream"
-    with client.stream("POST", base + "/api/v1/chat/completions", json=payload, headers=stream_headers, timeout=timeout_seconds) as r2:
-        if r2.status_code != 200:
-            body = r2.read().decode("utf-8", errors="replace")
-            fail(f"/api/v1/chat/completions HTTP {r2.status_code}: {body[:2000]}")
+        stream_headers = dict(headers)
+        stream_headers["Accept"] = "text/event-stream"
+        with client.stream(
+            "POST",
+            base + "/api/v1/chat/completions",
+            json=payload,
+            headers=stream_headers,
+            timeout=timeout_seconds,
+        ) as r2:
+            if r2.status_code != 200:
+                body = r2.read().decode("utf-8", errors="replace")
+                fail(f"/api/v1/chat/completions HTTP {r2.status_code}: {body[:2000]}")
 
-        for raw_line in r2.iter_lines():
-            if raw_line is None:
-                continue
-            line = raw_line.strip()
-            if not line:
-                continue
-            if not line.startswith("data:"):
-                continue
-            data = line[5:].strip()
-            if data == "[DONE]":
-                saw_done = True
-                break
-            if len(captured_data) < 50:
-                captured_data.append(data)
-            obj = json.loads(data)
-            if isinstance(obj, dict) and obj.get("error"):
-                fail(f"Stream returned error payload: {json.dumps(obj.get('error'), ensure_ascii=False)[:800]}")
-            choices = obj.get("choices") or []
-            if not choices:
-                continue
-            delta = (choices[0] or {}).get("delta") or {}
-            chunk = delta.get("content")
-            if chunk:
-                got_content = True
-                content_accum.append(chunk)
+            for raw_line in r2.iter_lines():
+                if raw_line is None:
+                    continue
+                line = raw_line.strip()
+                if not line:
+                    continue
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    saw_done = True
+                    break
+                if len(captured_data) < 50:
+                    captured_data.append(data)
+                obj = json.loads(data)
+                if isinstance(obj, dict) and obj.get("error"):
+                    fail(
+                        f"Stream returned error payload: {json.dumps(obj.get('error'), ensure_ascii=False)[:800]}"
+                    )
+                choices = obj.get("choices") or []
+                if not choices:
+                    continue
+                delta = (choices[0] or {}).get("delta") or {}
+                chunk = delta.get("content")
+                if chunk:
+                    got_content = True
+                    content_accum.append(chunk)
 
-    if not got_content:
-        if captured_data:
-            sys.stderr.write("Captured SSE data payloads (first 50):\\n")
-            for item in captured_data:
-                sys.stderr.write(item[:400] + "\\n")
-        fail("Did not receive any delta.content chunks")
-    if not saw_done:
-        fail("Did not receive [DONE] sentinel")
+        if not got_content:
+            if captured_data:
+                sys.stderr.write("Captured SSE data payloads (first 50):\\n")
+                for item in captured_data:
+                    sys.stderr.write(item[:400] + "\\n")
+            fail("Did not receive any delta.content chunks")
+        if not saw_done:
+            fail("Did not receive [DONE] sentinel")
+        return "".join(content_accum).strip()
+
+    content_out = run_stream(payload)
+
+    # Force an expired cookie state and ensure the proxy self-heals (refreshes) instead of emitting SSE error payloads.
+    r_debug = client.post(base + "/api/v1/_debug/expire-proxy-auth-once", headers=headers, timeout=10.0)
+    if r_debug.status_code != 200:
+        fail(f"/api/v1/_debug/expire-proxy-auth-once HTTP {r_debug.status_code}: {r_debug.text[:200]}")
+    try:
+        ok = bool((r_debug.json() or {}).get("ok"))
+    except Exception:
+        ok = False
+    if not ok:
+        fail("/api/v1/_debug/expire-proxy-auth-once did not return ok=true")
+
+    _ = run_stream(payload)
 
     # Userscript proxy endpoints (should be safe even when using internal Camoufox proxy worker).
     r_poll = client.post(base + "/api/v1/userscript/poll", json={"timeout_seconds": 0}, headers=headers, timeout=10.0)
@@ -302,7 +327,7 @@ with httpx.Client(timeout=httpx.Timeout(60.0, connect=10.0), follow_redirects=Tr
         fail("Non-stream response missing choices[0].message.content")
 
     print("[PASS] e2e_smoke")
-    print("".join(content_accum).strip())
+    print(content_out)
 '@ | python -
   if ($LASTEXITCODE -ne 0) {
     throw "e2e_smoke python check failed (exit code $LASTEXITCODE)"

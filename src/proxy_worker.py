@@ -18,12 +18,24 @@ async def camoufox_proxy_worker(core):
     is_arena_auth_token_expired = core.is_arena_auth_token_expired
     os = core.os
     push_proxy_chunk = core.push_proxy_chunk
+    refresh_arena_auth_token_via_lmarena_http = core.refresh_arena_auth_token_via_lmarena_http
+    refresh_arena_auth_token_via_supabase = core.refresh_arena_auth_token_via_supabase
     time = core.time
     uuid = core.uuid
 
     # Mark the proxy as alive immediately
     _touch_userscript_poll()
     debug_print("🦊 Camoufox proxy worker started (Singleton Mode).")
+
+    async def _poll_heartbeat() -> None:
+        while True:
+            try:
+                _touch_userscript_poll()
+            except Exception:
+                pass
+            await asyncio.sleep(2.0)
+
+    heartbeat_task = asyncio.create_task(_poll_heartbeat())
 
     browser_cm = None
     browser = None
@@ -209,10 +221,23 @@ async def camoufox_proxy_worker(core):
                                     if t.startswith("base64-"):
                                         candidate = t
                                         break
-                        
+
                         if candidate:
                             await context.add_cookies(
-                                [{"name": "arena-auth-prod-v1", "value": candidate, "domain": "lmarena.ai", "path": "/"}]
+                                [
+                                    {
+                                        "name": "arena-auth-prod-v1",
+                                        "value": candidate,
+                                        "domain": "lmarena.ai",
+                                        "path": "/",
+                                    },
+                                    {
+                                        "name": "arena-auth-prod-v1",
+                                        "value": candidate,
+                                        "domain": ".lmarena.ai",
+                                        "path": "/",
+                                    },
+                                ]
                             )
                 except Exception:
                     pass
@@ -394,17 +419,24 @@ async def camoufox_proxy_worker(core):
                                 "domain": "lmarena.ai",
                                 "path": "/",
                                 "expires": 1,
-                            }
+                            },
+                            {
+                                "name": "arena-auth-prod-v1",
+                                "value": "",
+                                "domain": ".lmarena.ai",
+                                "path": "/",
+                                "expires": 1,
+                            },
                         ]
                     )
                 except Exception:
                     pass
                 try:
-                    await page.goto("https://lmarena.ai/?mode=direct", wait_until="domcontentloaded", timeout=120000)
+                    await page.goto("https://lmarena.ai/?mode=direct", wait_until="domcontentloaded", timeout=45000)
                 except Exception:
                     pass
                 try:
-                    for _ in range(12):
+                    for _ in range(6):
                         cur = await _get_auth_cookie_value()
                         if cur and not is_arena_auth_token_expired(cur, skew_seconds=0):
                             return
@@ -549,7 +581,7 @@ async def camoufox_proxy_worker(core):
 
                 started = time.monotonic()
                 try:
-                    while (time.monotonic() - started) < 130.0:
+                    while (time.monotonic() - started) < 90.0:
                         try:
                             cur = await asyncio.wait_for(
                                 page.evaluate(poll_turnstile_js, {"widgetId": widget_id}),
@@ -572,14 +604,89 @@ async def camoufox_proxy_worker(core):
                     debug_print("⚠️ Camoufox proxy: Turnstile mint failed (timeout).")
                     return
 
-                sign_up_js = """async ({ turnstileToken, provisionalUserId }) => {
+                recaptcha_token = ""
+                mint_recaptcha_js = """async ({ sitekey, action, timeoutMs }) => {
+                  const w = (window.wrappedJSObject || window);
+                  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+                  const pickG = () => {
+                    const ent = w?.grecaptcha?.enterprise;
+                    if (ent && typeof ent.execute === 'function' && typeof ent.ready === 'function') return ent;
+                    const g = w?.grecaptcha;
+                    if (g && typeof g.execute === 'function' && typeof g.ready === 'function') return g;
+                    return null;
+                  };
+                  const key = String(sitekey || '');
+                  if (!key) return '';
+                  const act = String(action || 'sign_up');
+                  const start = Date.now();
+                  let injected = false;
+                  while ((Date.now() - start) < Number(timeoutMs || 60000)) {
+                    const g = pickG();
+                    if (g) {
+                      try {
+                        await Promise.race([
+                          new Promise((resolve) => { try { g.ready(resolve); } catch (e) { resolve(); } }),
+                          sleep(5000).then(() => {}),
+                        ]);
+                      } catch (e) {}
+                      try {
+                        const params = new w.Object();
+                        params.action = act;
+                        const tok = await Promise.race([
+                          Promise.resolve().then(() => g.execute(key, params)),
+                          sleep(15000).then(() => ''),
+                        ]);
+                        return (typeof tok === 'string') ? tok : '';
+                      } catch (e) {
+                        return '';
+                      }
+                    }
+                    if (!injected) {
+                      injected = true;
+                      try {
+                        const h = w.document?.head;
+                        if (h) {
+                          const s1 = w.document.createElement('script');
+                          s1.src = 'https://www.google.com/recaptcha/api.js?render=' + encodeURIComponent(key);
+                          s1.async = true;
+                          s1.defer = true;
+                          h.appendChild(s1);
+                          const s2 = w.document.createElement('script');
+                          s2.src = 'https://www.google.com/recaptcha/enterprise.js?render=' + encodeURIComponent(key);
+                          s2.async = true;
+                          s2.defer = true;
+                          h.appendChild(s2);
+                        }
+                      } catch (e) {}
+                    }
+                    await sleep(250);
+                  }
+                  return '';
+                }"""
+
+                try:
+                    recaptcha_token = await asyncio.wait_for(
+                        page.evaluate(
+                            mint_recaptcha_js,
+                            {"sitekey": proxy_recaptcha_sitekey, "action": "sign_up", "timeoutMs": 60000},
+                        ),
+                        timeout=30.0,
+                    )
+                except Exception:
+                    recaptcha_token = ""
+                recaptcha_token = str(recaptcha_token or "").strip()
+                if not recaptcha_token:
+                    debug_print("⚠️ Camoufox proxy: could not mint reCAPTCHA token for sign-up.")
+                    return
+
+                sign_up_js = """async ({ turnstileToken, recaptchaToken, provisionalUserId }) => {
                   const w = (window.wrappedJSObject || window);
                   const opts = new w.Object();
                   opts.method = 'POST';
                   opts.credentials = 'include';
                   opts.headers = new w.Object();
                   opts.headers['Content-Type'] = 'application/json';
-                  opts.body = JSON.stringify({ turnstileToken: String(turnstileToken || ''), provisionalUserId: String(provisionalUserId || '') });
+                  opts.body = JSON.stringify({ turnstileToken: String(turnstileToken || ''), recaptchaToken: String(recaptchaToken || ''), provisionalUserId: String(provisionalUserId || '') });
                   const res = await w.fetch('/nextjs-api/sign-up', opts);
                   let text = '';
                   try { text = await res.text(); } catch (e) { text = ''; }
@@ -590,7 +697,11 @@ async def camoufox_proxy_worker(core):
                     resp = await asyncio.wait_for(
                         page.evaluate(
                             sign_up_js,
-                            {"turnstileToken": token_value, "provisionalUserId": provisional_user_id},
+                            {
+                                "turnstileToken": token_value,
+                                "recaptchaToken": recaptcha_token,
+                                "provisionalUserId": provisional_user_id,
+                            },
                         ),
                         timeout=20.0,
                     )
@@ -610,6 +721,10 @@ async def camoufox_proxy_worker(core):
                     body_text = str((resp or {}).get("body") or "") if isinstance(resp, dict) else ""
                 except Exception:
                     body_text = ""
+                if status >= 400:
+                    preview = str(body_text or "").strip()
+                    if preview:
+                        debug_print(f"🦊 Camoufox proxy: /nextjs-api/sign-up body preview: {preview[:240]}")
                 try:
                     derived_cookie = core.maybe_build_arena_auth_cookie_from_signup_response_body(body_text)
                 except Exception:
@@ -624,7 +739,13 @@ async def camoufox_proxy_worker(core):
                                         "value": derived_cookie,
                                         "domain": "lmarena.ai",
                                         "path": "/",
-                                    }
+                                    },
+                                    {
+                                        "name": "arena-auth-prod-v1",
+                                        "value": derived_cookie,
+                                        "domain": ".lmarena.ai",
+                                        "path": "/",
+                                    },
                                 ]
                             )
                             _capture_ephemeral_arena_auth_token_from_cookies(
@@ -938,10 +1059,13 @@ async def camoufox_proxy_worker(core):
                         except Exception:
                             use_job_token = True
                 
-                if use_job_token:
-                    await context.add_cookies(
-                        [{"name": "arena-auth-prod-v1", "value": auth_token, "domain": "lmarena.ai", "path": "/"}]
-                    )
+                    if use_job_token:
+                        await context.add_cookies(
+                            [
+                                {"name": "arena-auth-prod-v1", "value": auth_token, "domain": "lmarena.ai", "path": "/"},
+                                {"name": "arena-auth-prod-v1", "value": auth_token, "domain": ".lmarena.ai", "path": "/"},
+                            ]
+                        )
                 elif browser_auth_cookie and not use_job_token:
                     debug_print("🦊 Camoufox proxy: using valid browser auth cookie (job token is empty or invalid).")
             except Exception:
@@ -952,6 +1076,50 @@ async def camoufox_proxy_worker(core):
                 current_cookie = await _get_auth_cookie_value()
             except Exception:
                 current_cookie = ""
+
+            # E2E/debug hook: force the cookie to look expired once (to exercise refresh paths).
+            try:
+                if bool(getattr(core, "_DEBUG_EXPIRE_PROXY_ARENA_AUTH_COOKIE_ONCE", False)):
+                    core._DEBUG_EXPIRE_PROXY_ARENA_AUTH_COOKIE_ONCE = False
+                    if current_cookie and str(current_cookie).startswith("base64-"):
+                        try:
+                            session = core._decode_arena_auth_session_token(current_cookie)
+                        except Exception:
+                            session = None
+                        if isinstance(session, dict):
+                            session = dict(session)
+                            session["expires_at"] = 0
+                            try:
+                                raw = core.json.dumps(session, separators=(",", ":")).encode("utf-8")
+                                b64 = core.base64.b64encode(raw).decode("utf-8").rstrip("=")
+                                forced = "base64-" + b64
+                            except Exception:
+                                forced = ""
+                            if forced:
+                                await context.add_cookies(
+                                    [
+                                        {
+                                            "name": "arena-auth-prod-v1",
+                                            "value": forced,
+                                            "domain": "lmarena.ai",
+                                            "path": "/",
+                                        },
+                                        {
+                                            "name": "arena-auth-prod-v1",
+                                            "value": forced,
+                                            "domain": ".lmarena.ai",
+                                            "path": "/",
+                                        },
+                                    ]
+                                )
+                                _capture_ephemeral_arena_auth_token_from_cookies(
+                                    [{"name": "arena-auth-prod-v1", "value": forced}]
+                                )
+                                current_cookie = forced
+                                debug_print("🦊 Camoufox proxy: forced arena-auth cookie to expired (debug).")
+            except Exception:
+                pass
+
             if current_cookie:
                 try:
                     expired = is_arena_auth_token_expired(current_cookie, skew_seconds=0)
@@ -960,10 +1128,214 @@ async def camoufox_proxy_worker(core):
                 debug_print(f"🦊 Camoufox proxy: arena-auth cookie present (len={len(current_cookie)} expired={expired})")
             else:
                 debug_print("🦊 Camoufox proxy: arena-auth cookie missing")
+
+            # If we have an expired base64 session cookie, try to refresh it before attempting anonymous signup.
+            # This avoids flaky Turnstile flows and keeps long-running installs stable.
+            if current_cookie:
+                try:
+                    expired = is_arena_auth_token_expired(current_cookie, skew_seconds=0)
+                except Exception:
+                    expired = False
+                refreshed = None
+                if expired and str(current_cookie).startswith("base64-"):
+                    # Prefer refreshing in the live browser (preserves identity for existing sessions and avoids
+                    # creating a new anonymous user when a simple cookie rotation would work).
+                    if page is not None:
+                        try:
+                            await page.reload(wait_until="domcontentloaded", timeout=45000)
+                        except Exception:
+                            pass
+                        try:
+                            candidate = await _get_auth_cookie_value()
+                        except Exception:
+                            candidate = ""
+                        if candidate:
+                            try:
+                                if not is_arena_auth_token_expired(candidate, skew_seconds=0):
+                                    refreshed = str(candidate)
+                            except Exception:
+                                refreshed = str(candidate)
+                    
+                    try:
+                        cfg_now = get_config()
+                    except Exception:
+                        cfg_now = {}
+                    if not isinstance(cfg_now, dict):
+                        cfg_now = {}
+                    # Prefer Cloudflare cookies from the live browser context (more reliable than stale config.json).
+                    try:
+                        browser_cookies = await context.cookies("https://lmarena.ai")
+                    except Exception:
+                        browser_cookies = []
+                    cookie_map = {}
+                    for c in browser_cookies or []:
+                        try:
+                            name = str(c.get("name") or "").strip()
+                            value = str(c.get("value") or "").strip()
+                        except Exception:
+                            continue
+                        if name and value:
+                            cookie_map[name] = value
+                    if not str(cfg_now.get("cf_clearance") or "").strip():
+                        cfg_now["cf_clearance"] = cookie_map.get("cf_clearance", "")
+                    if not str(cfg_now.get("cf_bm") or "").strip():
+                        cfg_now["cf_bm"] = cookie_map.get("__cf_bm", "")
+                    if not str(cfg_now.get("cfuvid") or "").strip():
+                        cfg_now["cfuvid"] = cookie_map.get("_cfuvid", "")
+                    if not str(cfg_now.get("provisional_user_id") or "").strip():
+                        cfg_now["provisional_user_id"] = cookie_map.get("provisional_user_id", "")
+                    if not refreshed:
+                        try:
+                            refreshed = await refresh_arena_auth_token_via_lmarena_http(current_cookie, cfg_now)
+                        except Exception:
+                            refreshed = None
+                    if not refreshed:
+                        try:
+                            refreshed = await refresh_arena_auth_token_via_supabase(current_cookie)
+                        except Exception:
+                            refreshed = None
+                    if not refreshed:
+                        # If we don't have the Supabase anon key yet, try to discover it from the live page once.
+                        try:
+                            anon_key = str(getattr(core, "SUPABASE_ANON_KEY", "") or "").strip()
+                        except Exception:
+                            anon_key = ""
+                        if (not anon_key) and page is not None:
+                            discovered = None
+                            try:
+                                html = await page.content()
+                                discovered = core.extract_supabase_anon_key_from_text(html)
+                            except Exception:
+                                discovered = None
+                            if not discovered:
+                                try:
+                                    script_urls = await page.evaluate(
+                                        "() => Array.from(document.scripts).map(s => s.src).filter(Boolean)"
+                                    )
+                                except Exception:
+                                    script_urls = []
+                                if not isinstance(script_urls, list):
+                                    script_urls = []
+                                for url in [str(u or "") for u in script_urls[:8]]:
+                                    if not url:
+                                        continue
+                                    try:
+                                        js_text = await page.evaluate(
+                                            "(u) => fetch(u, { credentials: 'include' }).then(r => r.text()).catch(() => '')",
+                                            url,
+                                        )
+                                    except Exception:
+                                        js_text = ""
+                                    discovered = core.extract_supabase_anon_key_from_text(js_text or "")
+                                    if discovered:
+                                        break
+                            if (not discovered) and isinstance(script_urls, list):
+                                # Fallback: fetch scripts via httpx with Cloudflare cookies from config/context.
+                                try:
+                                    ua = core.normalize_user_agent_value((cfg_now or {}).get("user_agent")) or (
+                                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+                                        "Chrome/120.0.0.0 Safari/537.36"
+                                    )
+                                except Exception:
+                                    ua = ""
+                                cookies_http = {}
+                                try:
+                                    cc = str((cfg_now or {}).get("cf_clearance") or "").strip()
+                                    if cc:
+                                        cookies_http["cf_clearance"] = cc
+                                except Exception:
+                                    pass
+                                try:
+                                    bm = str((cfg_now or {}).get("cf_bm") or "").strip()
+                                    if bm:
+                                        cookies_http["__cf_bm"] = bm
+                                except Exception:
+                                    pass
+                                try:
+                                    cfu = str((cfg_now or {}).get("cfuvid") or "").strip()
+                                    if cfu:
+                                        cookies_http["_cfuvid"] = cfu
+                                except Exception:
+                                    pass
+                                try:
+                                    prov = str((cfg_now or {}).get("provisional_user_id") or "").strip()
+                                    if prov:
+                                        cookies_http["provisional_user_id"] = prov
+                                except Exception:
+                                    pass
+                                try:
+                                    async with core.httpx.AsyncClient(
+                                        headers={"User-Agent": ua} if ua else {},
+                                        cookies=cookies_http,
+                                        follow_redirects=True,
+                                        timeout=core.httpx.Timeout(connect=10.0, read=20.0, write=10.0, pool=10.0),
+                                    ) as client:
+                                        for url in [str(u or "") for u in script_urls[:25]]:
+                                            if not url:
+                                                continue
+                                            try:
+                                                resp = await client.get(url)
+                                                text = str(getattr(resp, "text", "") or "")
+                                            except Exception:
+                                                text = ""
+                                            discovered = core.extract_supabase_anon_key_from_text(text)
+                                            if discovered:
+                                                break
+                                except Exception:
+                                    pass
+                            if discovered:
+                                try:
+                                    core.SUPABASE_ANON_KEY = str(discovered)
+                                except Exception:
+                                    pass
+                                debug_print(f"🦊 Camoufox proxy: discovered Supabase anon key: {str(discovered)[:16]}...")
+                                try:
+                                    refreshed = await refresh_arena_auth_token_via_supabase(current_cookie)
+                                except Exception:
+                                    refreshed = None
+                if refreshed:
+                    try:
+                        if not is_arena_auth_token_expired(refreshed, skew_seconds=0):
+                            await context.add_cookies(
+                                [
+                                    {
+                                        "name": "arena-auth-prod-v1",
+                                        "value": str(refreshed),
+                                        "domain": "lmarena.ai",
+                                        "path": "/",
+                                    },
+                                    {
+                                        "name": "arena-auth-prod-v1",
+                                        "value": str(refreshed),
+                                        "domain": ".lmarena.ai",
+                                        "path": "/",
+                                    },
+                                ]
+                            )
+                            _capture_ephemeral_arena_auth_token_from_cookies(
+                                [{"name": "arena-auth-prod-v1", "value": str(refreshed)}]
+                            )
+                            current_cookie = str(refreshed)
+                            debug_print("🦊 Camoufox proxy: refreshed expired arena-auth-prod-v1 cookie.")
+                    except Exception:
+                        pass
+            job_url = ""
             try:
-                needs_signup = (not current_cookie) or is_arena_auth_token_expired(current_cookie, skew_seconds=0)
+                job_url = str(job.get("url") or "")
             except Exception:
-                needs_signup = not bool(current_cookie)
+                job_url = ""
+
+            cookie_expired = False
+            if current_cookie:
+                try:
+                    cookie_expired = bool(is_arena_auth_token_expired(current_cookie, skew_seconds=0))
+                except Exception:
+                    cookie_expired = False
+
+            # Only create a new anonymous user when starting a new evaluation session. For follow-up messages,
+            # signing up would switch identities and break access to the existing session ID.
+            is_create_evaluation = "/nextjs-api/stream/create-evaluation" in job_url
+            needs_signup = (not current_cookie) or (cookie_expired and is_create_evaluation)
             # Unit tests stub out the browser; avoid slow/interactive signup flows there.
             if needs_signup and not os.environ.get("PYTEST_CURRENT_TEST"):
                 await _attempt_anonymous_signup(min_interval_seconds=20.0)
@@ -993,6 +1365,12 @@ async def camoufox_proxy_worker(core):
 
         except asyncio.CancelledError:
             debug_print("🦊 Camoufox proxy worker cancelled.")
+            if heartbeat_task is not None:
+                heartbeat_task.cancel()
+                try:
+                    await heartbeat_task
+                except Exception:
+                    pass
             if browser_cm:
                 try:
                     await browser_cm.__aexit__(None, None, None)
@@ -1005,4 +1383,3 @@ async def camoufox_proxy_worker(core):
             # Mark for relaunch
             browser = None
             page = None
-

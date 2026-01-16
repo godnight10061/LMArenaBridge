@@ -312,6 +312,14 @@ def build_router(core) -> APIRouter:  # noqa: ANN001
 
         return StreamingResponse(_gen(), media_type="text/event-stream")
 
+    @router.post("/api/v1/_debug/expire-proxy-auth-once")
+    async def debug_expire_proxy_auth_once(api_key: dict = Depends(core.rate_limit_api_key)):  # noqa: ARG001
+        try:
+            core._DEBUG_EXPIRE_PROXY_ARENA_AUTH_COOKIE_ONCE = True
+        except Exception:
+            pass
+        return {"ok": True}
+
     @router.post("/api/v1/chat/completions")
     async def api_chat_completions(request: Request, api_key: dict = Depends(core.rate_limit_api_key)):
         return await core.api_chat_completions(request, api_key)
