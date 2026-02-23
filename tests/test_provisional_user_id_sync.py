@@ -16,6 +16,17 @@ class _FakePage:
         self.evaluate = AsyncMock(return_value=True)
 
 
+class _FakeContextBatchFallback:
+    def __init__(self) -> None:
+        self.calls: list[list[dict]] = []
+
+    async def add_cookies(self, cookies):  # noqa: ANN001
+        batch = list(cookies or [])
+        self.calls.append(batch)
+        if len(batch) > 1:
+            raise RuntimeError("Cookie should have either url or path")
+
+
 class TestProvisionalUserIdSync(BaseBridgeTest):
     async def test_sets_cookie_and_localstorage(self) -> None:
         page = _FakePage()
@@ -58,3 +69,19 @@ class TestProvisionalUserIdSync(BaseBridgeTest):
         self.assertIn("localStorage", debug_message)
         self.assertIn("RuntimeError", debug_message)
         self.assertIn("ls write failed", debug_message)
+
+    async def test_falls_back_to_individual_cookie_writes_when_batch_add_fails(self) -> None:
+        page = _FakePage()
+        context = _FakeContextBatchFallback()
+
+        await self.main._set_provisional_user_id_in_browser(page, context, provisional_user_id="prov-1")
+
+        self.assertGreaterEqual(len(context.calls), 5)
+        self.assertEqual(len(context.calls[0]), 4)
+        per_cookie_calls = context.calls[1:]
+        self.assertEqual(len(per_cookie_calls), 4)
+        for call in per_cookie_calls:
+            self.assertEqual(len(call), 1)
+            cookie = call[0]
+            self.assertEqual(cookie.get("name"), "provisional_user_id")
+            self.assertEqual(cookie.get("value"), "prov-1")
