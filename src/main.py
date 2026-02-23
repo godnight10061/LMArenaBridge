@@ -853,15 +853,25 @@ async def _set_provisional_user_id_in_browser(page, context, *, provisional_user
     if not provisional_user_id:
         return
 
-    try:
-        if context is not None:
-            # Keep cookie variants in sync:
-            # - Some sessions store `provisional_user_id` as a domain cookie on `.lmarena.ai`
-            # - Others store it as a host-only cookie on `lmarena.ai` (via `url`)
-            # If the two disagree, upstream can reject /nextjs-api/sign-up with confusing errors.
-            await context.add_cookies(_provisional_user_id_cookie_specs(provisional_user_id))
-    except Exception as e:
-        debug_print(f"Failed to set provisional_user_id cookies in browser context: {type(e).__name__}: {e}")
+    if context is not None:
+        # Keep cookie variants in sync:
+        # - Some sessions store `provisional_user_id` as a domain cookie on `.lmarena.ai`
+        # - Others store it as a host-only cookie on `lmarena.ai` (via `url`)
+        # If the two disagree, upstream can reject /nextjs-api/sign-up with confusing errors.
+        cookie_specs = _provisional_user_id_cookie_specs(provisional_user_id)
+        try:
+            await context.add_cookies(cookie_specs)
+        except Exception as e:
+            debug_print(
+                f"Failed to set provisional_user_id cookies in browser context: {type(e).__name__}: {e}; retrying one-by-one."
+            )
+            for cookie in cookie_specs:
+                try:
+                    await context.add_cookies([cookie])
+                except Exception as cookie_error:
+                    debug_print(
+                        f"Failed to set provisional_user_id cookie in browser context: {type(cookie_error).__name__}: {cookie_error}"
+                    )
 
     try:
         await page.evaluate(
