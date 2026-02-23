@@ -999,6 +999,7 @@ async def get_recaptcha_v3_token_with_chrome(config: dict) -> Optional[str]:
         return None
 
     profile_dir = Path(CONFIG_FILE).with_name("chrome_grecaptcha")
+    headless_mode = False  # Headful for better reCAPTCHA score/warmup
 
     cf_clearance = str(config.get("cf_clearance") or "").strip()
     cf_bm = str(config.get("cf_bm") or "").strip()
@@ -1023,7 +1024,7 @@ async def get_recaptcha_v3_token_with_chrome(config: dict) -> Optional[str]:
         context = await p.chromium.launch_persistent_context(
             user_data_dir=str(profile_dir),
             executable_path=chrome_path,
-            headless=False,  # Headful for better reCAPTCHA score/warmup
+            headless=headless_mode,
             user_agent=user_agent or None,
             args=[
                 "--disable-blink-features=AutomationControlled",
@@ -1083,7 +1084,7 @@ async def get_recaptcha_v3_token_with_chrome(config: dict) -> Optional[str]:
                 config,
                 mode_key="chrome_fetch_window_mode",
                 marker="LMArenaBridge Chrome Fetch",
-                headless=False,
+                headless=headless_mode,
             )
             await page.goto("https://lmarena.ai/?mode=direct", wait_until="domcontentloaded", timeout=120000)
 
