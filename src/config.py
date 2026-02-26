@@ -5,6 +5,7 @@ Handles loading, saving, and managing configuration.
 
 import json
 import os
+import sys
 from typing import Optional, Dict, Any
 from collections import defaultdict
 
@@ -109,7 +110,10 @@ def save_config(
             except (FileNotFoundError, json.JSONDecodeError):
                 on_disk = None
             except Exception as e:
-                print(f"Warning: could not read config from disk to preserve keys: {e}")
+                print(
+                    f"Warning: could not read config from disk to preserve keys: {e}",
+                    file=sys.stderr,
+                )
                 on_disk = None
 
             if isinstance(on_disk, dict):
