@@ -124,13 +124,13 @@ def save_config(
         if preserve_auth_tokens or preserve_api_keys:
             on_disk = read_raw_config(_current_config_file)
 
-            if isinstance(on_disk, dict):
-                def _preserve_list_from_disk(config_dict: dict, on_disk_config: dict, key: str) -> None:
-                    if key in on_disk_config:
-                        value_on_disk = on_disk_config.get(key)
-                        if isinstance(value_on_disk, list):
-                            config_dict[key] = list(value_on_disk)
+            def _preserve_list_from_disk(config_dict: dict, on_disk_config: dict, key: str) -> None:
+                if key in on_disk_config:
+                    value_on_disk = on_disk_config.get(key)
+                    if isinstance(value_on_disk, list):
+                        config_dict[key] = list(value_on_disk)
 
+            if isinstance(on_disk, dict):
                 if preserve_auth_tokens:
                     _preserve_list_from_disk(config, on_disk, "auth_tokens")
                     if "auth_token" in on_disk:
