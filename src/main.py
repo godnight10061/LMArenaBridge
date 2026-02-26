@@ -1861,7 +1861,7 @@ async def update_auth_token(session: str = Depends(get_current_session), auth_to
         config = get_config()
         config["auth_token"] = auth_token.strip()
         save_config(config, preserve_auth_tokens=False)
-    except Exception as e:
+    except (OSError, TypeError) as e:
         print(f"Error updating auth token: {e}", file=sys.stderr)
         return RedirectResponse(url="/dashboard?error=save_config", status_code=status.HTTP_303_SEE_OTHER)
     return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
@@ -1880,7 +1880,7 @@ async def create_key(session: str = Depends(get_current_session), name: str = Fo
         }
         config["api_keys"].append(new_key)
         save_config(config, preserve_api_keys=False)
-    except Exception as e:
+    except (OSError, TypeError) as e:
         print(f"Error creating key: {e}", file=sys.stderr)
         return RedirectResponse(url="/dashboard?error=save_config", status_code=status.HTTP_303_SEE_OTHER)
     return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
@@ -1893,7 +1893,7 @@ async def delete_key(session: str = Depends(get_current_session), key_id: str = 
         config = get_config()
         config["api_keys"] = [k for k in config["api_keys"] if k["key"] != key_id]
         save_config(config, preserve_api_keys=False)
-    except Exception as e:
+    except (OSError, TypeError) as e:
         print(f"Error deleting key: {e}", file=sys.stderr)
         return RedirectResponse(url="/dashboard?error=save_config", status_code=status.HTTP_303_SEE_OTHER)
     return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
@@ -1910,7 +1910,7 @@ async def add_auth_token(session: str = Depends(get_current_session), new_auth_t
                 config["auth_tokens"] = []
             config["auth_tokens"].append(token)
             save_config(config, preserve_auth_tokens=False)
-    except Exception as e:
+    except (OSError, TypeError) as e:
         print(f"Error adding auth token: {e}", file=sys.stderr)
         return RedirectResponse(url="/dashboard?error=save_config", status_code=status.HTTP_303_SEE_OTHER)
     return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
@@ -1926,7 +1926,7 @@ async def delete_auth_token(session: str = Depends(get_current_session), token_i
             auth_tokens.pop(token_index)
             config["auth_tokens"] = auth_tokens
             save_config(config, preserve_auth_tokens=False)
-    except Exception as e:
+    except (OSError, TypeError) as e:
         print(f"Error deleting auth token: {e}", file=sys.stderr)
         return RedirectResponse(url="/dashboard?error=save_config", status_code=status.HTTP_303_SEE_OTHER)
     return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
