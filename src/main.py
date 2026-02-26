@@ -605,7 +605,7 @@ def get_config():
 
     # Ensure default keys exist
     try:
-        _config_module._apply_config_defaults(config)
+        _config_module.apply_config_defaults(config)
     except Exception as e:
         debug_print(f"⚠️  Error setting config defaults: {e}")
 
@@ -627,7 +627,7 @@ def save_config(
     *,
     preserve_auth_tokens: bool = True,
     preserve_api_keys: bool = True,
-):
+) -> None:
     try:
         # Persist in-memory stats to the config dict before saving
         config["usage_stats"] = dict(model_usage_stats)
@@ -1035,7 +1035,7 @@ async def startup_event():
             generated_default_api_key = True
 
         try:
-            _config_module._apply_config_defaults(config)
+            _config_module.apply_config_defaults(config)
         except Exception as e:
             debug_print(f"Warning: error setting config defaults on startup: {e}")
 

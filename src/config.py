@@ -67,6 +67,11 @@ def get_config() -> dict:
     return config
 
 
+def apply_config_defaults(config: dict) -> None:
+    """Apply default values to config dictionary in-place."""
+    _apply_config_defaults(config)
+
+
 def _apply_config_defaults(config: dict) -> None:
     """Apply default values to config dictionary."""
     config.setdefault("password", "admin")
