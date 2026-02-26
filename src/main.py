@@ -1220,7 +1220,7 @@ async def logout(request: Request, response: Response):
     return response
 
 @app.get("/dashboard", response_class=HTMLResponse)
-async def dashboard(session: str = Depends(get_current_session)):
+async def dashboard(session: str = Depends(get_current_session), error: Optional[str] = None):
     if not session:
         return RedirectResponse(url="/login")
 
@@ -1237,6 +1237,15 @@ async def dashboard(session: str = Depends(get_current_session)):
                 <p><a href="/logout">Logout</a> | <a href="/dashboard">Retry</a></p>
             </body></html>
         """, status_code=500)
+
+    error_banner = ""
+    if error == "save_config":
+        error_banner = """
+            <div class="section" style="border-left: 4px solid #c33; background: #fff5f5;">
+                <strong>Failed to save configuration.</strong>
+                Check server logs and ensure the config file is writable.
+            </div>
+        """
 
     # Render API Keys
     keys_html = ""
@@ -1587,6 +1596,7 @@ async def dashboard(session: str = Depends(get_current_session)):
             </div>
 
             <div class="container">
+                {error_banner}
                 <!-- Stats Overview -->
                 <div class="stats-grid">
                     <div class="stat-card">
@@ -1853,6 +1863,7 @@ async def update_auth_token(session: str = Depends(get_current_session), auth_to
         save_config(config, preserve_auth_tokens=False)
     except Exception as e:
         debug_print(f"❌ Error updating auth token: {e}")
+        return RedirectResponse(url="/dashboard?error=save_config", status_code=status.HTTP_303_SEE_OTHER)
     return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
 
 @app.post("/create-key")
@@ -1871,6 +1882,7 @@ async def create_key(session: str = Depends(get_current_session), name: str = Fo
         save_config(config, preserve_api_keys=False)
     except Exception as e:
         debug_print(f"❌ Error creating key: {e}")
+        return RedirectResponse(url="/dashboard?error=save_config", status_code=status.HTTP_303_SEE_OTHER)
     return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
 
 @app.post("/delete-key")
@@ -1883,6 +1895,7 @@ async def delete_key(session: str = Depends(get_current_session), key_id: str = 
         save_config(config, preserve_api_keys=False)
     except Exception as e:
         debug_print(f"❌ Error deleting key: {e}")
+        return RedirectResponse(url="/dashboard?error=save_config", status_code=status.HTTP_303_SEE_OTHER)
     return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
 
 @app.post("/add-auth-token")
@@ -1899,6 +1912,7 @@ async def add_auth_token(session: str = Depends(get_current_session), new_auth_t
             save_config(config, preserve_auth_tokens=False)
     except Exception as e:
         debug_print(f"❌ Error adding auth token: {e}")
+        return RedirectResponse(url="/dashboard?error=save_config", status_code=status.HTTP_303_SEE_OTHER)
     return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
 
 @app.post("/delete-auth-token")
@@ -1914,6 +1928,7 @@ async def delete_auth_token(session: str = Depends(get_current_session), token_i
             save_config(config, preserve_auth_tokens=False)
     except Exception as e:
         debug_print(f"❌ Error deleting auth token: {e}")
+        return RedirectResponse(url="/dashboard?error=save_config", status_code=status.HTTP_303_SEE_OTHER)
     return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
 
 @app.post("/refresh-tokens")
