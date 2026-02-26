@@ -631,7 +631,7 @@ def load_usage_stats():
         model_usage_stats = defaultdict(int)
 
 def save_config(
-    config,
+    config: dict,
     *,
     preserve_auth_tokens: bool = True,
     preserve_api_keys: bool = True,

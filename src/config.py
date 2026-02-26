@@ -106,7 +106,10 @@ def save_config(
             try:
                 with open(_current_config_file, "r") as f:
                     on_disk = json.load(f)
-            except Exception:
+            except (FileNotFoundError, json.JSONDecodeError):
+                on_disk = None
+            except Exception as e:
+                print(f"Warning: could not read config from disk to preserve keys: {e}")
                 on_disk = None
 
             if isinstance(on_disk, dict):
