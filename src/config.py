@@ -144,8 +144,7 @@ def save_config(
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(config, f, indent=4)
         os.replace(tmp_path, _current_config_file)
-    except (OSError, TypeError) as e:
-        print(f"Error saving config: {e}", file=sys.stderr)
+    except (OSError, TypeError):
         raise
 
 
