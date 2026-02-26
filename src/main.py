@@ -616,7 +616,7 @@ def get_config():
     try:
         _config_module.apply_config_defaults(config)
     except Exception as e:
-        debug_print(f"⚠️  Error setting config defaults: {e}")
+        print(f"Warning: error setting config defaults: {e}", file=sys.stderr)
 
     return config
 
@@ -648,7 +648,7 @@ def save_config(
             preserve_api_keys=preserve_api_keys,
         )
     except (OSError, TypeError) as e:
-        debug_print(f"❌ Error saving config: {e}")
+        print(f"Error saving config: {e}", file=sys.stderr)
         raise
 
 def get_request_headers():
@@ -1045,7 +1045,7 @@ async def startup_event():
         try:
             _config_module.apply_config_defaults(config)
         except Exception as e:
-            debug_print(f"Warning: error setting config defaults on startup: {e}")
+            print(f"Warning: error setting config defaults on startup: {e}", file=sys.stderr)
 
         save_config(config, preserve_api_keys=False)
         save_models(get_models())
@@ -1862,7 +1862,7 @@ async def update_auth_token(session: str = Depends(get_current_session), auth_to
         config["auth_token"] = auth_token.strip()
         save_config(config, preserve_auth_tokens=False)
     except Exception as e:
-        debug_print(f"❌ Error updating auth token: {e}")
+        print(f"Error updating auth token: {e}", file=sys.stderr)
         return RedirectResponse(url="/dashboard?error=save_config", status_code=status.HTTP_303_SEE_OTHER)
     return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
 
@@ -1881,7 +1881,7 @@ async def create_key(session: str = Depends(get_current_session), name: str = Fo
         config["api_keys"].append(new_key)
         save_config(config, preserve_api_keys=False)
     except Exception as e:
-        debug_print(f"❌ Error creating key: {e}")
+        print(f"Error creating key: {e}", file=sys.stderr)
         return RedirectResponse(url="/dashboard?error=save_config", status_code=status.HTTP_303_SEE_OTHER)
     return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
 
@@ -1894,7 +1894,7 @@ async def delete_key(session: str = Depends(get_current_session), key_id: str = 
         config["api_keys"] = [k for k in config["api_keys"] if k["key"] != key_id]
         save_config(config, preserve_api_keys=False)
     except Exception as e:
-        debug_print(f"❌ Error deleting key: {e}")
+        print(f"Error deleting key: {e}", file=sys.stderr)
         return RedirectResponse(url="/dashboard?error=save_config", status_code=status.HTTP_303_SEE_OTHER)
     return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
 
@@ -1911,7 +1911,7 @@ async def add_auth_token(session: str = Depends(get_current_session), new_auth_t
             config["auth_tokens"].append(token)
             save_config(config, preserve_auth_tokens=False)
     except Exception as e:
-        debug_print(f"❌ Error adding auth token: {e}")
+        print(f"Error adding auth token: {e}", file=sys.stderr)
         return RedirectResponse(url="/dashboard?error=save_config", status_code=status.HTTP_303_SEE_OTHER)
     return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
 
@@ -1927,7 +1927,7 @@ async def delete_auth_token(session: str = Depends(get_current_session), token_i
             config["auth_tokens"] = auth_tokens
             save_config(config, preserve_auth_tokens=False)
     except Exception as e:
-        debug_print(f"❌ Error deleting auth token: {e}")
+        print(f"Error deleting auth token: {e}", file=sys.stderr)
         return RedirectResponse(url="/dashboard?error=save_config", status_code=status.HTTP_303_SEE_OTHER)
     return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
 
