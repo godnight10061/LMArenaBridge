@@ -25,6 +25,15 @@ from fastapi.security import APIKeyHeader
 
 import httpx
 
+# Support running as a script (as documented): `python src/main.py`.
+# When executed directly, Python sets `sys.path[0]` to `.../src`, which breaks
+# package-relative imports like `from . import constants`.
+if __name__ == "__main__" and (__package__ is None or __package__ == ""):
+    repo_root = Path(__file__).resolve().parent.parent
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+    __package__ = "src"
+
 # Import from modularized modules
 from . import constants
 from . import config as _config_module
