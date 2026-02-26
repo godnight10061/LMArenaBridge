@@ -647,8 +647,7 @@ def save_config(
             preserve_auth_tokens=preserve_auth_tokens,
             preserve_api_keys=preserve_api_keys,
         )
-    except (OSError, TypeError) as e:
-        print(f"Error saving config: {e}", file=sys.stderr)
+    except (OSError, TypeError):
         raise
 
 def get_request_headers():
