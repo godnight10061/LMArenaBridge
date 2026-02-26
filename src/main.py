@@ -649,6 +649,7 @@ def save_config(
         )
     except Exception as e:
         debug_print(f"❌ Error saving config: {e}")
+        raise
 
 def get_request_headers():
     """Get request headers with the first available auth token (for compatibility)"""

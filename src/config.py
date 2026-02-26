@@ -141,7 +141,8 @@ def save_config(
             json.dump(config, f, indent=4)
         os.replace(tmp_path, _current_config_file)
     except Exception as e:
-        print(f"Error saving config: {e}")
+        print(f"Error saving config: {e}", file=sys.stderr)
+        raise
 
 
 # Global state storage (for cross-module state)
