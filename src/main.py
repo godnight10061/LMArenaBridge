@@ -637,34 +637,15 @@ def save_config(
     preserve_api_keys: bool = True,
 ):
     try:
-        # Avoid clobbering dashboard edits when multiple tasks write config.json concurrently.
-        # Background refreshes/cookie upserts shouldn't overwrite auth tokens or bridge API keys.
-        if preserve_auth_tokens or preserve_api_keys:
-            try:
-                with open(CONFIG_FILE, "r") as f:
-                    on_disk = json.load(f)
-            except Exception:
-                on_disk = None
-
-            if isinstance(on_disk, dict):
-                if preserve_auth_tokens:
-                    if "auth_tokens" in on_disk and isinstance(on_disk.get("auth_tokens"), list):
-                        config["auth_tokens"] = list(on_disk.get("auth_tokens") or [])
-                    if "auth_token" in on_disk:
-                        config["auth_token"] = str(on_disk.get("auth_token") or "")
-                if (
-                    preserve_api_keys
-                    and isinstance(on_disk.get("api_keys"), list)
-                    and on_disk.get("api_keys")
-                ):
-                    config["api_keys"] = list(on_disk.get("api_keys") or [])
-
         # Persist in-memory stats to the config dict before saving
         config["usage_stats"] = dict(model_usage_stats)
-        tmp_path = f"{CONFIG_FILE}.tmp"
-        with open(tmp_path, "w") as f:
-            json.dump(config, f, indent=4)
-        os.replace(tmp_path, CONFIG_FILE)
+        # Delegate persistence and preservation logic to the config module.
+        _config_module.set_config_file(CONFIG_FILE)
+        _config_module.save_config(
+            config,
+            preserve_auth_tokens=preserve_auth_tokens,
+            preserve_api_keys=preserve_api_keys,
+        )
     except Exception as e:
         debug_print(f"❌ Error saving config: {e}")
 

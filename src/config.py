@@ -115,12 +115,10 @@ def save_config(
                         config["auth_tokens"] = list(on_disk.get("auth_tokens") or [])
                     if "auth_token" in on_disk:
                         config["auth_token"] = str(on_disk.get("auth_token") or "")
-                if (
-                    preserve_api_keys
-                    and isinstance(on_disk.get("api_keys"), list)
-                    and on_disk.get("api_keys")
-                ):
-                    config["api_keys"] = list(on_disk.get("api_keys") or [])
+                if preserve_api_keys:
+                    api_keys_on_disk = on_disk.get("api_keys")
+                    if isinstance(api_keys_on_disk, list) and api_keys_on_disk:
+                        config["api_keys"] = list(api_keys_on_disk)
 
         # usage_stats will be set by the caller
         
