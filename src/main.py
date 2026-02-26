@@ -647,7 +647,7 @@ def save_config(
             preserve_auth_tokens=preserve_auth_tokens,
             preserve_api_keys=preserve_api_keys,
         )
-    except Exception as e:
+    except (OSError, TypeError) as e:
         debug_print(f"❌ Error saving config: {e}")
         raise
 
