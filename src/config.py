@@ -121,15 +121,11 @@ def save_config(
                     value_on_disk = on_disk_config.get(key)
                     if isinstance(value_on_disk, list):
                         config_dict[key] = list(value_on_disk)
-                    elif key not in on_disk_config:
-                        config_dict[key] = []
 
                 if preserve_auth_tokens:
                     _preserve_list_from_disk(config, on_disk, "auth_tokens")
                     if "auth_token" in on_disk:
                         config["auth_token"] = str(on_disk.get("auth_token") or "")
-                    else:
-                        config["auth_token"] = ""
                 if preserve_api_keys:
                     _preserve_list_from_disk(config, on_disk, "api_keys")
 
