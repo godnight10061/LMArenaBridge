@@ -1028,16 +1028,34 @@ async def startup_event():
     try:
         # Ensure config and models files exist
         config = get_config()
+        generated_default_api_key = False
         if not config.get("api_keys"):
-            config["api_keys"] = [
-                {
-                    "name": "Default Key",
-                    "key": f"sk-lmab-{uuid.uuid4()}",
-                    "rpm": 60,
-                    "created": int(time.time()),
-                }
-            ]
-        save_config(config)
+            # If the on-disk config explicitly contains an api_keys list (even if empty), respect it.
+            # Otherwise, generate a default key and persist it.
+            on_disk = None
+            try:
+                with open(CONFIG_FILE, "r") as f:
+                    on_disk = json.load(f)
+            except (FileNotFoundError, json.JSONDecodeError):
+                on_disk = None
+            except Exception:
+                on_disk = None
+
+            api_keys_on_disk = on_disk.get("api_keys") if isinstance(on_disk, dict) else None
+            if isinstance(api_keys_on_disk, list):
+                config["api_keys"] = list(api_keys_on_disk)
+            else:
+                config["api_keys"] = [
+                    {
+                        "name": "Default Key",
+                        "key": f"sk-lmab-{uuid.uuid4()}",
+                        "rpm": 60,
+                        "created": int(time.time()),
+                    }
+                ]
+                generated_default_api_key = True
+
+        save_config(config, preserve_api_keys=not generated_default_api_key)
         save_models(get_models())
         # Load usage stats from config
         load_usage_stats()
