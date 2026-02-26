@@ -106,6 +106,13 @@ def _apply_config_defaults(config: dict) -> None:
         config["api_keys"] = normalized_keys
 
 
+def _preserve_list_from_disk(config_dict: dict, on_disk_config: dict, key: str) -> None:
+    if key in on_disk_config:
+        value_on_disk = on_disk_config.get(key)
+        if isinstance(value_on_disk, list):
+            config_dict[key] = list(value_on_disk)
+
+
 def save_config(
     config: dict,
     *,
@@ -123,12 +130,6 @@ def save_config(
     try:
         if preserve_auth_tokens or preserve_api_keys:
             on_disk = read_raw_config(_current_config_file)
-
-            def _preserve_list_from_disk(config_dict: dict, on_disk_config: dict, key: str) -> None:
-                if key in on_disk_config:
-                    value_on_disk = on_disk_config.get(key)
-                    if isinstance(value_on_disk, list):
-                        config_dict[key] = list(value_on_disk)
 
             if isinstance(on_disk, dict):
                 if preserve_auth_tokens:
