@@ -33,7 +33,7 @@ def set_config_file(path: str) -> None:
 def read_raw_config(path: str) -> Optional[dict]:
     """Read and parse config from disk, returning None on failure."""
     try:
-        with open(path, "r") as f:
+        with open(path, "r", encoding="utf-8") as f:
             value = json.load(f)
         return value if isinstance(value, dict) else None
     except FileNotFoundError:
@@ -137,7 +137,7 @@ def save_config(
         # usage_stats will be set by the caller
         
         tmp_path = f"{_current_config_file}.tmp"
-        with open(tmp_path, "w") as f:
+        with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(config, f, indent=4)
         os.replace(tmp_path, _current_config_file)
     except Exception as e:
