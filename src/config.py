@@ -36,7 +36,10 @@ def read_raw_config(path: str) -> Optional[dict]:
         with open(path, "r") as f:
             value = json.load(f)
         return value if isinstance(value, dict) else None
-    except (FileNotFoundError, json.JSONDecodeError):
+    except FileNotFoundError:
+        return None
+    except json.JSONDecodeError as e:
+        print(f"Warning: could not parse config from disk (invalid JSON): {e}", file=sys.stderr)
         return None
     except Exception as e:
         print(f"Warning: could not read config from disk: {e}", file=sys.stderr)

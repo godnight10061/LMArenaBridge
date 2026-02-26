@@ -1019,25 +1019,25 @@ async def startup_event():
 
     try:
         # Ensure config and models files exist
-        config = get_config()
+        config = _config_module.read_raw_config(CONFIG_FILE) or {}
         generated_default_api_key = False
-        if not config.get("api_keys"):
-            # If the on-disk config explicitly contains an api_keys list (even if empty), respect it.
-            # Otherwise, generate a default key and persist it.
-            on_disk = _config_module.read_raw_config(CONFIG_FILE)
-            api_keys_on_disk = on_disk.get("api_keys") if isinstance(on_disk, dict) else None
-            if isinstance(api_keys_on_disk, list):
-                config["api_keys"] = list(api_keys_on_disk)
-            else:
-                config["api_keys"] = [
-                    {
-                        "name": "Default Key",
-                        "key": f"sk-lmab-{uuid.uuid4()}",
-                        "rpm": 60,
-                        "created": int(time.time()),
-                    }
-                ]
-                generated_default_api_key = True
+        # If api_keys is not a list in the raw config (missing/null), generate a default one.
+        # This respects an explicit empty list `[]` on disk.
+        if not isinstance(config.get("api_keys"), list):
+            config["api_keys"] = [
+                {
+                    "name": "Default Key",
+                    "key": f"sk-lmab-{uuid.uuid4()}",
+                    "rpm": 60,
+                    "created": int(time.time()),
+                }
+            ]
+            generated_default_api_key = True
+
+        try:
+            _config_module._apply_config_defaults(config)
+        except Exception as e:
+            debug_print(f"Warning: error setting config defaults on startup: {e}")
 
         save_config(config, preserve_api_keys=not generated_default_api_key)
         save_models(get_models())
