@@ -1847,9 +1847,12 @@ async def dashboard(session: str = Depends(get_current_session)):
 async def update_auth_token(session: str = Depends(get_current_session), auth_token: str = Form(...)):
     if not session:
         return RedirectResponse(url="/login")
-    config = get_config()
-    config["auth_token"] = auth_token.strip()
-    save_config(config, preserve_auth_tokens=False)
+    try:
+        config = get_config()
+        config["auth_token"] = auth_token.strip()
+        save_config(config, preserve_auth_tokens=False)
+    except Exception as e:
+        debug_print(f"❌ Error updating auth token: {e}")
     return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
 
 @app.post("/create-key")
