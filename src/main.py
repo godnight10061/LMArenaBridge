@@ -1049,7 +1049,7 @@ async def startup_event():
         except Exception as e:
             debug_print(f"Warning: error setting config defaults on startup: {e}")
 
-        save_config(config, preserve_api_keys=not generated_default_api_key)
+        save_config(config, preserve_api_keys=False)
         save_models(get_models())
         # Load usage stats from config
         load_usage_stats()
