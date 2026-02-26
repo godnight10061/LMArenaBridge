@@ -630,22 +630,34 @@ def load_usage_stats():
         debug_print(f"⚠️  Error loading usage stats: {e}, using empty stats")
         model_usage_stats = defaultdict(int)
 
-def save_config(config, *, preserve_auth_tokens: bool = True):
+def save_config(
+    config,
+    *,
+    preserve_auth_tokens: bool = True,
+    preserve_api_keys: bool = True,
+):
     try:
-        # Avoid clobbering user-provided auth tokens when multiple tasks write config.json concurrently.
-        # Background refreshes/cookie upserts shouldn't overwrite auth tokens that may have been added via the dashboard.
-        if preserve_auth_tokens:
+        # Avoid clobbering dashboard edits when multiple tasks write config.json concurrently.
+        # Background refreshes/cookie upserts shouldn't overwrite auth tokens or bridge API keys.
+        if preserve_auth_tokens or preserve_api_keys:
             try:
                 with open(CONFIG_FILE, "r") as f:
                     on_disk = json.load(f)
             except Exception:
                 on_disk = None
 
-            if isinstance(on_disk, dict):
+            if isinstance(on_disk, dict) and preserve_auth_tokens:
                 if "auth_tokens" in on_disk and isinstance(on_disk.get("auth_tokens"), list):
                     config["auth_tokens"] = list(on_disk.get("auth_tokens") or [])
                 if "auth_token" in on_disk:
                     config["auth_token"] = str(on_disk.get("auth_token") or "")
+            if (
+                isinstance(on_disk, dict)
+                and preserve_api_keys
+                and isinstance(on_disk.get("api_keys"), list)
+                and on_disk.get("api_keys")
+            ):
+                config["api_keys"] = list(on_disk.get("api_keys") or [])
 
         # Persist in-memory stats to the config dict before saving
         config["usage_stats"] = dict(model_usage_stats)
@@ -1862,7 +1874,7 @@ async def create_key(session: str = Depends(get_current_session), name: str = Fo
             "created": int(time.time())
         }
         config["api_keys"].append(new_key)
-        save_config(config)
+        save_config(config, preserve_api_keys=False)
     except Exception as e:
         debug_print(f"❌ Error creating key: {e}")
     return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
@@ -1874,7 +1886,7 @@ async def delete_key(session: str = Depends(get_current_session), key_id: str = 
     try:
         config = get_config()
         config["api_keys"] = [k for k in config["api_keys"] if k["key"] != key_id]
-        save_config(config)
+        save_config(config, preserve_api_keys=False)
     except Exception as e:
         debug_print(f"❌ Error deleting key: {e}")
     return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)

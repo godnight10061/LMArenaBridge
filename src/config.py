@@ -87,27 +87,40 @@ def _apply_config_defaults(config: dict) -> None:
         config["api_keys"] = normalized_keys
 
 
-def save_config(config: dict, *, preserve_auth_tokens: bool = True) -> None:
+def save_config(
+    config: dict,
+    *,
+    preserve_auth_tokens: bool = True,
+    preserve_api_keys: bool = True,
+) -> None:
     """
     Save configuration to file.
     
     Args:
         config: Configuration dictionary to save
         preserve_auth_tokens: If True, don't overwrite auth tokens from disk
+        preserve_api_keys: If True, don't overwrite API keys from disk
     """
     try:
-        if preserve_auth_tokens:
+        if preserve_auth_tokens or preserve_api_keys:
             try:
                 with open(_current_config_file, "r") as f:
                     on_disk = json.load(f)
             except Exception:
                 on_disk = None
 
-            if isinstance(on_disk, dict):
+            if isinstance(on_disk, dict) and preserve_auth_tokens:
                 if "auth_tokens" in on_disk and isinstance(on_disk.get("auth_tokens"), list):
                     config["auth_tokens"] = list(on_disk.get("auth_tokens") or [])
                 if "auth_token" in on_disk:
                     config["auth_token"] = str(on_disk.get("auth_token") or "")
+            if (
+                isinstance(on_disk, dict)
+                and preserve_api_keys
+                and isinstance(on_disk.get("api_keys"), list)
+                and on_disk.get("api_keys")
+            ):
+                config["api_keys"] = list(on_disk.get("api_keys") or [])
 
         # usage_stats will be set by the caller
         
