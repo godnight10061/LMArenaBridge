@@ -126,7 +126,7 @@ def save_config(
 
             if isinstance(on_disk, dict):
                 def _preserve_list_from_disk(config_dict: dict, on_disk_config: dict, key: str) -> None:
-                    value_on_disk = on_disk_config.get(key)
+                    value_on_disk = on_disk_config.get(key, [])
                     if isinstance(value_on_disk, list):
                         config_dict[key] = list(value_on_disk)
 
