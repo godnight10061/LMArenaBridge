@@ -117,22 +117,21 @@ def save_config(
                 on_disk = None
 
             if isinstance(on_disk, dict):
+                def _preserve_list_from_disk(config_dict: dict, on_disk_config: dict, key: str) -> None:
+                    value_on_disk = on_disk_config.get(key)
+                    if isinstance(value_on_disk, list):
+                        config_dict[key] = list(value_on_disk)
+                    elif key not in on_disk_config:
+                        config_dict[key] = []
+
                 if preserve_auth_tokens:
-                    auth_tokens_on_disk = on_disk.get("auth_tokens")
-                    if isinstance(auth_tokens_on_disk, list):
-                        config["auth_tokens"] = list(auth_tokens_on_disk)
-                    elif "auth_tokens" not in on_disk:
-                        config["auth_tokens"] = []
+                    _preserve_list_from_disk(config, on_disk, "auth_tokens")
                     if "auth_token" in on_disk:
                         config["auth_token"] = str(on_disk.get("auth_token") or "")
-                    elif "auth_token" not in on_disk:
+                    else:
                         config["auth_token"] = ""
                 if preserve_api_keys:
-                    api_keys_on_disk = on_disk.get("api_keys")
-                    if isinstance(api_keys_on_disk, list):
-                        config["api_keys"] = list(api_keys_on_disk)
-                    elif "api_keys" not in on_disk:
-                        config["api_keys"] = []
+                    _preserve_list_from_disk(config, on_disk, "api_keys")
 
         # usage_stats will be set by the caller
         

@@ -1038,7 +1038,8 @@ async def startup_event():
                     on_disk = json.load(f)
             except (FileNotFoundError, json.JSONDecodeError):
                 on_disk = None
-            except Exception:
+            except Exception as e:
+                debug_print(f"Warning: unexpected error reading config on startup: {e}")
                 on_disk = None
 
             api_keys_on_disk = on_disk.get("api_keys") if isinstance(on_disk, dict) else None
