@@ -27,3 +27,13 @@ class TestApiKeyPersistence(BaseBridgeTest):
         keys = [entry.get("key") for entry in on_disk.get("api_keys", [])]
         self.assertIn("new-key", keys)
 
+    async def test_save_config_preserves_empty_api_key_list_from_disk(self) -> None:
+        self.setup_config({"api_keys": []})
+
+        config = self.main.get_config()
+        config["api_keys"] = [{"name": "Generated Key", "key": "generated-key", "rpm": 1, "created": 1}]
+
+        self.main.save_config(config)
+
+        on_disk = json.loads(Path(self.main.CONFIG_FILE).read_text(encoding="utf-8"))
+        self.assertEqual(on_disk.get("api_keys"), [])
