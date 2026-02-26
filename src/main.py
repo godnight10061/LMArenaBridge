@@ -1030,7 +1030,6 @@ async def startup_event():
     try:
         # Ensure config and models files exist
         config = _config_module.read_raw_config(CONFIG_FILE) or {}
-        generated_default_api_key = False
         # If api_keys is not a list in the raw config (missing/null), generate a default one.
         # This respects an explicit empty list `[]` on disk.
         if not isinstance(config.get("api_keys"), list):
@@ -1042,7 +1041,6 @@ async def startup_event():
                     "created": int(time.time()),
                 }
             ]
-            generated_default_api_key = True
 
         try:
             _config_module.apply_config_defaults(config)
