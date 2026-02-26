@@ -615,7 +615,7 @@ def get_config():
     # Ensure default keys exist
     try:
         _config_module.apply_config_defaults(config)
-    except Exception as e:
+    except (TypeError, KeyError) as e:
         print(f"Warning: error setting config defaults: {e}", file=sys.stderr)
 
     return config
@@ -1044,7 +1044,7 @@ async def startup_event():
 
         try:
             _config_module.apply_config_defaults(config)
-        except Exception as e:
+        except (TypeError, KeyError) as e:
             print(f"Warning: error setting config defaults on startup: {e}", file=sys.stderr)
 
         save_config(config, preserve_api_keys=False)
