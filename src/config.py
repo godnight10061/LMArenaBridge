@@ -30,6 +30,19 @@ def set_config_file(path: str) -> None:
         _current_token_index = 0
 
 
+def read_raw_config(path: str) -> Optional[dict]:
+    """Read and parse config from disk, returning None on failure."""
+    try:
+        with open(path, "r") as f:
+            value = json.load(f)
+        return value if isinstance(value, dict) else None
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+    except Exception as e:
+        print(f"Warning: could not read config from disk: {e}", file=sys.stderr)
+        return None
+
+
 def get_config() -> dict:
     """
     Load configuration from file with defaults.
@@ -43,13 +56,7 @@ def get_config() -> dict:
         if global_state.get("_last_config_file") != _current_config_file:
             _current_token_index = 0
     
-    try:
-        with open(_current_config_file, "r") as f:
-            config = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        config = {}
-    except Exception:
-        config = {}
+    config = read_raw_config(_current_config_file) or {}
 
     # Ensure default keys exist
     _apply_config_defaults(config)
@@ -104,17 +111,7 @@ def save_config(
     """
     try:
         if preserve_auth_tokens or preserve_api_keys:
-            try:
-                with open(_current_config_file, "r") as f:
-                    on_disk = json.load(f)
-            except (FileNotFoundError, json.JSONDecodeError):
-                on_disk = None
-            except Exception as e:
-                print(
-                    f"Warning: could not read config from disk to preserve keys: {e}",
-                    file=sys.stderr,
-                )
-                on_disk = None
+            on_disk = read_raw_config(_current_config_file)
 
             if isinstance(on_disk, dict):
                 def _preserve_list_from_disk(config_dict: dict, on_disk_config: dict, key: str) -> None:

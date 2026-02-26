@@ -601,15 +601,7 @@ def get_config():
     if _LAST_CONFIG_FILE != CONFIG_FILE:
         _LAST_CONFIG_FILE = CONFIG_FILE
         current_token_index = 0
-    try:
-        with open(CONFIG_FILE, "r") as f:
-            config = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError) as e:
-        debug_print(f"⚠️  Config file error: {e}, using defaults")
-        config = {}
-    except Exception as e:
-        debug_print(f"⚠️  Unexpected error reading config: {e}, using defaults")
-        config = {}
+    config = _config_module.read_raw_config(CONFIG_FILE) or {}
 
     # Ensure default keys exist
     try:
@@ -1032,16 +1024,7 @@ async def startup_event():
         if not config.get("api_keys"):
             # If the on-disk config explicitly contains an api_keys list (even if empty), respect it.
             # Otherwise, generate a default key and persist it.
-            on_disk = None
-            try:
-                with open(CONFIG_FILE, "r") as f:
-                    on_disk = json.load(f)
-            except (FileNotFoundError, json.JSONDecodeError):
-                on_disk = None
-            except Exception as e:
-                debug_print(f"Warning: unexpected error reading config on startup: {e}")
-                on_disk = None
-
+            on_disk = _config_module.read_raw_config(CONFIG_FILE)
             api_keys_on_disk = on_disk.get("api_keys") if isinstance(on_disk, dict) else None
             if isinstance(api_keys_on_disk, list):
                 config["api_keys"] = list(api_keys_on_disk)
