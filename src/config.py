@@ -41,7 +41,7 @@ def read_raw_config(path: str) -> Optional[dict]:
     except json.JSONDecodeError as e:
         print(f"Warning: could not parse config from disk (invalid JSON): {e}", file=sys.stderr)
         return None
-    except Exception as e:
+    except OSError as e:
         print(f"Warning: could not read config from disk: {e}", file=sys.stderr)
         return None
 
