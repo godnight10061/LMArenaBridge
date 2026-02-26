@@ -35,7 +35,10 @@ def read_raw_config(path: str) -> Optional[dict]:
     try:
         with open(path, "r", encoding="utf-8") as f:
             value = json.load(f)
-        return value if isinstance(value, dict) else None
+        if isinstance(value, dict):
+            return value
+        print(f"Warning: config file at '{path}' did not contain a JSON object.", file=sys.stderr)
+        return None
     except FileNotFoundError:
         return None
     except json.JSONDecodeError as e:
