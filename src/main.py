@@ -4049,6 +4049,19 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                         payload["modelAMessageId"] = model_msg_id
                                         payload["modelBMessageId"] = model_b_msg_id
                                         debug_print("🔁 Retrying create-evaluation with fresh session/message IDs.")
+                                    elif (
+                                        session
+                                        and isinstance(payload, dict)
+                                        and http_method.upper() == "POST"
+                                        and "/nextjs-api/stream/post-to-evaluation/" in url
+                                    ):
+                                        user_msg_id = str(uuid7())
+                                        model_msg_id = str(uuid7())
+                                        model_b_msg_id = str(uuid7())
+                                        payload["userMessageId"] = user_msg_id
+                                        payload["modelAMessageId"] = model_msg_id
+                                        payload["modelBMessageId"] = model_b_msg_id
+                                        debug_print("🔁 Retrying post-to-evaluation with fresh message IDs.")
                                     async for ka in wait_with_keepalive(1.5):
                                         yield ka
                                 continue
