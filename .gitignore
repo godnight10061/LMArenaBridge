@@ -7,3 +7,9 @@ __pycache__/
 chrome_grecaptcha/
 grecaptcha/
 camoufox_fetch/
+
+# Local E2E artifacts
+e2e_server*.log
+e2e_server*.pid
+e2e_stream*.txt
+models.json

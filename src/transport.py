@@ -251,9 +251,14 @@ async def _finalize_userscript_proxy_job(job_id: str, *, error: Optional[str] = 
 class UserscriptProxyStreamResponse:
     def __init__(self, job_id: str, timeout_seconds: int = 120):
         self.job_id = str(job_id)
-        self._status_code: int = 200
+        # Start as "unknown" until the proxy reports upstream status.
+        self._status_code: int = 0
         self._headers: dict = {}
-        self._timeout_seconds = int(timeout_seconds or 120)
+        try:
+            self._timeout_seconds = int(timeout_seconds or 120)
+        except Exception:
+            self._timeout_seconds = 120
+        self._timeout_seconds = max(5, min(self._timeout_seconds, 3600))
         self._method = "POST"
         self._url = "https://lmarena.ai/"
 
@@ -348,7 +353,19 @@ class UserscriptProxyStreamResponse:
         if not isinstance(q, asyncio.Queue) or not isinstance(done_event, asyncio.Event):
             return
 
-        deadline = _m().time.time() + float(max(5, self._timeout_seconds))
+        # Use an absolute deadline anchored to job creation so we don't extend timeouts by delaying
+        # when `aiter_lines()` is first consumed (e.g. status waits / preflight).
+        created_at = 0.0
+        try:
+            created_at = float(job.get("created_at") or 0.0)
+        except Exception:
+            created_at = 0.0
+        try:
+            timeout_seconds = float(job.get("timeout_seconds") or self._timeout_seconds)
+        except Exception:
+            timeout_seconds = float(self._timeout_seconds)
+        timeout_seconds = max(5.0, min(timeout_seconds, 3600.0))
+        deadline = (created_at + timeout_seconds) if created_at > 0.0 else (_m().time.time() + timeout_seconds)
         while True:
             if done_event.is_set() and q.empty():
                 break
@@ -554,8 +571,15 @@ async def fetch_lmarena_stream_via_userscript_proxy(
 
     proxy_url = _normalize_userscript_proxy_url(str(url))
     sitekey, action = _m().get_recaptcha_settings(config)
+    try:
+        job_timeout_seconds = int(timeout_seconds or 120)
+    except Exception:
+        job_timeout_seconds = 120
+    job_timeout_seconds = max(5, min(job_timeout_seconds, 3600))
     job = {
         "created_at": _m().time.time(),
+        "created_at_monotonic": float(_m().time.monotonic()),
+        "timeout_seconds": int(job_timeout_seconds),
         "job_id": job_id,
         # Job lifecycle markers used by the server-side stream handler to apply timeouts correctly.
         # - phase: queued -> picked_up -> signup -> fetch
@@ -584,13 +608,14 @@ async def fetch_lmarena_stream_via_userscript_proxy(
         "status_event": status_event,
         "picked_up_event": picked_up_event,
         "done": False,
-        "status_code": 200,
+        # Unknown until the proxy reports the upstream HTTP status.
+        "status_code": 0,
         "headers": {},
         "error": None,
     }
     _m()._USERSCRIPT_PROXY_JOBS[job_id] = job
     await _get_userscript_proxy_queue().put(job_id)
-    return UserscriptProxyStreamResponse(job_id, timeout_seconds=timeout_seconds)
+    return UserscriptProxyStreamResponse(job_id, timeout_seconds=job_timeout_seconds)
 
 
 async def fetch_lmarena_stream_via_chrome(
@@ -1082,6 +1107,18 @@ async def fetch_lmarena_stream_via_chrome(
                         pass
                     await asyncio.sleep(min(2.0 * (2**attempt), 15.0))
 
+            try:
+                status_int = int(result.get("status") or 0)
+            except Exception:
+                status_int = 0
+            try:
+                text_hint = str(result.get("text") or "") if isinstance(result, dict) else ""
+            except Exception:
+                text_hint = ""
+            if status_int == 502 and text_hint == "FETCH_DONE_WITHOUT_META":
+                _m().debug_print("⚠️ Chrome fetch: FETCH_DONE_WITHOUT_META (treating as transport failure).")
+                return None
+
             response = BrowserFetchStreamResponse(
                 int(result.get("status") or 0),
                 result.get("headers") if isinstance(result, dict) else {},
@@ -1163,9 +1200,10 @@ async def fetch_lmarena_stream_via_camoufox(
         # Default to headful for better Turnstile/reCAPTCHA reliability; allow override via config.
         try:
             headless_value = config.get("camoufox_fetch_headless", None)
-            headless = bool(headless_value) if headless_value is not None else True
+            # Default to headful on Windows for better Turnstile/reCAPTCHA reliability.
+            headless = bool(headless_value) if headless_value is not None else (os.name != "nt")
         except Exception:
-            headless = True
+            headless = os.name != "nt"
 
         async with _m().AsyncCamoufox(headless=headless, main_world_eval=True) as browser:
             context = await browser.new_context(user_agent=user_agent or None)
@@ -1513,6 +1551,18 @@ async def fetch_lmarena_stream_via_camoufox(
                 
                 await asyncio.sleep(2)
 
+            try:
+                status_int = int(result.get("status") or 0)
+            except Exception:
+                status_int = 0
+            try:
+                text_hint = str(result.get("text") or "") if isinstance(result, dict) else ""
+            except Exception:
+                text_hint = ""
+            if status_int == 502 and text_hint == "FETCH_DONE_WITHOUT_META":
+                _m().debug_print("⚠️ Camoufox fetch: FETCH_DONE_WITHOUT_META (treating as transport failure).")
+                return None
+
             return BrowserFetchStreamResponse(
                 int(result.get("status") or 0),
                 result.get("headers") if isinstance(result, dict) else {},
@@ -1788,7 +1838,8 @@ async def camoufox_proxy_worker():
                 user_agent = _m().normalize_user_agent_value(cfg.get("user_agent"))
                 
                 headless_value = cfg.get("camoufox_proxy_headless", None)
-                headless = bool(headless_value) if headless_value is not None else True
+                # Default to headful on Windows for better Turnstile/reCAPTCHA reliability.
+                headless = bool(headless_value) if headless_value is not None else (os.name != "nt")
                 launch_timeout = float(cfg.get("camoufox_proxy_launch_timeout_seconds", 90))
                 launch_timeout = max(20.0, min(launch_timeout, 300.0))
 
@@ -2743,6 +2794,30 @@ async def camoufox_proxy_worker():
                         job["upstream_started_at_monotonic"] = _m().time.monotonic()
                 except Exception:
                     pass
+                # Bound the in-page fetch runtime to the per-job timeout so the singleton proxy worker
+                # cannot get stuck evaluating indefinitely (which would block all future jobs).
+                try:
+                    job_timeout_seconds = int(job.get("timeout_seconds") or 120)
+                except Exception:
+                    job_timeout_seconds = 120
+                job_timeout_seconds = max(5, min(job_timeout_seconds, 3600))
+
+                created_at_mono = job.get("created_at_monotonic")
+                try:
+                    elapsed = float(_m().time.monotonic()) - float(created_at_mono)
+                except Exception:
+                    elapsed = 0.0
+                if elapsed < 0.0:
+                    elapsed = 0.0
+
+                remaining_budget = float(job_timeout_seconds) - float(elapsed)
+                remaining_budget = max(5.0, remaining_budget)
+                timeout_ms = int(remaining_budget * 1000.0)
+                evaluate_timeout_seconds = remaining_budget + 20.0
+                evaluate_timeout_seconds = max(
+                    30.0, min(evaluate_timeout_seconds, float(job_timeout_seconds) + 30.0)
+                )
+
                 await asyncio.wait_for(
                     page.evaluate(
                         fetch_script,
@@ -2754,11 +2829,11 @@ async def camoufox_proxy_worker():
                             "sitekeyV2": _m().RECAPTCHA_V2_SITEKEY,
                             "grecaptchaTimeoutMs": 60000,
                             "grecaptchaPollMs": 250,
-                            "timeoutMs": 180000,
+                            "timeoutMs": int(timeout_ms),
                             "debug": bool(os.environ.get("LM_BRIDGE_PROXY_DEBUG")),
                         }
                     ),
-                    timeout=200.0
+                    timeout=float(evaluate_timeout_seconds),
                 )
             except asyncio.TimeoutError:
                 try:

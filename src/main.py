@@ -2726,7 +2726,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                 elif use_browser_transports and force_browser_transports_in_stream:
                     debug_print("⚠️ Stream mode without auth token: preferring userscript proxy / browser fetch transports.")
                 elif use_browser_transports and proxy_active_at_start:
-                    debug_print("🦊 Userscript proxy is ACTIVE: routing stream through proxy and skipping side-channel reCAPTCHA mint.")
+                    debug_print("🦊 Userscript proxy is ACTIVE: enabling proxy fallback and skipping side-channel reCAPTCHA mint.")
 
                 # Non-strict models: mint a fresh side-channel token before the first upstream attempt so we don't
                 # send an empty `recaptchaV3Token` (which commonly yields 403 "recaptcha validation failed").
@@ -2766,6 +2766,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                     # Abort if the client disconnects.
                     try:
                         if await request.is_disconnected():
+                            debug_print("⚠️ Client disconnected; ending stream.")
                             return
                     except Exception:
                         pass
@@ -2862,6 +2863,11 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                 stream_context is None
                                 and use_browser_transports
                                 and not use_userscript
+                                and not (
+                                    proxy_active_at_start
+                                    and userscript_proxy_available
+                                    and not disable_userscript_for_request
+                                )
                                 and isinstance(payload, dict)
                                 and not strict_token_prefill_attempted
                                 and not str(payload.get("recaptchaV3Token") or "").strip()
@@ -2883,6 +2889,10 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                         new_token = None
                                     if new_token:
                                         payload["recaptchaV3Token"] = new_token
+
+                            # Even when the proxy is active, keep it as a backup transport. Browser fetch transports
+                            # (Camoufox/Chrome) tend to provide more consistent first-token behavior; the proxy remains
+                            # valuable when browser transports fail (e.g. CORS/origin issues or bot-mitigation).
 
                             if stream_context is None and use_browser_transports:
                                 browser_fetch_attempts = 5
@@ -3038,18 +3048,25 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                     if stream_context is not None:
                                         transport_used = "camoufox"
                                     if stream_context is None:
-                                        chrome_task = asyncio.create_task(_try_chrome_fetch())
-                                        while True:
-                                            done, _ = await asyncio.wait({chrome_task}, timeout=1.0)
-                                            if chrome_task in done:
-                                                try:
-                                                    stream_context = chrome_task.result()
-                                                except Exception:
-                                                    stream_context = None
-                                                break
-                                            yield ": keep-alive\n\n"
-                                        if stream_context is not None:
-                                            transport_used = "chrome"
+                                        # When no upstream auth token is configured, Chrome fetch frequently provides no
+                                        # additional value (it cannot sign up anonymously) and can trigger client-side
+                                        # disconnects on some Windows setups. If a userscript/camoufox proxy is active,
+                                        # prefer falling back to it instead of launching Chrome here.
+                                        if userscript_proxy_available and (not str(current_token or "").strip()):
+                                            debug_print("🦊 No auth token configured; skipping Chrome fetch and falling back to Userscript proxy...")
+                                        else:
+                                            chrome_task = asyncio.create_task(_try_chrome_fetch())
+                                            while True:
+                                                done, _ = await asyncio.wait({chrome_task}, timeout=1.0)
+                                                if chrome_task in done:
+                                                    try:
+                                                        stream_context = chrome_task.result()
+                                                    except Exception:
+                                                        stream_context = None
+                                                    break
+                                                yield ": keep-alive\n\n"
+                                            if stream_context is not None:
+                                                transport_used = "chrome"
 
                             # Userscript proxy: backup transport after browser transports fail.
                             if stream_context is None and userscript_proxy_available and not disable_userscript_for_request:
@@ -3484,7 +3501,8 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                                 time.monotonic() - stream_started_at
                                             )
                                             remaining_budget = max(0.0, remaining_budget)
-                                            max_wait_seconds = min(max(float(grace_seconds), 200.0), remaining_budget)
+                                            # Wait only for the configured grace window (bounded by remaining budget).
+                                            max_wait_seconds = min(float(grace_seconds), remaining_budget)
 
                                             debug_print(
                                                 f"⏳ Userscript proxy reported 403. Waiting up to {int(max_wait_seconds)}s for in-page retry..."
@@ -3772,9 +3790,32 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                         if pending is not None and not pending.done():
                                             pending.cancel()
 
+                                # If we never see any usable deltas, don't keep the client socket open forever
+                                # emitting keep-alives. Abort the attempt so retry/fallback logic can run.
+                                try:
+                                    first_delta_timeout_seconds = float(
+                                        get_config().get("stream_first_delta_timeout_seconds", 120)
+                                    )
+                                except Exception:
+                                    first_delta_timeout_seconds = 120.0
+                                first_delta_timeout_seconds = max(
+                                    10.0, min(float(first_delta_timeout_seconds), float(stream_total_timeout_seconds))
+                                )
+                                first_delta_deadline = time.monotonic() + float(first_delta_timeout_seconds)
+                                saw_delta = False
+
                                 async for maybe_line in _aiter_with_keepalive(response.aiter_lines().__aiter__()):
                                     if maybe_line is None:
                                         yield ": keep-alive\n\n"
+                                        if (not saw_delta) and (time.monotonic() > float(first_delta_deadline)):
+                                            if not unhandled_preview:
+                                                unhandled_preview.append(
+                                                    f"stream_first_delta_timeout after {int(first_delta_timeout_seconds)}s"
+                                                )
+                                            debug_print(
+                                                f"⚠️ Upstream produced no content deltas for {int(first_delta_timeout_seconds)}s. Aborting attempt."
+                                            )
+                                            break
                                         continue
 
                                     line = str(maybe_line).strip()
@@ -3790,6 +3831,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                         try:
                                             reasoning_chunk = json.loads(chunk_data)
                                             reasoning_text += reasoning_chunk
+                                            saw_delta = True
                                             
                                             # Send SSE-formatted chunk with reasoning_content
                                             chunk_response = {
@@ -3816,6 +3858,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                         try:
                                             text_chunk = json.loads(chunk_data)
                                             response_text += text_chunk
+                                            saw_delta = True
                                             
                                             # Send SSE-formatted chunk
                                             chunk_response = {
@@ -3848,6 +3891,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                                     image_url = image_obj.get('image', '')
                                                     # Format as markdown for streaming
                                                     response_text = f"![Generated Image]({image_url})"
+                                                    saw_delta = True
                                                     
                                                     # Send the markdown-formatted image in a chunk
                                                     chunk_response = {
@@ -3930,6 +3974,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                                 if "reasoning_content" in delta:
                                                     r_chunk = str(delta["reasoning_content"] or "")
                                                     reasoning_text += r_chunk
+                                                    saw_delta = True
                                                     chunk_response = {
                                                         "id": chunk_id, "object": "chat.completion.chunk", "created": int(time.time()), "model": model_public_name,
                                                         "choices": [{"index": 0, "delta": {"reasoning_content": r_chunk}, "finish_reason": None}]
@@ -3940,6 +3985,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                                 if "content" in delta:
                                                     c_chunk = str(delta["content"] or "")
                                                     response_text += c_chunk
+                                                    saw_delta = True
                                                     chunk_response = {
                                                         "id": chunk_id, "object": "chat.completion.chunk", "created": int(time.time()), "model": model_public_name,
                                                         "choices": [{"index": 0, "delta": {"content": c_chunk}, "finish_reason": None}]
@@ -4263,6 +4309,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                     except asyncio.CancelledError:
                         # Client disconnected or server shutdown. Avoid leaking proxy jobs or surfacing noisy uvicorn
                         # "response not completed" warnings on cancellation.
+                        debug_print("⚠️ Stream task cancelled (client disconnected or server shutdown).")
                         try:
                             if transport_used == "userscript":
                                 jid = str(getattr(stream_context, "job_id", "") or "").strip()
