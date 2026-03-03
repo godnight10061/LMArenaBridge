@@ -2840,10 +2840,7 @@ async def camoufox_proxy_worker():
                     timeout=float(evaluate_timeout_seconds),
                 )
             except asyncio.TimeoutError:
-                try:
-                    await _finalize_userscript_proxy_job(job_id, error="camoufox proxy evaluate timeout")
-                except Exception:
-                    await push_proxy_chunk(job_id, {"error": "camoufox proxy evaluate timeout", "done": True})
+                await _finalize_userscript_proxy_job(job_id, error="camoufox proxy evaluate timeout")
                 # The page can get stuck in a bad execution context after an evaluate timeout. Force a relaunch
                 # so subsequent jobs don't repeatedly hang.
                 browser = None
