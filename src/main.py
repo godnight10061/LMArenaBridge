@@ -1,5 +1,6 @@
 import asyncio
 import builtins as _builtins
+import html
 import json
 import os
 import re
@@ -575,8 +576,8 @@ API_KEY_HEADER = APIKeyHeader(name="Authorization", auto_error=False)
 # In-memory stores
 # { "api_key": { "conversation_id": session_data } }
 chat_sessions: Dict[str, Dict[str, dict]] = defaultdict(dict)
-# { "session_id": "username" }
-dashboard_sessions = {}
+# { "session_id": {"user": "admin", "csrf_token": "..."} }
+dashboard_sessions: Dict[str, dict] = {}
 # { "api_key": [timestamp1, timestamp2, ...] }
 api_key_usage = defaultdict(list)
 # { "model_id": count }
@@ -640,6 +641,50 @@ def load_usage_stats():
         debug_print(f"⚠️  Error loading usage stats: {e}, using empty stats")
         model_usage_stats = defaultdict(int)
 
+
+def _escape_html(value: object) -> str:
+    try:
+        return html.escape(str(value), quote=True)
+    except Exception:
+        return ""
+
+
+def _safe_json_dumps_for_script(value: object) -> str:
+    """
+    JSON-dump a value and escape characters that can break out of <script> tags.
+
+    This prevents sequences like </script> from terminating the script element.
+    """
+    try:
+        dumped = json.dumps(value)
+    except Exception:
+        dumped = "null"
+    return (
+        dumped.replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("&", "\\u0026")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    )
+
+
+def _csrf_token_matches_session(session: object, csrf_token: object) -> bool:
+    if not isinstance(session, dict):
+        return False
+    expected = str(session.get("csrf_token") or "")
+    provided = str(csrf_token or "")
+    if not expected or not provided:
+        return False
+    try:
+        return secrets.compare_digest(expected, provided)
+    except Exception:
+        return False
+
+
+def _userscript_proxy_error_requires_fallback(proxy_error: str) -> bool:
+    lowered = str(proxy_error or "").lower()
+    return ("camoufox proxy evaluate timeout" in lowered) or ("userscript proxy timeout" in lowered)
+
 def save_config(
     config,
     *,
@@ -666,8 +711,11 @@ def save_config(
                 if preserve_api_keys and isinstance(on_disk.get("api_keys"), list):
                     config["api_keys"] = list(on_disk.get("api_keys") or [])
 
-        # Persist in-memory stats to the config dict before saving
-        config["usage_stats"] = dict(model_usage_stats)
+        # Persist in-memory stats to the config dict before saving.
+        try:
+            config["usage_stats"] = {str(k): int(v) for k, v in dict(model_usage_stats).items()}
+        except Exception:
+            config["usage_stats"] = {}
         tmp_path = f"{CONFIG_FILE}.tmp"
         with open(tmp_path, "w") as f:
             json.dump(config, f, indent=4)
@@ -701,9 +749,29 @@ def get_request_headers():
 
 async def get_current_session(request: Request):
     session_id = request.cookies.get("session_id")
-    if session_id and session_id in dashboard_sessions:
-        return dashboard_sessions[session_id]
-    return None
+    if not session_id:
+        return None
+
+    entry = dashboard_sessions.get(session_id)
+    if not entry:
+        return None
+
+    # Backward compat: older sessions stored just a username string.
+    if not isinstance(entry, dict):
+        entry = {"user": str(entry or "admin")}
+
+    # Ensure every session has a CSRF token.
+    try:
+        token = str(entry.get("csrf_token") or "").strip()
+    except Exception:
+        token = ""
+    if not token:
+        token = secrets.token_urlsafe(32)
+        entry["csrf_token"] = token
+
+    entry["session_id"] = session_id
+    dashboard_sessions[session_id] = entry
+    return entry
 
 # --- API Key Authentication & Rate Limiting ---
 
@@ -1252,9 +1320,9 @@ async def login_submit(response: Response, password: str = Form(...)):
     config = get_config()
     if password == config.get("password"):
         session_id = str(uuid.uuid4())
-        dashboard_sessions[session_id] = "admin"
+        dashboard_sessions[session_id] = {"user": "admin", "csrf_token": secrets.token_urlsafe(32)}
         response = RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
-        response.set_cookie(key="session_id", value=session_id, httponly=True)
+        response.set_cookie(key="session_id", value=session_id, httponly=True, samesite="strict")
         return response
     return RedirectResponse(url="/login?error=1", status_code=status.HTTP_303_SEE_OTHER)
 
@@ -1286,38 +1354,49 @@ async def dashboard(session: str = Depends(get_current_session)):
             </body></html>
         """, status_code=500)
 
+    csrf_token = ""
+    try:
+        if isinstance(session, dict):
+            csrf_token = str(session.get("csrf_token") or "")
+    except Exception:
+        csrf_token = ""
+    csrf_token_html = _escape_html(csrf_token)
+
     # Render API Keys
     keys_html = ""
     for key in config["api_keys"]:
-        key_name = key.get("name") or "Unnamed Key"
-        key_value = key.get("key") or ""
+        key_name = _escape_html(key.get("name") or "Unnamed Key")
+        key_value = str(key.get("key") or "")
+        key_value_html = _escape_html(key_value)
         rpm_value = key.get("rpm", 60)
-        created_date = time.strftime('%Y-%m-%d %H:%M', time.localtime(key.get('created', 0)))
+        created_date = time.strftime("%Y-%m-%d %H:%M", time.localtime(key.get("created", 0)))
         keys_html += f"""
             <tr>
                 <td><strong>{key_name}</strong></td>
-                <td><code class="api-key-code">{key_value}</code></td>
+                <td><code class="api-key-code">{key_value_html}</code></td>
                 <td><span class="badge">{rpm_value} RPM</span></td>
                 <td><small>{created_date}</small></td>
                 <td>
-                    <form action='/delete-key' method='post' style='margin:0;' onsubmit='return confirm("Delete this API key?");'>
-                        <input type='hidden' name='key_id' value='{key_value}'>
-                        <button type='submit' class='btn-delete'>Delete</button>
+                    <form action="/delete-key" method="post" style="margin:0;" onsubmit="return confirm('Delete this API key?');">
+                        <input type="hidden" name="csrf_token" value="{csrf_token_html}">
+                        <input type="hidden" name="key_id" value="{key_value_html}">
+                        <button type="submit" class="btn-delete">Delete</button>
                     </form>
                 </td>
             </tr>
         """
 
     # Render Models (limit to first 20 with text output)
-    text_models = [m for m in models if m.get('capabilities', {}).get('outputCapabilities', {}).get('text')]
+    text_models = [m for m in models if m.get("capabilities", {}).get("outputCapabilities", {}).get("text")]
     models_html = ""
     for i, model in enumerate(text_models[:20]):
-        rank = model.get('rank', '?')
-        org = model.get('organization', 'Unknown')
+        rank = model.get("rank", "?")
+        org = _escape_html(model.get("organization", "Unknown"))
+        public_name = _escape_html(model.get("publicName", "Unnamed"))
         models_html += f"""
             <div class="model-card">
                 <div class="model-header">
-                    <span class="model-name">{model.get('publicName', 'Unnamed')}</span>
+                    <span class="model-name">{public_name}</span>
                     <span class="model-rank">Rank {rank}</span>
                 </div>
                 <div class="model-org">{org}</div>
@@ -1331,7 +1410,7 @@ async def dashboard(session: str = Depends(get_current_session)):
     stats_html = ""
     if model_usage_stats:
         for model, count in sorted(model_usage_stats.items(), key=lambda x: x[1], reverse=True)[:10]:
-            stats_html += f"<tr><td>{model}</td><td><strong>{count}</strong></td></tr>"
+            stats_html += f"<tr><td>{_escape_html(model)}</td><td><strong>{int(count)}</strong></td></tr>"
     else:
         stats_html = "<tr><td colspan='2' class='no-data'>No usage data yet</td></tr>"
 
@@ -1721,6 +1800,7 @@ async def dashboard(session: str = Depends(get_current_session)):
                     
                     <h3 style="margin-top: 30px; margin-bottom: 15px; font-size: 18px;">Create New API Key</h3>
                     <form action="/create-key" method="post">
+                        <input type="hidden" name="csrf_token" value="{csrf_token_html}">
                         <div class="form-row">
                             <div class="form-group">
                                 <label for="name">Key Name</label>
@@ -1780,7 +1860,7 @@ async def dashboard(session: str = Depends(get_current_session)):
             
             <script>
                 // Prepare data for charts
-                const statsData = {json.dumps(dict(sorted(model_usage_stats.items(), key=lambda x: x[1], reverse=True)[:10]))};
+                const statsData = {_safe_json_dumps_for_script(dict(sorted(model_usage_stats.items(), key=lambda x: x[1], reverse=True)[:10]))};
                 const modelNames = Object.keys(statsData);
                 const modelCounts = Object.values(statsData);
                 
@@ -1901,13 +1981,24 @@ async def update_auth_token(session: str = Depends(get_current_session), auth_to
     return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
 
 @app.post("/create-key")
-async def create_key(session: str = Depends(get_current_session), name: str = Form(...), rpm: int = Form(...)):
+async def create_key(
+    session: dict = Depends(get_current_session),
+    name: str = Form(...),
+    rpm: int = Form(...),
+    csrf_token: str = Form(""),
+):
     if not session:
         return RedirectResponse(url="/login")
+    if not _csrf_token_matches_session(session, csrf_token):
+        raise HTTPException(status_code=403, detail="Invalid CSRF token.")
     try:
         config = get_config()
+        safe_name = " ".join(str(name or "").strip().split())
+        if not safe_name:
+            safe_name = "Unnamed Key"
+        safe_name = safe_name[:80]
         new_key = {
-            "name": name.strip(),
+            "name": safe_name,
             "key": f"sk-lmab-{uuid.uuid4()}",
             "rpm": max(1, min(rpm, 1000)),  # Clamp between 1-1000
             "created": int(time.time())
@@ -1919,10 +2010,17 @@ async def create_key(session: str = Depends(get_current_session), name: str = Fo
     return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
 
 @app.post("/delete-key")
-async def delete_key(session: str = Depends(get_current_session), key_id: str = Form(...)):
+async def delete_key(
+    session: dict = Depends(get_current_session),
+    key_id: str = Form(...),
+    csrf_token: str = Form(""),
+):
     if not session:
         return RedirectResponse(url="/login")
+    if not _csrf_token_matches_session(session, csrf_token):
+        raise HTTPException(status_code=403, detail="Invalid CSRF token.")
     try:
+        key_id = str(key_id or "").strip()
         config = get_config()
         config["api_keys"] = [k for k in config["api_keys"] if k["key"] != key_id]
         save_config(config, preserve_api_keys=False)
@@ -3462,11 +3560,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                         except Exception:
                                             proxy_error = ""
                                         if proxy_error:
-                                            lowered = proxy_error.lower()
-                                            if (
-                                                "camoufox proxy evaluate timeout" in lowered
-                                                or "userscript proxy timeout" in lowered
-                                            ):
+                                            if _userscript_proxy_error_requires_fallback(proxy_error):
                                                 debug_print(
                                                     f"鈿狅笍 Userscript proxy error: {proxy_error[:200]}. Falling back..."
                                                 )
@@ -4078,11 +4172,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                 # Proxy transport may hang even when it reports a status code (e.g. page-evaluate timeout).
                                 # Treat these as proxy-health failures and fall back to browser fetch transports.
                                 if transport_used == "userscript" and proxy_error:
-                                    lowered = str(proxy_error or "").lower()
-                                    if (
-                                        "camoufox proxy evaluate timeout" in lowered
-                                        or "userscript proxy timeout" in lowered
-                                    ):
+                                    if _userscript_proxy_error_requires_fallback(proxy_error):
                                         debug_print(
                                             f"鈿狅笍 Userscript proxy error: {proxy_error[:200]}. Falling back..."
                                         )
