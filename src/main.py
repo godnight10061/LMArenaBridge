@@ -685,6 +685,25 @@ def _userscript_proxy_error_requires_fallback(proxy_error: str) -> bool:
     lowered = str(proxy_error or "").lower()
     return ("camoufox proxy evaluate timeout" in lowered) or ("userscript proxy timeout" in lowered)
 
+
+def _handle_userscript_proxy_timeout_error(proxy_error: str) -> bool:
+    """
+    Return True if a userscript proxy error should trigger fallback to other transports.
+
+    Side effects:
+    - Marks the userscript proxy as inactive (best-effort).
+    """
+    text = str(proxy_error or "").strip()
+    if not text:
+        return False
+    if not _userscript_proxy_error_requires_fallback(text):
+        return False
+    try:
+        _mark_userscript_proxy_inactive()
+    except Exception:
+        pass
+    return True
+
 def save_config(
     config,
     *,
@@ -3560,15 +3579,11 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                         except Exception:
                                             proxy_error = ""
                                         if proxy_error:
-                                            if _userscript_proxy_error_requires_fallback(proxy_error):
+                                            if _handle_userscript_proxy_timeout_error(proxy_error):
                                                 debug_print(
                                                     f"鈿狅笍 Userscript proxy error: {proxy_error[:200]}. Falling back..."
                                                 )
                                                 disable_userscript_for_request = True
-                                                try:
-                                                    _mark_userscript_proxy_inactive()
-                                                except Exception:
-                                                    pass
                                                 async for ka in wait_with_keepalive(0.5):
                                                     yield ka
                                                 continue
@@ -4172,15 +4187,11 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                 # Proxy transport may hang even when it reports a status code (e.g. page-evaluate timeout).
                                 # Treat these as proxy-health failures and fall back to browser fetch transports.
                                 if transport_used == "userscript" and proxy_error:
-                                    if _userscript_proxy_error_requires_fallback(proxy_error):
+                                    if _handle_userscript_proxy_timeout_error(proxy_error):
                                         debug_print(
                                             f"鈿狅笍 Userscript proxy error: {proxy_error[:200]}. Falling back..."
                                         )
                                         disable_userscript_for_request = True
-                                        try:
-                                            _mark_userscript_proxy_inactive()
-                                        except Exception:
-                                            pass
                                         yield ": keep-alive\n\n"
                                         continue
 
