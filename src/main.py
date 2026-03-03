@@ -792,6 +792,17 @@ async def get_current_session(request: Request):
     dashboard_sessions[session_id] = entry
     return entry
 
+
+def _require_dashboard_csrf_session(
+    session: dict = Depends(get_current_session),
+    csrf_token: str = Form(""),
+):
+    if not session:
+        return None
+    if not _csrf_token_matches_session(session, csrf_token):
+        raise HTTPException(status_code=403, detail="Invalid CSRF token.")
+    return session
+
 # --- API Key Authentication & Rate Limiting ---
 
 async def rate_limit_api_key(key: str = Depends(API_KEY_HEADER)):
@@ -1409,7 +1420,7 @@ async def dashboard(session: str = Depends(get_current_session)):
     text_models = [m for m in models if m.get("capabilities", {}).get("outputCapabilities", {}).get("text")]
     models_html = ""
     for i, model in enumerate(text_models[:20]):
-        rank = model.get("rank", "?")
+        rank = _escape_html(model.get("rank", "?"))
         org = _escape_html(model.get("organization", "Unknown"))
         public_name = _escape_html(model.get("publicName", "Unnamed"))
         models_html += f"""
@@ -2001,15 +2012,12 @@ async def update_auth_token(session: str = Depends(get_current_session), auth_to
 
 @app.post("/create-key")
 async def create_key(
-    session: dict = Depends(get_current_session),
+    session: dict = Depends(_require_dashboard_csrf_session),
     name: str = Form(...),
     rpm: int = Form(...),
-    csrf_token: str = Form(""),
 ):
     if not session:
         return RedirectResponse(url="/login")
-    if not _csrf_token_matches_session(session, csrf_token):
-        raise HTTPException(status_code=403, detail="Invalid CSRF token.")
     try:
         config = get_config()
         safe_name = " ".join(str(name or "").strip().split())
@@ -2030,14 +2038,11 @@ async def create_key(
 
 @app.post("/delete-key")
 async def delete_key(
-    session: dict = Depends(get_current_session),
+    session: dict = Depends(_require_dashboard_csrf_session),
     key_id: str = Form(...),
-    csrf_token: str = Form(""),
 ):
     if not session:
         return RedirectResponse(url="/login")
-    if not _csrf_token_matches_session(session, csrf_token):
-        raise HTTPException(status_code=403, detail="Invalid CSRF token.")
     try:
         key_id = str(key_id or "").strip()
         config = get_config()

@@ -355,21 +355,25 @@ class UserscriptProxyStreamResponse:
 
         # Use an absolute deadline anchored to job creation so we don't extend timeouts by delaying
         # when `aiter_lines()` is first consumed (e.g. status waits / preflight).
-        created_at = 0.0
+        created_at_mono = 0.0
         try:
-            created_at = float(job.get("created_at") or 0.0)
+            created_at_mono = float(job.get("created_at_monotonic") or 0.0)
         except Exception:
-            created_at = 0.0
+            created_at_mono = 0.0
         try:
             timeout_seconds = float(job.get("timeout_seconds") or self._timeout_seconds)
         except Exception:
             timeout_seconds = float(self._timeout_seconds)
         timeout_seconds = max(5.0, min(timeout_seconds, 3600.0))
-        deadline = (created_at + timeout_seconds) if created_at > 0.0 else (_m().time.time() + timeout_seconds)
+        deadline = (
+            (created_at_mono + timeout_seconds)
+            if created_at_mono > 0.0
+            else (_m().time.monotonic() + timeout_seconds)
+        )
         while True:
             if done_event.is_set() and q.empty():
                 break
-            remaining = deadline - _m().time.time()
+            remaining = deadline - _m().time.monotonic()
             if remaining <= 0:
                 job["error"] = job.get("error") or "userscript proxy timeout"
                 job["done"] = True
