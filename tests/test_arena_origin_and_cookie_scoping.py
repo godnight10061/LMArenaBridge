@@ -28,7 +28,9 @@ class TestArenaOriginAndCookieScoping(BaseBridgeTest):
         for cookie in specs:
             self.assertEqual(cookie.get("name"), "arena-auth-prod-v1")
             self.assertEqual(cookie.get("value"), "base64-token-1")
-            self.assertEqual(cookie.get("path"), "/")
+            self.assertIn("url", cookie)
+            self.assertNotIn("domain", cookie)
+            self.assertNotIn("path", cookie)
 
     def test_provisional_user_id_cookie_specs_include_host_and_domain(self) -> None:
         specs = self.main._provisional_user_id_cookie_specs("prov-1", page_url="https://lmarena.ai/?mode=direct")

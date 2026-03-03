@@ -640,11 +640,16 @@ def load_usage_stats():
         debug_print(f"⚠️  Error loading usage stats: {e}, using empty stats")
         model_usage_stats = defaultdict(int)
 
-def save_config(config, *, preserve_auth_tokens: bool = True):
+def save_config(
+    config,
+    *,
+    preserve_auth_tokens: bool = True,
+    preserve_api_keys: bool = True,
+):
     try:
-        # Avoid clobbering user-provided auth tokens when multiple tasks write config.json concurrently.
-        # Background refreshes/cookie upserts shouldn't overwrite auth tokens that may have been added via the dashboard.
-        if preserve_auth_tokens:
+        # Avoid clobbering user-provided auth tokens / API keys when multiple tasks write config.json concurrently.
+        # Background refreshes/cookie upserts shouldn't overwrite values that may have been changed via the dashboard.
+        if preserve_auth_tokens or preserve_api_keys:
             try:
                 with open(CONFIG_FILE, "r") as f:
                     on_disk = json.load(f)
@@ -652,10 +657,14 @@ def save_config(config, *, preserve_auth_tokens: bool = True):
                 on_disk = None
 
             if isinstance(on_disk, dict):
-                if "auth_tokens" in on_disk and isinstance(on_disk.get("auth_tokens"), list):
-                    config["auth_tokens"] = list(on_disk.get("auth_tokens") or [])
-                if "auth_token" in on_disk:
-                    config["auth_token"] = str(on_disk.get("auth_token") or "")
+                if preserve_auth_tokens:
+                    if "auth_tokens" in on_disk and isinstance(on_disk.get("auth_tokens"), list):
+                        config["auth_tokens"] = list(on_disk.get("auth_tokens") or [])
+                    if "auth_token" in on_disk:
+                        config["auth_token"] = str(on_disk.get("auth_token") or "")
+
+                if preserve_api_keys and isinstance(on_disk.get("api_keys"), list):
+                    config["api_keys"] = list(on_disk.get("api_keys") or [])
 
         # Persist in-memory stats to the config dict before saving
         config["usage_stats"] = dict(model_usage_stats)
@@ -1044,8 +1053,18 @@ async def startup_event():
 
     try:
         # Ensure config and models files exist
+        try:
+            with open(CONFIG_FILE, "r") as f:
+                raw_config = json.load(f)
+            if not isinstance(raw_config, dict):
+                raw_config = None
+        except Exception:
+            raw_config = None
+
         config = get_config()
-        if not config.get("api_keys"):
+        raw_api_keys = raw_config.get("api_keys") if isinstance(raw_config, dict) else None
+        should_generate_default_api_key = ("api_keys" not in (raw_config or {})) or (raw_api_keys is None)
+        if should_generate_default_api_key and not config.get("api_keys"):
             config["api_keys"] = [
                 {
                     "name": "Default Key",
@@ -1894,7 +1913,7 @@ async def create_key(session: str = Depends(get_current_session), name: str = Fo
             "created": int(time.time())
         }
         config["api_keys"].append(new_key)
-        save_config(config)
+        save_config(config, preserve_api_keys=False)
     except Exception as e:
         debug_print(f"❌ Error creating key: {e}")
     return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
@@ -1906,7 +1925,7 @@ async def delete_key(session: str = Depends(get_current_session), key_id: str = 
     try:
         config = get_config()
         config["api_keys"] = [k for k in config["api_keys"] if k["key"] != key_id]
-        save_config(config)
+        save_config(config, preserve_api_keys=False)
     except Exception as e:
         debug_print(f"❌ Error deleting key: {e}")
     return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
@@ -3419,6 +3438,29 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                         proxy_done_event = None
                                         if isinstance(proxy_job, dict):
                                             proxy_done_event = proxy_job.get("done_event")
+                                        proxy_error = ""
+                                        try:
+                                            if isinstance(proxy_job, dict) and proxy_job.get("error"):
+                                                proxy_error = str(proxy_job.get("error") or "")
+                                        except Exception:
+                                            proxy_error = ""
+                                        if proxy_error:
+                                            lowered = proxy_error.lower()
+                                            if (
+                                                "camoufox proxy evaluate timeout" in lowered
+                                                or "userscript proxy timeout" in lowered
+                                            ):
+                                                debug_print(
+                                                    f"鈿狅笍 Userscript proxy error: {proxy_error[:200]}. Falling back..."
+                                                )
+                                                disable_userscript_for_request = True
+                                                try:
+                                                    _mark_userscript_proxy_inactive()
+                                                except Exception:
+                                                    pass
+                                                async for ka in wait_with_keepalive(0.5):
+                                                    yield ka
+                                                continue
 
                                         # Give the proxy a chance to finish its in-page reCAPTCHA retry path before we
                                         # abandon this response and queue a new job (which can lead to pickup timeouts).
@@ -3510,13 +3552,28 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                                 is_recaptcha_failure = True
                                             elif "recaptcha validation failed" in str(body_text).lower():
                                                 is_recaptcha_failure = True
+                                            elif "recaptcha" in str(body_text).lower():
+                                                is_recaptcha_failure = True
                                         except Exception:
                                             is_recaptcha_failure = False
 
                                         if transport_used == "userscript":
-                                            # The proxy is our only truly streaming browser transport. Prefer retrying
-                                            # it with a fresh in-page token mint over switching to buffered browser
-                                            # fetch fallbacks (which can stall SSE).
+                                            # For reCAPTCHA failures, the in-page proxy retry path (v3 retry + v2
+                                            # fallback) is the most reliable streaming transport. For *non*-reCAPTCHA
+                                            # 403s (e.g. Access denied / bot mitigation), fall back to Chrome/Camoufox
+                                            # fetch transports which can succeed with a different browser fingerprint.
+                                            if not is_recaptcha_failure:
+                                                debug_print(
+                                                    "🚫 Userscript proxy received non-reCAPTCHA 403. Falling back to browser fetch transports..."
+                                                )
+                                                disable_userscript_for_request = True
+                                                if isinstance(payload, dict):
+                                                    payload["recaptchaV3Token"] = ""
+                                                    payload.pop("recaptchaV2Token", None)
+                                                async for ka in wait_with_keepalive(0.5):
+                                                    yield ka
+                                                continue
+
                                             force_proxy_recaptcha_mint = True
                                             if is_recaptcha_failure:
                                                 recaptcha_403_failures += 1
@@ -3608,6 +3665,23 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                             continue
 
                                         # If 403 but not recaptcha, might be other auth issue, but let's retry anyway
+                                        if transport_used in ("chrome", "camoufox"):
+                                            if transport_used == "chrome":
+                                                debug_print(
+                                                    "🚫 Non-reCAPTCHA 403 in Chrome fetch. Switching to Camoufox..."
+                                                )
+                                                prefer_chrome_transport = False
+                                            else:
+                                                debug_print(
+                                                    "🚫 Non-reCAPTCHA 403 in Camoufox fetch. Switching to Chrome..."
+                                                )
+                                                prefer_chrome_transport = True
+                                            if isinstance(payload, dict):
+                                                payload["recaptchaV3Token"] = ""
+                                                payload.pop("recaptchaV2Token", None)
+                                            async for ka in wait_with_keepalive(0.5):
+                                                yield ka
+                                            continue
                                         async for ka in wait_with_keepalive(2.0):
                                             yield ka
                                         continue
@@ -3885,13 +3959,15 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                 upstream_hint: Optional[str] = None
                                 proxy_status: Optional[int] = None
                                 proxy_headers: Optional[dict] = None
+                                proxy_error: Optional[str] = None
                                 if transport_used == "userscript":
                                     try:
                                         proxy_job_id = str(getattr(stream_context, "job_id", "") or "").strip()
                                         proxy_job = _USERSCRIPT_PROXY_JOBS.get(proxy_job_id)
                                         if isinstance(proxy_job, dict):
                                             if proxy_job.get("error"):
-                                                upstream_hint = str(proxy_job.get("error") or "")
+                                                proxy_error = str(proxy_job.get("error") or "")
+                                                upstream_hint = proxy_error
                                             status = proxy_job.get("status_code")
                                             headers = proxy_job.get("headers")
                                             if isinstance(headers, dict):
@@ -3902,17 +3978,22 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                     except Exception:
                                         pass
 
-                                if not upstream_hint and unhandled_preview:
-                                    # Common case: upstream returns a JSON error body (not a0:/ad: lines).
+                                # Prefer a hint from the actual upstream body over a generic proxy status message.
+                                if unhandled_preview:
+                                    parsed_hint: Optional[str] = None
                                     try:
                                         obj = json.loads(unhandled_preview[0])
                                         if isinstance(obj, dict):
-                                            upstream_hint = str(obj.get("error") or obj.get("message") or "")
+                                            parsed_hint = str(obj.get("error") or obj.get("message") or "")
                                     except Exception:
-                                        pass
-                                    
-                                    if not upstream_hint:
-                                        upstream_hint = unhandled_preview[0][:500]
+                                        parsed_hint = None
+                                    if not parsed_hint:
+                                        parsed_hint = unhandled_preview[0][:500]
+                                    if parsed_hint and (
+                                        (not upstream_hint)
+                                        or str(upstream_hint).startswith("Userscript proxy upstream HTTP")
+                                    ):
+                                        upstream_hint = parsed_hint
 
                                 debug_print(f"⚠️ Stream produced no content deltas (transport={transport_used}, attempt {attempt}). Retrying...")
                                 if upstream_hint:
@@ -3948,6 +4029,25 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                     yield "data: [DONE]\n\n"
                                     return
 
+                                # Proxy transport may hang even when it reports a status code (e.g. page-evaluate timeout).
+                                # Treat these as proxy-health failures and fall back to browser fetch transports.
+                                if transport_used == "userscript" and proxy_error:
+                                    lowered = str(proxy_error or "").lower()
+                                    if (
+                                        "camoufox proxy evaluate timeout" in lowered
+                                        or "userscript proxy timeout" in lowered
+                                    ):
+                                        debug_print(
+                                            f"鈿狅笍 Userscript proxy error: {proxy_error[:200]}. Falling back..."
+                                        )
+                                        disable_userscript_for_request = True
+                                        try:
+                                            _mark_userscript_proxy_inactive()
+                                        except Exception:
+                                            pass
+                                        yield ": keep-alive\n\n"
+                                        continue
+
                                 # If the userscript proxy actually returned an upstream HTTP error, don't spin forever
                                 # sending keep-alives: treat them as the equivalent upstream status and fall back.
                                 if transport_used == "userscript" and proxy_status in (
@@ -3980,6 +4080,19 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                             return
 
                                     if proxy_status == HTTPStatus.FORBIDDEN:
+                                        hint_lower = str(upstream_hint or "").lower()
+                                        is_recaptcha_like = ("recaptcha" in hint_lower) or ("captcha" in hint_lower)
+                                        if not is_recaptcha_like:
+                                            debug_print(
+                                                "🚫 Userscript proxy upstream 403 (non-reCAPTCHA). Falling back to browser fetch transports..."
+                                            )
+                                            disable_userscript_for_request = True
+                                            if isinstance(payload, dict):
+                                                payload["recaptchaV3Token"] = ""
+                                                payload.pop("recaptchaV2Token", None)
+                                            yield ": keep-alive\n\n"
+                                            continue
+
                                         recaptcha_403_failures += 1
                                         if recaptcha_403_failures >= 5:
                                             debug_print("❌ Too many reCAPTCHA failures in userscript proxy. Failing fast.")

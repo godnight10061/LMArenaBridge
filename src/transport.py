@@ -449,7 +449,8 @@ def _arena_auth_cookie_specs(token: str, *, page_url: Optional[str] = None) -> l
         return []
     specs: list[dict] = []
     for origin in _arena_origin_candidates(page_url):
-        specs.append({"name": "arena-auth-prod-v1", "value": value, "url": origin, "path": "/"})
+        # Playwright validates that cookie specs use either `url` OR `domain`+`path` (not `url`+`path`).
+        specs.append({"name": "arena-auth-prod-v1", "value": value, "url": origin})
     return specs
 
 
@@ -464,7 +465,8 @@ def _provisional_user_id_cookie_specs(provisional_user_id: str, *, page_url: Opt
         return []
     specs: list[dict] = []
     for origin in _arena_origin_candidates(page_url):
-        specs.append({"name": "provisional_user_id", "value": value, "url": origin, "path": "/"})
+        # Playwright validates that cookie specs use either `url` OR `domain`+`path` (not `url`+`path`).
+        specs.append({"name": "provisional_user_id", "value": value, "url": origin})
     for domain in (".lmarena.ai", ".arena.ai"):
         # When using domain, do NOT include path - they're mutually exclusive in Playwright
         specs.append({"name": "provisional_user_id", "value": value, "domain": domain})
@@ -710,9 +712,14 @@ async def fetch_lmarena_stream_via_chrome(
                             cookies_to_add.append(c)
                             continue
 
-                        # Do NOT overwrite/inject Cloudflare or reCAPTCHA cookies in the persistent profile.
-                        # The profile manages these itself; injecting stale ones from config causes 403s.
+                        # Cloudflare/BM/reCAPTCHA cookies can be highly fingerprinted and stale values can cause 403s.
+                        # However, a *fresh* config-provided clearance can help bootstrap a brand new persistent profile
+                        # (before it has any cookies at all). Never overwrite existing profile cookies, but allow
+                        # seeding when the profile is missing them entirely.
                         if name in ("cf_clearance", "__cf_bm", "_GRECAPTCHA"):
+                            if name in existing_names:
+                                continue
+                            cookies_to_add.append(c)
                             continue
 
                         # Avoid overwriting existing Cloudflare/session cookies in the persistent profile.
@@ -2135,7 +2142,6 @@ async def camoufox_proxy_worker():
                                 "name": "arena-auth-prod-v1",
                                 "value": "",
                                 "url": origin,
-                                "path": "/",
                                 "expires": 1,
                             }
                         )
@@ -2754,7 +2760,15 @@ async def camoufox_proxy_worker():
                     timeout=200.0
                 )
             except asyncio.TimeoutError:
-                await push_proxy_chunk(job_id, {"error": "camoufox proxy evaluate timeout", "done": True})
+                try:
+                    await _finalize_userscript_proxy_job(job_id, error="camoufox proxy evaluate timeout")
+                except Exception:
+                    await push_proxy_chunk(job_id, {"error": "camoufox proxy evaluate timeout", "done": True})
+                # The page can get stuck in a bad execution context after an evaluate timeout. Force a relaunch
+                # so subsequent jobs don't repeatedly hang.
+                browser = None
+                context = None
+                page = None
             except Exception as e:
                 await push_proxy_chunk(job_id, {"error": str(e), "done": True})
 
