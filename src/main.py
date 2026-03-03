@@ -25,6 +25,15 @@ from fastapi.security import APIKeyHeader
 
 import httpx
 
+# Support running as a script (as documented): `python src/main.py`.
+# When executed directly, Python sets `sys.path[0]` to `.../src`, which breaks
+# package-relative imports like `from . import constants`.
+if __name__ == "__main__" and __package__ in (None, ""):
+    repo_root = str(Path(__file__).resolve().parent.parent)
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+    __package__ = "src"
+
 # Import from modularized modules
 from . import constants
 from . import config as _config_module
@@ -4078,6 +4087,19 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                         payload["modelAMessageId"] = model_msg_id
                                         payload["modelBMessageId"] = model_b_msg_id
                                         debug_print("🔁 Retrying create-evaluation with fresh session/message IDs.")
+                                    elif (
+                                        session
+                                        and isinstance(payload, dict)
+                                        and http_method.upper() == "POST"
+                                        and "/nextjs-api/stream/post-to-evaluation/" in url
+                                    ):
+                                        user_msg_id = str(uuid7())
+                                        model_msg_id = str(uuid7())
+                                        model_b_msg_id = str(uuid7())
+                                        payload["userMessageId"] = user_msg_id
+                                        payload["modelAMessageId"] = model_msg_id
+                                        payload["modelBMessageId"] = model_b_msg_id
+                                        debug_print("🔁 Retrying post-to-evaluation with fresh message IDs.")
                                     async for ka in wait_with_keepalive(1.5):
                                         yield ka
                                 continue
