@@ -3071,7 +3071,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                     url=url,
                                     payload=payload if isinstance(payload, dict) else {},
                                     http_method=http_method,
-                                    timeout_seconds=120,
+                                    timeout_seconds=int(stream_total_timeout_seconds),
                                     streaming=True,
                                     auth_token=proxy_auth_token,
                                 )

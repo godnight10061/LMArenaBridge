@@ -7,28 +7,14 @@ from tests._stream_test_utils import BaseBridgeTest
 
 
 class TestStreamBrowserFetchNonRecaptcha403SwitchesTransport(BaseBridgeTest):
-    async def test_chrome_403_access_denied_switches_to_camoufox(self) -> None:
+    async def test_camoufox_403_access_denied_switches_to_chrome(self) -> None:
         chrome_calls: dict[str, int] = {"count": 0}
         camoufox_calls: dict[str, int] = {"count": 0}
 
-        chrome_resp = self.main.BrowserFetchStreamResponse(
+        camoufox_resp = self.main.BrowserFetchStreamResponse(
             status_code=403,
             headers={},
             text='{"error":"Access denied"}',
-            method="POST",
-            url="https://lmarena.ai/nextjs-api/stream/create-evaluation",
-        )
-
-        async def _chrome_stream(*args, **kwargs):  # noqa: ANN001
-            chrome_calls["count"] += 1
-            return chrome_resp
-
-        chrome_mock = AsyncMock(side_effect=_chrome_stream)
-
-        camoufox_resp = self.main.BrowserFetchStreamResponse(
-            status_code=200,
-            headers={},
-            text='a0:"Hello"\nad:{"finishReason":"stop"}\n',
             method="POST",
             url="https://lmarena.ai/nextjs-api/stream/create-evaluation",
         )
@@ -38,6 +24,20 @@ class TestStreamBrowserFetchNonRecaptcha403SwitchesTransport(BaseBridgeTest):
             return camoufox_resp
 
         camoufox_mock = AsyncMock(side_effect=_camoufox_stream)
+
+        chrome_resp = self.main.BrowserFetchStreamResponse(
+            status_code=200,
+            headers={},
+            text='a0:"Hello"\nad:{"finishReason":"stop"}\n',
+            method="POST",
+            url="https://lmarena.ai/nextjs-api/stream/create-evaluation",
+        )
+
+        async def _chrome_stream(*args, **kwargs):  # noqa: ANN001
+            chrome_calls["count"] += 1
+            return chrome_resp
+
+        chrome_mock = AsyncMock(side_effect=_chrome_stream)
 
         with (
             patch.object(self.main, "get_models") as get_models_mock,

@@ -67,6 +67,8 @@ class TestStreamUserscriptProxyLongDelayRespectsStreamDeadline(BaseBridgeTest):
             patch.object(self.main, "get_models") as get_models_mock,
             patch.object(self.main, "refresh_recaptcha_token", AsyncMock(return_value="recaptcha-token")),
             patch.object(self.main, "fetch_lmarena_stream_via_userscript_proxy", proxy_mock),
+            patch.object(self.main, "fetch_lmarena_stream_via_camoufox", AsyncMock(return_value=None)),
+            patch.object(self.main, "fetch_lmarena_stream_via_chrome", AsyncMock(return_value=None)),
             patch("src.main.print"),
         ):
             # Mark proxy as active so strict-model routing prefers it.

@@ -57,6 +57,10 @@ class TestStreamUserscriptProxyEvaluateTimeoutFallback(BaseBridgeTest):
 
         async def _chrome_stream(*args, **kwargs):  # noqa: ANN001
             chrome_calls["count"] += 1
+            # Proxy is a backup transport; force browser transports to fail on the first attempt
+            # so the userscript-proxy path is exercised.
+            if chrome_calls["count"] == 1:
+                return None
             return chrome_resp
 
         chrome_mock = AsyncMock(side_effect=_chrome_stream)
@@ -66,6 +70,7 @@ class TestStreamUserscriptProxyEvaluateTimeoutFallback(BaseBridgeTest):
             patch.object(self.main, "refresh_recaptcha_token", AsyncMock(return_value="recaptcha-token")),
             patch.object(self.main, "fetch_lmarena_stream_via_userscript_proxy", proxy_mock),
             patch.object(self.main, "fetch_lmarena_stream_via_chrome", chrome_mock),
+            patch.object(self.main, "fetch_lmarena_stream_via_camoufox", AsyncMock(return_value=None)),
             patch("src.main.print"),
         ):
             # Mark proxy as active so strict-model routing prefers it initially.

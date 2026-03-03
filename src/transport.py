@@ -468,8 +468,9 @@ def _provisional_user_id_cookie_specs(provisional_user_id: str, *, page_url: Opt
         # Playwright validates that cookie specs use either `url` OR `domain`+`path` (not `url`+`path`).
         specs.append({"name": "provisional_user_id", "value": value, "url": origin})
     for domain in (".lmarena.ai", ".arena.ai"):
-        # When using domain, do NOT include path - they're mutually exclusive in Playwright
-        specs.append({"name": "provisional_user_id", "value": value, "domain": domain})
+        # Playwright requires `domain`+`path` when not using `url`.
+        specs.append({"name": "provisional_user_id", "value": value, "domain": domain, "path": "/"})
+    return specs
 
 
 async def _get_arena_context_cookies(context, *, page_url: Optional[str] = None) -> list[dict]:
