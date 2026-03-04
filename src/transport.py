@@ -413,7 +413,10 @@ class UserscriptProxyStreamResponse:
             response = httpx.Response(503, request=request, content=str(job.get("error")).encode("utf-8"))
             raise httpx.HTTPStatusError("Userscript proxy error", request=request, response=response)
         status = int(self.status_code or 0)
-        if status == 0 or status >= 400:
+        # Userscript proxy jobs report upstream status asynchronously. A status of 0 means "unknown yet",
+        # not a transport failure; allow callers to keep consuming streaming lines until the job reports a
+        # real status code or times out.
+        if status >= 400:
             request = httpx.Request(self._method, self._url)
             response = httpx.Response(status or 502, request=request)
             raise httpx.HTTPStatusError(f"HTTP {status}", request=request, response=response)
