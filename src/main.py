@@ -1,5 +1,6 @@
 import asyncio
 import builtins as _builtins
+import html
 import json
 import os
 import re
@@ -24,6 +25,15 @@ from starlette.responses import HTMLResponse, RedirectResponse, StreamingRespons
 from fastapi.security import APIKeyHeader
 
 import httpx
+
+# Support running as a script (as documented): `python src/main.py`.
+# When executed directly, Python sets `sys.path[0]` to `.../src`, which breaks
+# package-relative imports like `from . import constants`.
+if __name__ == "__main__" and __package__ in (None, ""):
+    repo_root = str(Path(__file__).resolve().parent.parent)
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+    __package__ = "src"
 
 # Import from modularized modules
 from . import constants
@@ -566,8 +576,8 @@ API_KEY_HEADER = APIKeyHeader(name="Authorization", auto_error=False)
 # In-memory stores
 # { "api_key": { "conversation_id": session_data } }
 chat_sessions: Dict[str, Dict[str, dict]] = defaultdict(dict)
-# { "session_id": "username" }
-dashboard_sessions = {}
+# { "session_id": {"user": "admin", "csrf_token": "..."} }
+dashboard_sessions: Dict[str, dict] = {}
 # { "api_key": [timestamp1, timestamp2, ...] }
 api_key_usage = defaultdict(list)
 # { "model_id": count }
@@ -631,11 +641,79 @@ def load_usage_stats():
         debug_print(f"⚠️  Error loading usage stats: {e}, using empty stats")
         model_usage_stats = defaultdict(int)
 
-def save_config(config, *, preserve_auth_tokens: bool = True):
+
+def _escape_html(value: object) -> str:
     try:
-        # Avoid clobbering user-provided auth tokens when multiple tasks write config.json concurrently.
-        # Background refreshes/cookie upserts shouldn't overwrite auth tokens that may have been added via the dashboard.
-        if preserve_auth_tokens:
+        return html.escape(str(value), quote=True)
+    except Exception:
+        return ""
+
+
+def _safe_json_dumps_for_script(value: object) -> str:
+    """
+    JSON-dump a value and escape characters that can break out of <script> tags.
+
+    This prevents sequences like </script> from terminating the script element.
+    """
+    try:
+        dumped = json.dumps(value)
+    except Exception:
+        dumped = "null"
+    return (
+        dumped.replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("&", "\\u0026")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    )
+
+
+def _csrf_token_matches_session(session: object, csrf_token: object) -> bool:
+    if not isinstance(session, dict):
+        return False
+    expected = str(session.get("csrf_token") or "")
+    provided = str(csrf_token or "")
+    if not expected or not provided:
+        return False
+    try:
+        return secrets.compare_digest(expected, provided)
+    except Exception:
+        return False
+
+
+def _userscript_proxy_error_requires_fallback(proxy_error: str) -> bool:
+    lowered = str(proxy_error or "").lower()
+    return ("camoufox proxy evaluate timeout" in lowered) or ("userscript proxy timeout" in lowered)
+
+
+def _handle_userscript_proxy_timeout_error(proxy_error: str) -> bool:
+    """
+    Return True if a userscript proxy error should trigger fallback to other transports.
+
+    Side effects:
+    - Marks the userscript proxy as inactive (best-effort).
+    """
+    text = str(proxy_error or "").strip()
+    if not text:
+        return False
+    if not _userscript_proxy_error_requires_fallback(text):
+        return False
+    try:
+        _mark_userscript_proxy_inactive()
+    except Exception:
+        pass
+    return True
+
+def save_config(
+    config,
+    *,
+    preserve_auth_tokens: bool = True,
+    preserve_api_keys: bool = True,
+):
+    try:
+        # Avoid clobbering user-provided auth tokens / API keys when multiple tasks write config.json concurrently.
+        # Background refreshes/cookie upserts shouldn't overwrite values that may have been changed via the dashboard.
+        if preserve_auth_tokens or preserve_api_keys:
             try:
                 with open(CONFIG_FILE, "r") as f:
                     on_disk = json.load(f)
@@ -643,13 +721,20 @@ def save_config(config, *, preserve_auth_tokens: bool = True):
                 on_disk = None
 
             if isinstance(on_disk, dict):
-                if "auth_tokens" in on_disk and isinstance(on_disk.get("auth_tokens"), list):
-                    config["auth_tokens"] = list(on_disk.get("auth_tokens") or [])
-                if "auth_token" in on_disk:
-                    config["auth_token"] = str(on_disk.get("auth_token") or "")
+                if preserve_auth_tokens:
+                    if "auth_tokens" in on_disk and isinstance(on_disk.get("auth_tokens"), list):
+                        config["auth_tokens"] = list(on_disk.get("auth_tokens") or [])
+                    if "auth_token" in on_disk:
+                        config["auth_token"] = str(on_disk.get("auth_token") or "")
 
-        # Persist in-memory stats to the config dict before saving
-        config["usage_stats"] = dict(model_usage_stats)
+                if preserve_api_keys and isinstance(on_disk.get("api_keys"), list):
+                    config["api_keys"] = list(on_disk.get("api_keys") or [])
+
+        # Persist in-memory stats to the config dict before saving.
+        try:
+            config["usage_stats"] = {str(k): int(v) for k, v in dict(model_usage_stats).items()}
+        except Exception:
+            config["usage_stats"] = {}
         tmp_path = f"{CONFIG_FILE}.tmp"
         with open(tmp_path, "w") as f:
             json.dump(config, f, indent=4)
@@ -683,9 +768,40 @@ def get_request_headers():
 
 async def get_current_session(request: Request):
     session_id = request.cookies.get("session_id")
-    if session_id and session_id in dashboard_sessions:
-        return dashboard_sessions[session_id]
-    return None
+    if not session_id:
+        return None
+
+    entry = dashboard_sessions.get(session_id)
+    if not entry:
+        return None
+
+    # Backward compat: older sessions stored just a username string.
+    if not isinstance(entry, dict):
+        entry = {"user": str(entry or "admin")}
+
+    # Ensure every session has a CSRF token.
+    try:
+        token = str(entry.get("csrf_token") or "").strip()
+    except Exception:
+        token = ""
+    if not token:
+        token = secrets.token_urlsafe(32)
+        entry["csrf_token"] = token
+
+    entry["session_id"] = session_id
+    dashboard_sessions[session_id] = entry
+    return entry
+
+
+def _require_dashboard_csrf_session(
+    session: dict = Depends(get_current_session),
+    csrf_token: str = Form(""),
+):
+    if not session:
+        return None
+    if not _csrf_token_matches_session(session, csrf_token):
+        raise HTTPException(status_code=403, detail="Invalid CSRF token.")
+    return session
 
 # --- API Key Authentication & Rate Limiting ---
 
@@ -1035,8 +1151,18 @@ async def startup_event():
 
     try:
         # Ensure config and models files exist
+        try:
+            with open(CONFIG_FILE, "r") as f:
+                raw_config = json.load(f)
+            if not isinstance(raw_config, dict):
+                raw_config = None
+        except Exception:
+            raw_config = None
+
         config = get_config()
-        if not config.get("api_keys"):
+        raw_api_keys = raw_config.get("api_keys") if isinstance(raw_config, dict) else None
+        should_generate_default_api_key = ("api_keys" not in (raw_config or {})) or (raw_api_keys is None)
+        if should_generate_default_api_key and not config.get("api_keys"):
             config["api_keys"] = [
                 {
                     "name": "Default Key",
@@ -1224,9 +1350,9 @@ async def login_submit(response: Response, password: str = Form(...)):
     config = get_config()
     if password == config.get("password"):
         session_id = str(uuid.uuid4())
-        dashboard_sessions[session_id] = "admin"
+        dashboard_sessions[session_id] = {"user": "admin", "csrf_token": secrets.token_urlsafe(32)}
         response = RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
-        response.set_cookie(key="session_id", value=session_id, httponly=True)
+        response.set_cookie(key="session_id", value=session_id, httponly=True, samesite="strict")
         return response
     return RedirectResponse(url="/login?error=1", status_code=status.HTTP_303_SEE_OTHER)
 
@@ -1258,38 +1384,49 @@ async def dashboard(session: str = Depends(get_current_session)):
             </body></html>
         """, status_code=500)
 
+    csrf_token = ""
+    try:
+        if isinstance(session, dict):
+            csrf_token = str(session.get("csrf_token") or "")
+    except Exception:
+        csrf_token = ""
+    csrf_token_html = _escape_html(csrf_token)
+
     # Render API Keys
     keys_html = ""
     for key in config["api_keys"]:
-        key_name = key.get("name") or "Unnamed Key"
-        key_value = key.get("key") or ""
+        key_name = _escape_html(key.get("name") or "Unnamed Key")
+        key_value = str(key.get("key") or "")
+        key_value_html = _escape_html(key_value)
         rpm_value = key.get("rpm", 60)
-        created_date = time.strftime('%Y-%m-%d %H:%M', time.localtime(key.get('created', 0)))
+        created_date = time.strftime("%Y-%m-%d %H:%M", time.localtime(key.get("created", 0)))
         keys_html += f"""
             <tr>
                 <td><strong>{key_name}</strong></td>
-                <td><code class="api-key-code">{key_value}</code></td>
+                <td><code class="api-key-code">{key_value_html}</code></td>
                 <td><span class="badge">{rpm_value} RPM</span></td>
                 <td><small>{created_date}</small></td>
                 <td>
-                    <form action='/delete-key' method='post' style='margin:0;' onsubmit='return confirm("Delete this API key?");'>
-                        <input type='hidden' name='key_id' value='{key_value}'>
-                        <button type='submit' class='btn-delete'>Delete</button>
+                    <form action="/delete-key" method="post" style="margin:0;" onsubmit="return confirm('Delete this API key?');">
+                        <input type="hidden" name="csrf_token" value="{csrf_token_html}">
+                        <input type="hidden" name="key_id" value="{key_value_html}">
+                        <button type="submit" class="btn-delete">Delete</button>
                     </form>
                 </td>
             </tr>
         """
 
     # Render Models (limit to first 20 with text output)
-    text_models = [m for m in models if m.get('capabilities', {}).get('outputCapabilities', {}).get('text')]
+    text_models = [m for m in models if m.get("capabilities", {}).get("outputCapabilities", {}).get("text")]
     models_html = ""
     for i, model in enumerate(text_models[:20]):
-        rank = model.get('rank', '?')
-        org = model.get('organization', 'Unknown')
+        rank = _escape_html(model.get("rank", "?"))
+        org = _escape_html(model.get("organization", "Unknown"))
+        public_name = _escape_html(model.get("publicName", "Unnamed"))
         models_html += f"""
             <div class="model-card">
                 <div class="model-header">
-                    <span class="model-name">{model.get('publicName', 'Unnamed')}</span>
+                    <span class="model-name">{public_name}</span>
                     <span class="model-rank">Rank {rank}</span>
                 </div>
                 <div class="model-org">{org}</div>
@@ -1303,7 +1440,7 @@ async def dashboard(session: str = Depends(get_current_session)):
     stats_html = ""
     if model_usage_stats:
         for model, count in sorted(model_usage_stats.items(), key=lambda x: x[1], reverse=True)[:10]:
-            stats_html += f"<tr><td>{model}</td><td><strong>{count}</strong></td></tr>"
+            stats_html += f"<tr><td>{_escape_html(model)}</td><td><strong>{int(count)}</strong></td></tr>"
     else:
         stats_html = "<tr><td colspan='2' class='no-data'>No usage data yet</td></tr>"
 
@@ -1693,6 +1830,7 @@ async def dashboard(session: str = Depends(get_current_session)):
                     
                     <h3 style="margin-top: 30px; margin-bottom: 15px; font-size: 18px;">Create New API Key</h3>
                     <form action="/create-key" method="post">
+                        <input type="hidden" name="csrf_token" value="{csrf_token_html}">
                         <div class="form-row">
                             <div class="form-group">
                                 <label for="name">Key Name</label>
@@ -1752,7 +1890,7 @@ async def dashboard(session: str = Depends(get_current_session)):
             
             <script>
                 // Prepare data for charts
-                const statsData = {json.dumps(dict(sorted(model_usage_stats.items(), key=lambda x: x[1], reverse=True)[:10]))};
+                const statsData = {_safe_json_dumps_for_script(dict(sorted(model_usage_stats.items(), key=lambda x: x[1], reverse=True)[:10]))};
                 const modelNames = Object.keys(statsData);
                 const modelCounts = Object.values(statsData);
                 
@@ -1873,31 +2011,43 @@ async def update_auth_token(session: str = Depends(get_current_session), auth_to
     return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
 
 @app.post("/create-key")
-async def create_key(session: str = Depends(get_current_session), name: str = Form(...), rpm: int = Form(...)):
+async def create_key(
+    session: dict = Depends(_require_dashboard_csrf_session),
+    name: str = Form(...),
+    rpm: int = Form(...),
+):
     if not session:
         return RedirectResponse(url="/login")
     try:
         config = get_config()
+        safe_name = " ".join(str(name or "").strip().split())
+        if not safe_name:
+            safe_name = "Unnamed Key"
+        safe_name = safe_name[:80]
         new_key = {
-            "name": name.strip(),
+            "name": safe_name,
             "key": f"sk-lmab-{uuid.uuid4()}",
             "rpm": max(1, min(rpm, 1000)),  # Clamp between 1-1000
             "created": int(time.time())
         }
         config["api_keys"].append(new_key)
-        save_config(config)
+        save_config(config, preserve_api_keys=False)
     except Exception as e:
         debug_print(f"❌ Error creating key: {e}")
     return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
 
 @app.post("/delete-key")
-async def delete_key(session: str = Depends(get_current_session), key_id: str = Form(...)):
+async def delete_key(
+    session: dict = Depends(_require_dashboard_csrf_session),
+    key_id: str = Form(...),
+):
     if not session:
         return RedirectResponse(url="/login")
     try:
+        key_id = str(key_id or "").strip()
         config = get_config()
         config["api_keys"] = [k for k in config["api_keys"] if k["key"] != key_id]
-        save_config(config)
+        save_config(config, preserve_api_keys=False)
     except Exception as e:
         debug_print(f"❌ Error deleting key: {e}")
     return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
@@ -2666,6 +2816,26 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                         yield ": keep-alive\n\n"
 
                 chunk_id = f"chatcmpl-{uuid.uuid4()}"
+
+                # Emit an early OpenAI-style chunk so SSE clients that ignore comment keep-alives
+                # still receive a valid `data:` event promptly.
+                try:
+                    role_chunk = {
+                        "id": chunk_id,
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": model_public_name,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"role": "assistant"},
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                    yield f"data: {json.dumps(role_chunk)}\n\n"
+                except Exception:
+                    pass
                 
                 # Helper to keep connection alive during backoff
                 async def wait_with_keepalive(seconds: float):
@@ -2698,7 +2868,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                 elif use_browser_transports and force_browser_transports_in_stream:
                     debug_print("⚠️ Stream mode without auth token: preferring userscript proxy / browser fetch transports.")
                 elif use_browser_transports and proxy_active_at_start:
-                    debug_print("🦊 Userscript proxy is ACTIVE: routing stream through proxy and skipping side-channel reCAPTCHA mint.")
+                    debug_print("🦊 Userscript proxy is ACTIVE: enabling proxy fallback and skipping side-channel reCAPTCHA mint.")
 
                 # Non-strict models: mint a fresh side-channel token before the first upstream attempt so we don't
                 # send an empty `recaptchaV3Token` (which commonly yields 403 "recaptcha validation failed").
@@ -2738,6 +2908,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                     # Abort if the client disconnects.
                     try:
                         if await request.is_disconnected():
+                            debug_print("⚠️ Client disconnected; ending stream.")
                             return
                     except Exception:
                         pass
@@ -2766,9 +2937,8 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                             stream_context = None
                             transport_used = "httpx"
                             
-                            # Userscript proxy is now a backup-only transport.  We check
-                            # availability here but defer actually using it until after
-                            # browser transports have been attempted.
+                            # Userscript proxy: usually a fallback transport, but it becomes primary when no upstream
+                            # auth token is configured (it can maintain a logged-in browser session via cookies).
                             use_userscript = False
                             cfg_now = None
                             userscript_proxy_available = False
@@ -2807,7 +2977,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
 
                                 if proxy_active:
                                     userscript_proxy_available = True
-                                    debug_print("🌐 Userscript Proxy is ACTIVE (will use as backup after browser transports).")
+                                    debug_print("🌐 Userscript Proxy is ACTIVE.")
                                 # Default behavior: mint in-page (higher success rate than side-channel cached tokens).
                                 # Optional: allow pre-filling a cached token for speed via config flag.
                                 try:
@@ -2834,6 +3004,11 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                 stream_context is None
                                 and use_browser_transports
                                 and not use_userscript
+                                and not (
+                                    proxy_active_at_start
+                                    and userscript_proxy_available
+                                    and not disable_userscript_for_request
+                                )
                                 and isinstance(payload, dict)
                                 and not strict_token_prefill_attempted
                                 and not str(payload.get("recaptchaV3Token") or "").strip()
@@ -2856,6 +3031,51 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                     if new_token:
                                         payload["recaptchaV3Token"] = new_token
 
+                            userscript_stream_attempted = False
+
+                            async def _start_userscript_proxy_stream() -> Optional[object]:
+                                nonlocal use_userscript, transport_used, userscript_stream_attempted
+                                userscript_stream_attempted = True
+                                use_userscript = True
+                                debug_print(
+                                    f"?? Delegating request to Userscript Proxy (poll active {int(time.time() - last_userscript_poll)}s ago)..."
+                                )
+                                proxy_auth_token = str(current_token or "").strip()
+                                try:
+                                    if (
+                                        proxy_auth_token
+                                        and not str(proxy_auth_token).startswith("base64-")
+                                        and is_arena_auth_token_expired(proxy_auth_token, skew_seconds=0)
+                                    ):
+                                        proxy_auth_token = ""
+                                except Exception:
+                                    pass
+                                stream = await fetch_via_proxy_queue(
+                                    url=url,
+                                    payload=payload if isinstance(payload, dict) else {},
+                                    http_method=http_method,
+                                    timeout_seconds=int(stream_total_timeout_seconds),
+                                    streaming=True,
+                                    auth_token=proxy_auth_token,
+                                )
+                                if stream is None:
+                                    debug_print("?? Userscript Proxy returned None (timeout?). Falling back...")
+                                    use_userscript = False
+                                    return None
+                                transport_used = "userscript"
+                                return stream
+
+                            # When no upstream auth token is configured, prefer the proxy first: it can perform
+                            # anonymous signup and maintain session cookies for strict models.
+                            if (
+                                stream_context is None
+                                and userscript_proxy_available
+                                and not disable_userscript_for_request
+                                and not str(current_token or "").strip()
+                            ):
+                                stream_context = await _start_userscript_proxy_stream()
+
+                            # When we do have a usable auth token, try browser fetch transports first.
                             if stream_context is None and use_browser_transports:
                                 browser_fetch_attempts = 5
                                 try:
@@ -3010,48 +3230,35 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                     if stream_context is not None:
                                         transport_used = "camoufox"
                                     if stream_context is None:
-                                        chrome_task = asyncio.create_task(_try_chrome_fetch())
-                                        while True:
-                                            done, _ = await asyncio.wait({chrome_task}, timeout=1.0)
-                                            if chrome_task in done:
-                                                try:
-                                                    stream_context = chrome_task.result()
-                                                except Exception:
-                                                    stream_context = None
-                                                break
-                                            yield ": keep-alive\n\n"
-                                        if stream_context is not None:
-                                            transport_used = "chrome"
+                                        # When no upstream auth token is configured, Chrome fetch frequently provides no
+                                        # additional value (it cannot sign up anonymously) and can trigger client-side
+                                        # disconnects on some Windows setups. If a userscript/camoufox proxy is active,
+                                        # prefer falling back to it instead of launching Chrome here.
+                                        if userscript_proxy_available and (not str(current_token or "").strip()):
+                                            debug_print("🦊 No auth token configured; skipping Chrome fetch and falling back to Userscript proxy...")
+                                        else:
+                                            chrome_task = asyncio.create_task(_try_chrome_fetch())
+                                            while True:
+                                                done, _ = await asyncio.wait({chrome_task}, timeout=1.0)
+                                                if chrome_task in done:
+                                                    try:
+                                                        stream_context = chrome_task.result()
+                                                    except Exception:
+                                                        stream_context = None
+                                                    break
+                                                yield ": keep-alive\n\n"
+                                            if stream_context is not None:
+                                                transport_used = "chrome"
 
-                            # Userscript proxy: backup transport after browser transports fail.
-                            if stream_context is None and userscript_proxy_available and not disable_userscript_for_request:
-                                use_userscript = True
-                                debug_print(
-                                    f"📫 Delegating request to Userscript Proxy (poll active {int(time.time() - last_userscript_poll)}s ago)..."
-                                )
-                                proxy_auth_token = str(current_token or "").strip()
-                                try:
-                                    if (
-                                        proxy_auth_token
-                                        and not str(proxy_auth_token).startswith("base64-")
-                                        and is_arena_auth_token_expired(proxy_auth_token, skew_seconds=0)
-                                    ):
-                                        proxy_auth_token = ""
-                                except Exception:
-                                    pass
-                                stream_context = await fetch_via_proxy_queue(
-                                    url=url,
-                                    payload=payload if isinstance(payload, dict) else {},
-                                    http_method=http_method,
-                                    timeout_seconds=120,
-                                    streaming=True,
-                                    auth_token=proxy_auth_token,
-                                )
-                                if stream_context is None:
-                                    debug_print("⚠️ Userscript Proxy returned None (timeout?). Falling back to cloudscraper...")
-                                    use_userscript = False
-                                else:
-                                    transport_used = "userscript"
+                            # Userscript proxy: fallback transport after browser transports fail (or if proxy-first
+                            # was attempted but returned None).
+                            if (
+                                stream_context is None
+                                and userscript_proxy_available
+                                and not disable_userscript_for_request
+                                and not userscript_stream_attempted
+                            ):
+                                stream_context = await _start_userscript_proxy_stream()
 
                             if stream_context is None:
                                 # Last-resort: httpx streaming fallback.
@@ -3410,6 +3617,21 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                         proxy_done_event = None
                                         if isinstance(proxy_job, dict):
                                             proxy_done_event = proxy_job.get("done_event")
+                                        proxy_error = ""
+                                        try:
+                                            if isinstance(proxy_job, dict) and proxy_job.get("error"):
+                                                proxy_error = str(proxy_job.get("error") or "")
+                                        except Exception:
+                                            proxy_error = ""
+                                        if proxy_error:
+                                            if _handle_userscript_proxy_timeout_error(proxy_error):
+                                                debug_print(
+                                                    f"鈿狅笍 Userscript proxy error: {proxy_error[:200]}. Falling back..."
+                                                )
+                                                disable_userscript_for_request = True
+                                                async for ka in wait_with_keepalive(0.5):
+                                                    yield ka
+                                                continue
 
                                         # Give the proxy a chance to finish its in-page reCAPTCHA retry path before we
                                         # abandon this response and queue a new job (which can lead to pickup timeouts).
@@ -3433,7 +3655,8 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                                 time.monotonic() - stream_started_at
                                             )
                                             remaining_budget = max(0.0, remaining_budget)
-                                            max_wait_seconds = min(max(float(grace_seconds), 200.0), remaining_budget)
+                                            # Wait only for the configured grace window (bounded by remaining budget).
+                                            max_wait_seconds = min(float(grace_seconds), remaining_budget)
 
                                             debug_print(
                                                 f"⏳ Userscript proxy reported 403. Waiting up to {int(max_wait_seconds)}s for in-page retry..."
@@ -3492,6 +3715,45 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                             error_body = None
                                             # If it's not JSON, we'll use the body_text for keyword matching.
 
+                                        # Userscript proxy: `aread()` drains only already-queued lines. The proxy can
+                                        # report 403 status before it finishes emitting the upstream error body (JSON),
+                                        # which would cause us to misclassify reCAPTCHA failures as "access denied" and
+                                        # disable the proxy prematurely. Wait briefly for body lines to arrive.
+                                        if (not body_text) and isinstance(proxy_job, dict):
+                                            q = proxy_job.get("lines_queue")
+                                            done_ev = proxy_job.get("done_event")
+                                            try:
+                                                wait_seconds = float(
+                                                    get_config().get("userscript_proxy_error_body_wait_seconds", 2.0)
+                                                )
+                                            except Exception:
+                                                wait_seconds = 2.0
+                                            wait_seconds = max(0.0, min(wait_seconds, 10.0))
+                                            if wait_seconds > 0.0 and isinstance(q, asyncio.Queue):
+                                                deadline = time.monotonic() + float(wait_seconds)
+                                                while time.monotonic() < deadline:
+                                                    if not q.empty():
+                                                        break
+                                                    if isinstance(done_ev, asyncio.Event) and done_ev.is_set():
+                                                        break
+                                                    yield ": keep-alive\n\n"
+                                                    await asyncio.sleep(0.25)
+                                                items: list[str] = []
+                                                try:
+                                                    while True:
+                                                        item = q.get_nowait()
+                                                        if item is None:
+                                                            break
+                                                        items.append(str(item))
+                                                except Exception:
+                                                    pass
+                                                if items:
+                                                    body_text = "\n".join(items)
+                                                    try:
+                                                        error_body = json.loads(body_text)
+                                                    except Exception:
+                                                        error_body = None
+
                                         is_recaptcha_failure = False
                                         try:
                                             if (
@@ -3501,13 +3763,28 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                                 is_recaptcha_failure = True
                                             elif "recaptcha validation failed" in str(body_text).lower():
                                                 is_recaptcha_failure = True
+                                            elif "recaptcha" in str(body_text).lower():
+                                                is_recaptcha_failure = True
                                         except Exception:
                                             is_recaptcha_failure = False
 
                                         if transport_used == "userscript":
-                                            # The proxy is our only truly streaming browser transport. Prefer retrying
-                                            # it with a fresh in-page token mint over switching to buffered browser
-                                            # fetch fallbacks (which can stall SSE).
+                                            # For reCAPTCHA failures, the in-page proxy retry path (v3 retry + v2
+                                            # fallback) is the most reliable streaming transport. For *non*-reCAPTCHA
+                                            # 403s (e.g. Access denied / bot mitigation), fall back to Chrome/Camoufox
+                                            # fetch transports which can succeed with a different browser fingerprint.
+                                            if not is_recaptcha_failure:
+                                                debug_print(
+                                                    "🚫 Userscript proxy received non-reCAPTCHA 403. Falling back to browser fetch transports..."
+                                                )
+                                                disable_userscript_for_request = True
+                                                if isinstance(payload, dict):
+                                                    payload["recaptchaV3Token"] = ""
+                                                    payload.pop("recaptchaV2Token", None)
+                                                async for ka in wait_with_keepalive(0.5):
+                                                    yield ka
+                                                continue
+
                                             force_proxy_recaptcha_mint = True
                                             if is_recaptcha_failure:
                                                 recaptcha_403_failures += 1
@@ -3599,6 +3876,23 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                             continue
 
                                         # If 403 but not recaptcha, might be other auth issue, but let's retry anyway
+                                        if transport_used in ("chrome", "camoufox"):
+                                            if transport_used == "chrome":
+                                                debug_print(
+                                                    "🚫 Non-reCAPTCHA 403 in Chrome fetch. Switching to Camoufox..."
+                                                )
+                                                prefer_chrome_transport = False
+                                            else:
+                                                debug_print(
+                                                    "🚫 Non-reCAPTCHA 403 in Camoufox fetch. Switching to Chrome..."
+                                                )
+                                                prefer_chrome_transport = True
+                                            if isinstance(payload, dict):
+                                                payload["recaptchaV3Token"] = ""
+                                                payload.pop("recaptchaV2Token", None)
+                                            async for ka in wait_with_keepalive(0.5):
+                                                yield ka
+                                            continue
                                         async for ka in wait_with_keepalive(2.0):
                                             yield ka
                                         continue
@@ -3689,9 +3983,32 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                         if pending is not None and not pending.done():
                                             pending.cancel()
 
+                                # If we never see any usable deltas, don't keep the client socket open forever
+                                # emitting keep-alives. Abort the attempt so retry/fallback logic can run.
+                                try:
+                                    first_delta_timeout_seconds = float(
+                                        get_config().get("stream_first_delta_timeout_seconds", 120)
+                                    )
+                                except Exception:
+                                    first_delta_timeout_seconds = 120.0
+                                first_delta_timeout_seconds = max(
+                                    10.0, min(float(first_delta_timeout_seconds), float(stream_total_timeout_seconds))
+                                )
+                                first_delta_deadline = time.monotonic() + float(first_delta_timeout_seconds)
+                                saw_delta = False
+
                                 async for maybe_line in _aiter_with_keepalive(response.aiter_lines().__aiter__()):
                                     if maybe_line is None:
                                         yield ": keep-alive\n\n"
+                                        if (not saw_delta) and (time.monotonic() > float(first_delta_deadline)):
+                                            if not unhandled_preview:
+                                                unhandled_preview.append(
+                                                    f"stream_first_delta_timeout after {int(first_delta_timeout_seconds)}s"
+                                                )
+                                            debug_print(
+                                                f"⚠️ Upstream produced no content deltas for {int(first_delta_timeout_seconds)}s. Aborting attempt."
+                                            )
+                                            break
                                         continue
 
                                     line = str(maybe_line).strip()
@@ -3707,6 +4024,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                         try:
                                             reasoning_chunk = json.loads(chunk_data)
                                             reasoning_text += reasoning_chunk
+                                            saw_delta = True
                                             
                                             # Send SSE-formatted chunk with reasoning_content
                                             chunk_response = {
@@ -3733,6 +4051,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                         try:
                                             text_chunk = json.loads(chunk_data)
                                             response_text += text_chunk
+                                            saw_delta = True
                                             
                                             # Send SSE-formatted chunk
                                             chunk_response = {
@@ -3765,6 +4084,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                                     image_url = image_obj.get('image', '')
                                                     # Format as markdown for streaming
                                                     response_text = f"![Generated Image]({image_url})"
+                                                    saw_delta = True
                                                     
                                                     # Send the markdown-formatted image in a chunk
                                                     chunk_response = {
@@ -3837,33 +4157,48 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                     
                                     # Support for standard OpenAI-style JSON chunks (some proxies or new LMArena endpoints)
                                     elif line.startswith("{"):
+                                        handled_json_line = False
                                         try:
                                             chunk_obj = json.loads(line)
-                                            # If it looks like an OpenAI chunk, extract the delta content
-                                            if "choices" in chunk_obj and isinstance(chunk_obj["choices"], list) and len(chunk_obj["choices"]) > 0:
-                                                delta = chunk_obj["choices"][0].get("delta", {})
-                                                
-                                                # Handle thinking/reasoning
-                                                if "reasoning_content" in delta:
-                                                    r_chunk = str(delta["reasoning_content"] or "")
-                                                    reasoning_text += r_chunk
-                                                    chunk_response = {
-                                                        "id": chunk_id, "object": "chat.completion.chunk", "created": int(time.time()), "model": model_public_name,
-                                                        "choices": [{"index": 0, "delta": {"reasoning_content": r_chunk}, "finish_reason": None}]
-                                                    }
-                                                    yield f"data: {json.dumps(chunk_response)}\n\n"
-
-                                                # Handle text content
-                                                if "content" in delta:
-                                                    c_chunk = str(delta["content"] or "")
-                                                    response_text += c_chunk
-                                                    chunk_response = {
-                                                        "id": chunk_id, "object": "chat.completion.chunk", "created": int(time.time()), "model": model_public_name,
-                                                        "choices": [{"index": 0, "delta": {"content": c_chunk}, "finish_reason": None}]
-                                                    }
-                                                    yield f"data: {json.dumps(chunk_response)}\n\n"
                                         except Exception:
-                                            pass
+                                            chunk_obj = None
+
+                                        # If it looks like an OpenAI chunk, extract the delta content
+                                        if (
+                                            isinstance(chunk_obj, dict)
+                                            and "choices" in chunk_obj
+                                            and isinstance(chunk_obj.get("choices"), list)
+                                            and len(chunk_obj["choices"]) > 0
+                                        ):
+                                            delta = chunk_obj["choices"][0].get("delta", {})
+                                            
+                                            # Handle thinking/reasoning
+                                            if "reasoning_content" in delta:
+                                                r_chunk = str(delta["reasoning_content"] or "")
+                                                reasoning_text += r_chunk
+                                                saw_delta = True
+                                                handled_json_line = True
+                                                chunk_response = {
+                                                    "id": chunk_id, "object": "chat.completion.chunk", "created": int(time.time()), "model": model_public_name,
+                                                    "choices": [{"index": 0, "delta": {"reasoning_content": r_chunk}, "finish_reason": None}]
+                                                }
+                                                yield f"data: {json.dumps(chunk_response)}\n\n"
+
+                                            # Handle text content
+                                            if "content" in delta:
+                                                c_chunk = str(delta["content"] or "")
+                                                response_text += c_chunk
+                                                saw_delta = True
+                                                handled_json_line = True
+                                                chunk_response = {
+                                                    "id": chunk_id, "object": "chat.completion.chunk", "created": int(time.time()), "model": model_public_name,
+                                                    "choices": [{"index": 0, "delta": {"content": c_chunk}, "finish_reason": None}]
+                                                }
+                                                yield f"data: {json.dumps(chunk_response)}\n\n"
+
+                                        # Preserve non-OpenAI JSON lines for upstream hint extraction (e.g. error payloads).
+                                        if (not handled_json_line) and len(unhandled_preview) < 5:
+                                            unhandled_preview.append(line)
 
                                     else:
                                         # Capture a small preview of unhandled upstream lines for troubleshooting.
@@ -3876,13 +4211,15 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                 upstream_hint: Optional[str] = None
                                 proxy_status: Optional[int] = None
                                 proxy_headers: Optional[dict] = None
+                                proxy_error: Optional[str] = None
                                 if transport_used == "userscript":
                                     try:
                                         proxy_job_id = str(getattr(stream_context, "job_id", "") or "").strip()
                                         proxy_job = _USERSCRIPT_PROXY_JOBS.get(proxy_job_id)
                                         if isinstance(proxy_job, dict):
                                             if proxy_job.get("error"):
-                                                upstream_hint = str(proxy_job.get("error") or "")
+                                                proxy_error = str(proxy_job.get("error") or "")
+                                                upstream_hint = proxy_error
                                             status = proxy_job.get("status_code")
                                             headers = proxy_job.get("headers")
                                             if isinstance(headers, dict):
@@ -3893,17 +4230,22 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                     except Exception:
                                         pass
 
-                                if not upstream_hint and unhandled_preview:
-                                    # Common case: upstream returns a JSON error body (not a0:/ad: lines).
+                                # Prefer a hint from the actual upstream body over a generic proxy status message.
+                                if unhandled_preview:
+                                    parsed_hint: Optional[str] = None
                                     try:
                                         obj = json.loads(unhandled_preview[0])
                                         if isinstance(obj, dict):
-                                            upstream_hint = str(obj.get("error") or obj.get("message") or "")
+                                            parsed_hint = str(obj.get("error") or obj.get("message") or "")
                                     except Exception:
-                                        pass
-                                    
-                                    if not upstream_hint:
-                                        upstream_hint = unhandled_preview[0][:500]
+                                        parsed_hint = None
+                                    if not parsed_hint:
+                                        parsed_hint = unhandled_preview[0][:500]
+                                    if parsed_hint and (
+                                        (not upstream_hint)
+                                        or str(upstream_hint).startswith("Userscript proxy upstream HTTP")
+                                    ):
+                                        upstream_hint = parsed_hint
 
                                 debug_print(f"⚠️ Stream produced no content deltas (transport={transport_used}, attempt {attempt}). Retrying...")
                                 if upstream_hint:
@@ -3939,6 +4281,17 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                     yield "data: [DONE]\n\n"
                                     return
 
+                                # Proxy transport may hang even when it reports a status code (e.g. page-evaluate timeout).
+                                # Treat these as proxy-health failures and fall back to browser fetch transports.
+                                if transport_used == "userscript" and proxy_error:
+                                    if _handle_userscript_proxy_timeout_error(proxy_error):
+                                        debug_print(
+                                            f"鈿狅笍 Userscript proxy error: {proxy_error[:200]}. Falling back..."
+                                        )
+                                        disable_userscript_for_request = True
+                                        yield ": keep-alive\n\n"
+                                        continue
+
                                 # If the userscript proxy actually returned an upstream HTTP error, don't spin forever
                                 # sending keep-alives: treat them as the equivalent upstream status and fall back.
                                 if transport_used == "userscript" and proxy_status in (
@@ -3971,6 +4324,19 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                             return
 
                                     if proxy_status == HTTPStatus.FORBIDDEN:
+                                        hint_lower = str(upstream_hint or "").lower()
+                                        is_recaptcha_like = ("recaptcha" in hint_lower) or ("captcha" in hint_lower)
+                                        if not is_recaptcha_like:
+                                            debug_print(
+                                                "🚫 Userscript proxy upstream 403 (non-reCAPTCHA). Falling back to browser fetch transports..."
+                                            )
+                                            disable_userscript_for_request = True
+                                            if isinstance(payload, dict):
+                                                payload["recaptchaV3Token"] = ""
+                                                payload.pop("recaptchaV2Token", None)
+                                            yield ": keep-alive\n\n"
+                                            continue
+
                                         recaptcha_403_failures += 1
                                         if recaptcha_403_failures >= 5:
                                             debug_print("❌ Too many reCAPTCHA failures in userscript proxy. Failing fast.")
@@ -4078,6 +4444,19 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                         payload["modelAMessageId"] = model_msg_id
                                         payload["modelBMessageId"] = model_b_msg_id
                                         debug_print("🔁 Retrying create-evaluation with fresh session/message IDs.")
+                                    elif (
+                                        session
+                                        and isinstance(payload, dict)
+                                        and http_method.upper() == "POST"
+                                        and "/nextjs-api/stream/post-to-evaluation/" in url
+                                    ):
+                                        user_msg_id = str(uuid7())
+                                        model_msg_id = str(uuid7())
+                                        model_b_msg_id = str(uuid7())
+                                        payload["userMessageId"] = user_msg_id
+                                        payload["modelAMessageId"] = model_msg_id
+                                        payload["modelBMessageId"] = model_b_msg_id
+                                        debug_print("🔁 Retrying post-to-evaluation with fresh message IDs.")
                                     async for ka in wait_with_keepalive(1.5):
                                         yield ka
                                 continue
@@ -4128,6 +4507,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                     except asyncio.CancelledError:
                         # Client disconnected or server shutdown. Avoid leaking proxy jobs or surfacing noisy uvicorn
                         # "response not completed" warnings on cancellation.
+                        debug_print("⚠️ Stream task cancelled (client disconnected or server shutdown).")
                         try:
                             if transport_used == "userscript":
                                 jid = str(getattr(stream_context, "job_id", "") or "").strip()
@@ -4283,17 +4663,38 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                     debug_print("⚠️ Userscript Proxy returned None. Falling back...")
 
             if response is None:
-                if use_chrome_fetch_for_model:
+                if use_browser_fetch_for_model:
                     debug_print(f"🌐 Using Chrome fetch transport for non-streaming strict model ({model_public_name})...")
                     # Chrome fetch transport has its own internal reCAPTCHA retries, 
                     # but we add an outer loop here to handle token rotation (401) and rate limits (429).
                     max_chrome_retries = 3
                     for chrome_attempt in range(max_chrome_retries):
+                        # Prefer an ephemeral arena-auth cookie captured from browser sessions when no
+                        # user-configured auth token is available. This mirrors the streaming transport logic.
+                        auth_for_browser = str(current_token or "").strip()
+                        try:
+                            cand = str(EPHEMERAL_ARENA_AUTH_TOKEN or "").strip()
+                        except Exception:
+                            cand = ""
+                        if cand:
+                            try:
+                                if (
+                                    is_probably_valid_arena_auth_token(cand)
+                                    and not is_arena_auth_token_expired(cand, skew_seconds=0)
+                                    and (
+                                        (not auth_for_browser)
+                                        or (not is_probably_valid_arena_auth_token(auth_for_browser))
+                                        or is_arena_auth_token_expired(auth_for_browser, skew_seconds=0)
+                                    )
+                                ):
+                                    auth_for_browser = cand
+                            except Exception:
+                                auth_for_browser = cand
                         response = await fetch_lmarena_stream_via_chrome(
                             http_method=http_method,
                             url=url,
                             payload=payload if isinstance(payload, dict) else {},
-                            auth_token=current_token,
+                            auth_token=auth_for_browser,
                             timeout_seconds=120,
                         )
                         
@@ -4303,7 +4704,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                 http_method=http_method,
                                 url=url,
                                 payload=payload if isinstance(payload, dict) else {},
-                                auth_token=current_token,
+                                auth_token=auth_for_browser,
                                 timeout_seconds=120,
                             )
                             if response is None:

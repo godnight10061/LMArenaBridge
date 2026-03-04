@@ -251,9 +251,14 @@ async def _finalize_userscript_proxy_job(job_id: str, *, error: Optional[str] = 
 class UserscriptProxyStreamResponse:
     def __init__(self, job_id: str, timeout_seconds: int = 120):
         self.job_id = str(job_id)
-        self._status_code: int = 200
+        # Start as "unknown" until the proxy reports upstream status.
+        self._status_code: int = 0
         self._headers: dict = {}
-        self._timeout_seconds = int(timeout_seconds or 120)
+        try:
+            self._timeout_seconds = int(timeout_seconds or 120)
+        except Exception:
+            self._timeout_seconds = 120
+        self._timeout_seconds = max(5, min(self._timeout_seconds, 3600))
         self._method = "POST"
         self._url = "https://lmarena.ai/"
 
@@ -348,11 +353,27 @@ class UserscriptProxyStreamResponse:
         if not isinstance(q, asyncio.Queue) or not isinstance(done_event, asyncio.Event):
             return
 
-        deadline = _m().time.time() + float(max(5, self._timeout_seconds))
+        # Use an absolute deadline anchored to job creation so we don't extend timeouts by delaying
+        # when `aiter_lines()` is first consumed (e.g. status waits / preflight).
+        created_at_mono = 0.0
+        try:
+            created_at_mono = float(job.get("created_at_monotonic") or 0.0)
+        except Exception:
+            created_at_mono = 0.0
+        try:
+            timeout_seconds = float(job.get("timeout_seconds") or self._timeout_seconds)
+        except Exception:
+            timeout_seconds = float(self._timeout_seconds)
+        timeout_seconds = max(5.0, min(timeout_seconds, 3600.0))
+        deadline = (
+            (created_at_mono + timeout_seconds)
+            if created_at_mono > 0.0
+            else (_m().time.monotonic() + timeout_seconds)
+        )
         while True:
             if done_event.is_set() and q.empty():
                 break
-            remaining = deadline - _m().time.time()
+            remaining = deadline - _m().time.monotonic()
             if remaining <= 0:
                 job["error"] = job.get("error") or "userscript proxy timeout"
                 job["done"] = True
@@ -392,7 +413,10 @@ class UserscriptProxyStreamResponse:
             response = httpx.Response(503, request=request, content=str(job.get("error")).encode("utf-8"))
             raise httpx.HTTPStatusError("Userscript proxy error", request=request, response=response)
         status = int(self.status_code or 0)
-        if status == 0 or status >= 400:
+        # Userscript proxy jobs report upstream status asynchronously. A status of 0 means "unknown yet",
+        # not a transport failure; allow callers to keep consuming streaming lines until the job reports a
+        # real status code or times out.
+        if status >= 400:
             request = httpx.Request(self._method, self._url)
             response = httpx.Response(status or 502, request=request)
             raise httpx.HTTPStatusError(f"HTTP {status}", request=request, response=response)
@@ -449,7 +473,8 @@ def _arena_auth_cookie_specs(token: str, *, page_url: Optional[str] = None) -> l
         return []
     specs: list[dict] = []
     for origin in _arena_origin_candidates(page_url):
-        specs.append({"name": "arena-auth-prod-v1", "value": value, "url": origin, "path": "/"})
+        # Playwright validates that cookie specs use either `url` OR `domain`+`path` (not `url`+`path`).
+        specs.append({"name": "arena-auth-prod-v1", "value": value, "url": origin})
     return specs
 
 
@@ -464,10 +489,12 @@ def _provisional_user_id_cookie_specs(provisional_user_id: str, *, page_url: Opt
         return []
     specs: list[dict] = []
     for origin in _arena_origin_candidates(page_url):
-        specs.append({"name": "provisional_user_id", "value": value, "url": origin, "path": "/"})
+        # Playwright validates that cookie specs use either `url` OR `domain`+`path` (not `url`+`path`).
+        specs.append({"name": "provisional_user_id", "value": value, "url": origin})
     for domain in (".lmarena.ai", ".arena.ai"):
-        # When using domain, do NOT include path - they're mutually exclusive in Playwright
-        specs.append({"name": "provisional_user_id", "value": value, "domain": domain})
+        # Playwright requires `domain`+`path` when not using `url`.
+        specs.append({"name": "provisional_user_id", "value": value, "domain": domain, "path": "/"})
+    return specs
 
 
 async def _get_arena_context_cookies(context, *, page_url: Optional[str] = None) -> list[dict]:
@@ -551,8 +578,15 @@ async def fetch_lmarena_stream_via_userscript_proxy(
 
     proxy_url = _normalize_userscript_proxy_url(str(url))
     sitekey, action = _m().get_recaptcha_settings(config)
+    try:
+        job_timeout_seconds = int(timeout_seconds or 120)
+    except Exception:
+        job_timeout_seconds = 120
+    job_timeout_seconds = max(5, min(job_timeout_seconds, 3600))
     job = {
         "created_at": _m().time.time(),
+        "created_at_monotonic": float(_m().time.monotonic()),
+        "timeout_seconds": int(job_timeout_seconds),
         "job_id": job_id,
         # Job lifecycle markers used by the server-side stream handler to apply timeouts correctly.
         # - phase: queued -> picked_up -> signup -> fetch
@@ -581,13 +615,14 @@ async def fetch_lmarena_stream_via_userscript_proxy(
         "status_event": status_event,
         "picked_up_event": picked_up_event,
         "done": False,
-        "status_code": 200,
+        # Unknown until the proxy reports the upstream HTTP status.
+        "status_code": 0,
         "headers": {},
         "error": None,
     }
     _m()._USERSCRIPT_PROXY_JOBS[job_id] = job
     await _get_userscript_proxy_queue().put(job_id)
-    return UserscriptProxyStreamResponse(job_id, timeout_seconds=timeout_seconds)
+    return UserscriptProxyStreamResponse(job_id, timeout_seconds=job_timeout_seconds)
 
 
 async def fetch_lmarena_stream_via_chrome(
@@ -710,9 +745,14 @@ async def fetch_lmarena_stream_via_chrome(
                             cookies_to_add.append(c)
                             continue
 
-                        # Do NOT overwrite/inject Cloudflare or reCAPTCHA cookies in the persistent profile.
-                        # The profile manages these itself; injecting stale ones from config causes 403s.
+                        # Cloudflare/BM/reCAPTCHA cookies can be highly fingerprinted and stale values can cause 403s.
+                        # However, a *fresh* config-provided clearance can help bootstrap a brand new persistent profile
+                        # (before it has any cookies at all). Never overwrite existing profile cookies, but allow
+                        # seeding when the profile is missing them entirely.
                         if name in ("cf_clearance", "__cf_bm", "_GRECAPTCHA"):
+                            if name in existing_names:
+                                continue
+                            cookies_to_add.append(c)
                             continue
 
                         # Avoid overwriting existing Cloudflare/session cookies in the persistent profile.
@@ -879,9 +919,21 @@ async def fetch_lmarena_stream_via_chrome(
                   }
                 } catch (e) {}
 
-                // Send initial status and headers
-                if (window.reportChunk) {
+                let reportOk = (typeof window.reportChunk === 'function');
+                // Send initial status and headers (if streaming hook is available).
+                if (reportOk) {
+                  try {
                     await window.reportChunk(JSON.stringify({ __type: 'meta', status: res.status, headers }));
+                  } catch (e) {
+                    reportOk = false;
+                  }
+                }
+
+                // If we can't stream via reportChunk (binding missing or failed), fall back to a buffered response.
+                if (!reportOk) {
+                  let text = '';
+                  try { text = await res.text(); } catch (e) { text = ''; }
+                  return { status: res.status, headers, text };
                 }
 
                 if (res.body) {
@@ -984,7 +1036,7 @@ async def fetch_lmarena_stream_via_chrome(
                             result = res
                         else:
                             result = {"status": 502, "text": "FETCH_DONE_WITHOUT_META"}
-                    except Exception as e:
+                    except (asyncio.CancelledError, Exception) as e:
                         result = {"status": 502, "text": f"FETCH_EXCEPTION: {e}"}
                 elif meta:
                     result = meta
@@ -1074,6 +1126,18 @@ async def fetch_lmarena_stream_via_chrome(
                         pass
                     await asyncio.sleep(min(2.0 * (2**attempt), 15.0))
 
+            try:
+                status_int = int(result.get("status") or 0)
+            except Exception:
+                status_int = 0
+            try:
+                text_hint = str(result.get("text") or "") if isinstance(result, dict) else ""
+            except Exception:
+                text_hint = ""
+            if status_int == 502 and text_hint == "FETCH_DONE_WITHOUT_META":
+                _m().debug_print("⚠️ Chrome fetch: FETCH_DONE_WITHOUT_META (treating as transport failure).")
+                return None
+
             response = BrowserFetchStreamResponse(
                 int(result.get("status") or 0),
                 result.get("headers") if isinstance(result, dict) else {},
@@ -1082,7 +1146,7 @@ async def fetch_lmarena_stream_via_chrome(
                 url=url,
             )
             return response
-        except Exception as e:
+        except (asyncio.CancelledError, Exception) as e:
             _m().debug_print(f"??? Chrome fetch transport failed: {e}")
             return None
         finally:
@@ -1155,9 +1219,10 @@ async def fetch_lmarena_stream_via_camoufox(
         # Default to headful for better Turnstile/reCAPTCHA reliability; allow override via config.
         try:
             headless_value = config.get("camoufox_fetch_headless", None)
-            headless = bool(headless_value) if headless_value is not None else True
+            # Default to headful on Windows for better Turnstile/reCAPTCHA reliability.
+            headless = bool(headless_value) if headless_value is not None else (os.name != "nt")
         except Exception:
-            headless = True
+            headless = os.name != "nt"
 
         async with _m().AsyncCamoufox(headless=headless, main_world_eval=True) as browser:
             context = await browser.new_context(user_agent=user_agent or None)
@@ -1352,9 +1417,21 @@ async def fetch_lmarena_stream_via_camoufox(
                   }
                 } catch (e) {}
 
-                // Send initial status and headers
-                if (window.reportChunk) {
+                let reportOk = (typeof window.reportChunk === 'function');
+                // Send initial status and headers (if streaming hook is available).
+                if (reportOk) {
+                  try {
                     await window.reportChunk(JSON.stringify({ __type: 'meta', status: res.status, headers }));
+                  } catch (e) {
+                    reportOk = false;
+                  }
+                }
+
+                // If we can't stream via reportChunk (binding missing or failed), fall back to a buffered response.
+                if (!reportOk) {
+                  let text = '';
+                  try { text = await res.text(); } catch (e) { text = ''; }
+                  return { status: res.status, headers, text };
                 }
 
                 if (res.body) {
@@ -1454,7 +1531,7 @@ async def fetch_lmarena_stream_via_camoufox(
                             result = res
                         else:
                             result = {"status": 502, "text": "FETCH_DONE_WITHOUT_META"}
-                    except Exception as e:
+                    except (asyncio.CancelledError, Exception) as e:
                         result = {"status": 502, "text": f"FETCH_EXCEPTION: {e}"}
                 elif meta:
                     result = meta
@@ -1505,6 +1582,18 @@ async def fetch_lmarena_stream_via_camoufox(
                 
                 await asyncio.sleep(2)
 
+            try:
+                status_int = int(result.get("status") or 0)
+            except Exception:
+                status_int = 0
+            try:
+                text_hint = str(result.get("text") or "") if isinstance(result, dict) else ""
+            except Exception:
+                text_hint = ""
+            if status_int == 502 and text_hint == "FETCH_DONE_WITHOUT_META":
+                _m().debug_print("⚠️ Camoufox fetch: FETCH_DONE_WITHOUT_META (treating as transport failure).")
+                return None
+
             return BrowserFetchStreamResponse(
                 int(result.get("status") or 0),
                 result.get("headers") if isinstance(result, dict) else {},
@@ -1513,7 +1602,7 @@ async def fetch_lmarena_stream_via_camoufox(
                 url=url,
             )
 
-    except Exception as e:
+    except (asyncio.CancelledError, Exception) as e:
         _m().debug_print(f"❌ Camoufox fetch transport failed: {e}")
         return None
 
@@ -1780,7 +1869,8 @@ async def camoufox_proxy_worker():
                 user_agent = _m().normalize_user_agent_value(cfg.get("user_agent"))
                 
                 headless_value = cfg.get("camoufox_proxy_headless", None)
-                headless = bool(headless_value) if headless_value is not None else True
+                # Default to headful on Windows for better Turnstile/reCAPTCHA reliability.
+                headless = bool(headless_value) if headless_value is not None else (os.name != "nt")
                 launch_timeout = float(cfg.get("camoufox_proxy_launch_timeout_seconds", 90))
                 launch_timeout = max(20.0, min(launch_timeout, 300.0))
 
@@ -2135,7 +2225,6 @@ async def camoufox_proxy_worker():
                                 "name": "arena-auth-prod-v1",
                                 "value": "",
                                 "url": origin,
-                                "path": "/",
                                 "expires": 1,
                             }
                         )
@@ -2682,15 +2771,16 @@ async def camoufox_proxy_worker():
                 
                 use_job_token = False
                 if auth_token:
-                    # Only use the job's token if we don't have a valid one, or if the job's token is explicitly fresher (hard to tell, so prefer browser's if valid).
-                    if not browser_auth_cookie:
+                    # Per-request tokens must take precedence: some models/endpoints require a logged-in cookie even
+                    # when the browser currently holds a valid anonymous session.
+                    try:
+                        use_job_token = bool(
+                            _m().is_probably_valid_arena_auth_token(auth_token)
+                            and not _m().is_arena_auth_token_expired(auth_token, skew_seconds=0)
+                        )
+                    except Exception:
+                        # If we cannot validate (parsing error, etc.), still prefer the job token.
                         use_job_token = True
-                    else:
-                        try:
-                            if _m().is_arena_auth_token_expired(browser_auth_cookie, skew_seconds=60):
-                                use_job_token = True
-                        except Exception:
-                            use_job_token = True
                 
                 if use_job_token:
                     await context.add_cookies(
@@ -2736,6 +2826,30 @@ async def camoufox_proxy_worker():
                         job["upstream_started_at_monotonic"] = _m().time.monotonic()
                 except Exception:
                     pass
+                # Bound the in-page fetch runtime to the per-job timeout so the singleton proxy worker
+                # cannot get stuck evaluating indefinitely (which would block all future jobs).
+                try:
+                    job_timeout_seconds = int(job.get("timeout_seconds") or 120)
+                except Exception:
+                    job_timeout_seconds = 120
+                job_timeout_seconds = max(5, min(job_timeout_seconds, 3600))
+
+                created_at_mono = job.get("created_at_monotonic")
+                try:
+                    elapsed = float(_m().time.monotonic()) - float(created_at_mono)
+                except Exception:
+                    elapsed = 0.0
+                if elapsed < 0.0:
+                    elapsed = 0.0
+
+                remaining_budget = float(job_timeout_seconds) - float(elapsed)
+                remaining_budget = max(5.0, remaining_budget)
+                timeout_ms = int(remaining_budget * 1000.0)
+                evaluate_timeout_seconds = remaining_budget + 20.0
+                evaluate_timeout_seconds = max(
+                    30.0, min(evaluate_timeout_seconds, float(job_timeout_seconds) + 30.0)
+                )
+
                 await asyncio.wait_for(
                     page.evaluate(
                         fetch_script,
@@ -2747,14 +2861,19 @@ async def camoufox_proxy_worker():
                             "sitekeyV2": _m().RECAPTCHA_V2_SITEKEY,
                             "grecaptchaTimeoutMs": 60000,
                             "grecaptchaPollMs": 250,
-                            "timeoutMs": 180000,
+                            "timeoutMs": int(timeout_ms),
                             "debug": bool(os.environ.get("LM_BRIDGE_PROXY_DEBUG")),
                         }
                     ),
-                    timeout=200.0
+                    timeout=float(evaluate_timeout_seconds),
                 )
             except asyncio.TimeoutError:
-                await push_proxy_chunk(job_id, {"error": "camoufox proxy evaluate timeout", "done": True})
+                await _finalize_userscript_proxy_job(job_id, error="camoufox proxy evaluate timeout")
+                # The page can get stuck in a bad execution context after an evaluate timeout. Force a relaunch
+                # so subsequent jobs don't repeatedly hang.
+                browser = None
+                context = None
+                page = None
             except Exception as e:
                 await push_proxy_chunk(job_id, {"error": str(e), "done": True})
 

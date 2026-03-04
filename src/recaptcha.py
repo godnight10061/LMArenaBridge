@@ -511,9 +511,13 @@ async def get_recaptcha_v3_token_with_chrome(config: dict) -> Optional[str]:
                             cookies_to_add.append(c)
                             continue
 
-                        # Do NOT overwrite/inject Cloudflare or reCAPTCHA cookies in the persistent profile.
-                        # The profile manages these itself; injecting stale ones from config causes 403s.
+                        # Cloudflare/BM cookies can be highly fingerprinted and stale values can cause 403s.
+                        # Never overwrite existing profile cookies, but allow seeding when the profile is missing them
+                        # entirely (fresh profile bootstrap).
                         if name in ("cf_clearance", "__cf_bm", "_GRECAPTCHA"):
+                            if name in existing_names:
+                                continue
+                            cookies_to_add.append(c)
                             continue
 
                         # Avoid overwriting existing Cloudflare/session cookies in the persistent profile.
