@@ -916,9 +916,21 @@ async def fetch_lmarena_stream_via_chrome(
                   }
                 } catch (e) {}
 
-                // Send initial status and headers
-                if (window.reportChunk) {
+                let reportOk = (typeof window.reportChunk === 'function');
+                // Send initial status and headers (if streaming hook is available).
+                if (reportOk) {
+                  try {
                     await window.reportChunk(JSON.stringify({ __type: 'meta', status: res.status, headers }));
+                  } catch (e) {
+                    reportOk = false;
+                  }
+                }
+
+                // If we can't stream via reportChunk (binding missing or failed), fall back to a buffered response.
+                if (!reportOk) {
+                  let text = '';
+                  try { text = await res.text(); } catch (e) { text = ''; }
+                  return { status: res.status, headers, text };
                 }
 
                 if (res.body) {
@@ -1021,7 +1033,7 @@ async def fetch_lmarena_stream_via_chrome(
                             result = res
                         else:
                             result = {"status": 502, "text": "FETCH_DONE_WITHOUT_META"}
-                    except Exception as e:
+                    except (asyncio.CancelledError, Exception) as e:
                         result = {"status": 502, "text": f"FETCH_EXCEPTION: {e}"}
                 elif meta:
                     result = meta
@@ -1131,7 +1143,7 @@ async def fetch_lmarena_stream_via_chrome(
                 url=url,
             )
             return response
-        except Exception as e:
+        except (asyncio.CancelledError, Exception) as e:
             _m().debug_print(f"??? Chrome fetch transport failed: {e}")
             return None
         finally:
@@ -1402,9 +1414,21 @@ async def fetch_lmarena_stream_via_camoufox(
                   }
                 } catch (e) {}
 
-                // Send initial status and headers
-                if (window.reportChunk) {
+                let reportOk = (typeof window.reportChunk === 'function');
+                // Send initial status and headers (if streaming hook is available).
+                if (reportOk) {
+                  try {
                     await window.reportChunk(JSON.stringify({ __type: 'meta', status: res.status, headers }));
+                  } catch (e) {
+                    reportOk = false;
+                  }
+                }
+
+                // If we can't stream via reportChunk (binding missing or failed), fall back to a buffered response.
+                if (!reportOk) {
+                  let text = '';
+                  try { text = await res.text(); } catch (e) { text = ''; }
+                  return { status: res.status, headers, text };
                 }
 
                 if (res.body) {
@@ -1504,7 +1528,7 @@ async def fetch_lmarena_stream_via_camoufox(
                             result = res
                         else:
                             result = {"status": 502, "text": "FETCH_DONE_WITHOUT_META"}
-                    except Exception as e:
+                    except (asyncio.CancelledError, Exception) as e:
                         result = {"status": 502, "text": f"FETCH_EXCEPTION: {e}"}
                 elif meta:
                     result = meta
@@ -1575,7 +1599,7 @@ async def fetch_lmarena_stream_via_camoufox(
                 url=url,
             )
 
-    except Exception as e:
+    except (asyncio.CancelledError, Exception) as e:
         _m().debug_print(f"❌ Camoufox fetch transport failed: {e}")
         return None
 
@@ -2744,15 +2768,16 @@ async def camoufox_proxy_worker():
                 
                 use_job_token = False
                 if auth_token:
-                    # Only use the job's token if we don't have a valid one, or if the job's token is explicitly fresher (hard to tell, so prefer browser's if valid).
-                    if not browser_auth_cookie:
+                    # Per-request tokens must take precedence: some models/endpoints require a logged-in cookie even
+                    # when the browser currently holds a valid anonymous session.
+                    try:
+                        use_job_token = bool(
+                            _m().is_probably_valid_arena_auth_token(auth_token)
+                            and not _m().is_arena_auth_token_expired(auth_token, skew_seconds=0)
+                        )
+                    except Exception:
+                        # If we cannot validate (parsing error, etc.), still prefer the job token.
                         use_job_token = True
-                    else:
-                        try:
-                            if _m().is_arena_auth_token_expired(browser_auth_cookie, skew_seconds=60):
-                                use_job_token = True
-                        except Exception:
-                            use_job_token = True
                 
                 if use_job_token:
                     await context.add_cookies(
