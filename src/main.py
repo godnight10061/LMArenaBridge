@@ -25,6 +25,15 @@ from fastapi.security import APIKeyHeader
 
 import httpx
 
+# Support running as a script (as documented): `python src/main.py`.
+# When executed directly, Python sets `sys.path[0]` to `.../src`, which breaks
+# package-relative imports like `from . import constants`.
+if __name__ == "__main__" and (__package__ is None or __package__ == ""):
+    repo_root = Path(__file__).resolve().parent.parent
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+    __package__ = "src"
+
 # Import from modularized modules
 from . import constants
 from . import config as _config_module
@@ -602,21 +611,13 @@ def get_config():
     if _LAST_CONFIG_FILE != CONFIG_FILE:
         _LAST_CONFIG_FILE = CONFIG_FILE
         current_token_index = 0
-    try:
-        with open(CONFIG_FILE, "r") as f:
-            config = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError) as e:
-        debug_print(f"⚠️  Config file error: {e}, using defaults")
-        config = {}
-    except Exception as e:
-        debug_print(f"⚠️  Unexpected error reading config: {e}, using defaults")
-        config = {}
+    config = _config_module.read_raw_config(CONFIG_FILE) or {}
 
     # Ensure default keys exist
     try:
-        _config_module._apply_config_defaults(config)
-    except Exception as e:
-        debug_print(f"⚠️  Error setting config defaults: {e}")
+        _config_module.apply_config_defaults(config)
+    except (TypeError, KeyError) as e:
+        print(f"Warning: error setting config defaults: {e}", file=sys.stderr)
 
     return config
 
@@ -631,31 +632,24 @@ def load_usage_stats():
         debug_print(f"⚠️  Error loading usage stats: {e}, using empty stats")
         model_usage_stats = defaultdict(int)
 
-def save_config(config, *, preserve_auth_tokens: bool = True):
+def save_config(
+    config: dict,
+    *,
+    preserve_auth_tokens: bool = True,
+    preserve_api_keys: bool = True,
+) -> None:
     try:
-        # Avoid clobbering user-provided auth tokens when multiple tasks write config.json concurrently.
-        # Background refreshes/cookie upserts shouldn't overwrite auth tokens that may have been added via the dashboard.
-        if preserve_auth_tokens:
-            try:
-                with open(CONFIG_FILE, "r") as f:
-                    on_disk = json.load(f)
-            except Exception:
-                on_disk = None
-
-            if isinstance(on_disk, dict):
-                if "auth_tokens" in on_disk and isinstance(on_disk.get("auth_tokens"), list):
-                    config["auth_tokens"] = list(on_disk.get("auth_tokens") or [])
-                if "auth_token" in on_disk:
-                    config["auth_token"] = str(on_disk.get("auth_token") or "")
-
         # Persist in-memory stats to the config dict before saving
         config["usage_stats"] = dict(model_usage_stats)
-        tmp_path = f"{CONFIG_FILE}.tmp"
-        with open(tmp_path, "w") as f:
-            json.dump(config, f, indent=4)
-        os.replace(tmp_path, CONFIG_FILE)
-    except Exception as e:
-        debug_print(f"❌ Error saving config: {e}")
+        # Delegate persistence and preservation logic to the config module.
+        _config_module.set_config_file(CONFIG_FILE)
+        _config_module.save_config(
+            config,
+            preserve_auth_tokens=preserve_auth_tokens,
+            preserve_api_keys=preserve_api_keys,
+        )
+    except (OSError, TypeError):
+        raise
 
 def get_request_headers():
     """Get request headers with the first available auth token (for compatibility)"""
@@ -1035,8 +1029,10 @@ async def startup_event():
 
     try:
         # Ensure config and models files exist
-        config = get_config()
-        if not config.get("api_keys"):
+        config = _config_module.read_raw_config(CONFIG_FILE) or {}
+        # If api_keys is not a list in the raw config (missing/null), generate a default one.
+        # This respects an explicit empty list `[]` on disk.
+        if not isinstance(config.get("api_keys"), list):
             config["api_keys"] = [
                 {
                     "name": "Default Key",
@@ -1045,7 +1041,13 @@ async def startup_event():
                     "created": int(time.time()),
                 }
             ]
-        save_config(config)
+
+        try:
+            _config_module.apply_config_defaults(config)
+        except (TypeError, KeyError) as e:
+            print(f"Warning: error setting config defaults on startup: {e}", file=sys.stderr)
+
+        save_config(config, preserve_api_keys=False)
         save_models(get_models())
         # Load usage stats from config
         load_usage_stats()
@@ -1240,7 +1242,7 @@ async def logout(request: Request, response: Response):
     return response
 
 @app.get("/dashboard", response_class=HTMLResponse)
-async def dashboard(session: str = Depends(get_current_session)):
+async def dashboard(session: str = Depends(get_current_session), error: Optional[str] = None):
     if not session:
         return RedirectResponse(url="/login")
 
@@ -1257,6 +1259,15 @@ async def dashboard(session: str = Depends(get_current_session)):
                 <p><a href="/logout">Logout</a> | <a href="/dashboard">Retry</a></p>
             </body></html>
         """, status_code=500)
+
+    error_banner = ""
+    if error == "save_config":
+        error_banner = """
+            <div class="section" style="border-left: 4px solid #c33; background: #fff5f5;">
+                <strong>Failed to save configuration.</strong>
+                Check server logs and ensure the config file is writable.
+            </div>
+        """
 
     # Render API Keys
     keys_html = ""
@@ -1607,6 +1618,7 @@ async def dashboard(session: str = Depends(get_current_session)):
             </div>
 
             <div class="container">
+                {error_banner}
                 <!-- Stats Overview -->
                 <div class="stats-grid">
                     <div class="stat-card">
@@ -1867,9 +1879,13 @@ async def dashboard(session: str = Depends(get_current_session)):
 async def update_auth_token(session: str = Depends(get_current_session), auth_token: str = Form(...)):
     if not session:
         return RedirectResponse(url="/login")
-    config = get_config()
-    config["auth_token"] = auth_token.strip()
-    save_config(config, preserve_auth_tokens=False)
+    try:
+        config = get_config()
+        config["auth_token"] = auth_token.strip()
+        save_config(config, preserve_auth_tokens=False)
+    except (OSError, TypeError) as e:
+        print(f"Error updating auth token: {e}", file=sys.stderr)
+        return RedirectResponse(url="/dashboard?error=save_config", status_code=status.HTTP_303_SEE_OTHER)
     return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
 
 @app.post("/create-key")
@@ -1885,9 +1901,10 @@ async def create_key(session: str = Depends(get_current_session), name: str = Fo
             "created": int(time.time())
         }
         config["api_keys"].append(new_key)
-        save_config(config)
-    except Exception as e:
-        debug_print(f"❌ Error creating key: {e}")
+        save_config(config, preserve_api_keys=False)
+    except (OSError, TypeError) as e:
+        print(f"Error creating key: {e}", file=sys.stderr)
+        return RedirectResponse(url="/dashboard?error=save_config", status_code=status.HTTP_303_SEE_OTHER)
     return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
 
 @app.post("/delete-key")
@@ -1897,9 +1914,10 @@ async def delete_key(session: str = Depends(get_current_session), key_id: str = 
     try:
         config = get_config()
         config["api_keys"] = [k for k in config["api_keys"] if k["key"] != key_id]
-        save_config(config)
-    except Exception as e:
-        debug_print(f"❌ Error deleting key: {e}")
+        save_config(config, preserve_api_keys=False)
+    except (OSError, TypeError) as e:
+        print(f"Error deleting key: {e}", file=sys.stderr)
+        return RedirectResponse(url="/dashboard?error=save_config", status_code=status.HTTP_303_SEE_OTHER)
     return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
 
 @app.post("/add-auth-token")
@@ -1914,8 +1932,9 @@ async def add_auth_token(session: str = Depends(get_current_session), new_auth_t
                 config["auth_tokens"] = []
             config["auth_tokens"].append(token)
             save_config(config, preserve_auth_tokens=False)
-    except Exception as e:
-        debug_print(f"❌ Error adding auth token: {e}")
+    except (OSError, TypeError) as e:
+        print(f"Error adding auth token: {e}", file=sys.stderr)
+        return RedirectResponse(url="/dashboard?error=save_config", status_code=status.HTTP_303_SEE_OTHER)
     return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
 
 @app.post("/delete-auth-token")
@@ -1929,8 +1948,9 @@ async def delete_auth_token(session: str = Depends(get_current_session), token_i
             auth_tokens.pop(token_index)
             config["auth_tokens"] = auth_tokens
             save_config(config, preserve_auth_tokens=False)
-    except Exception as e:
-        debug_print(f"❌ Error deleting auth token: {e}")
+    except (OSError, TypeError) as e:
+        print(f"Error deleting auth token: {e}", file=sys.stderr)
+        return RedirectResponse(url="/dashboard?error=save_config", status_code=status.HTTP_303_SEE_OTHER)
     return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
 
 @app.post("/refresh-tokens")
