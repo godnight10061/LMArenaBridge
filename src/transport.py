@@ -102,7 +102,7 @@ class BrowserFetchStreamResponse:
 
     def raise_for_status(self) -> None:
         if self.status_code == 0 or self.status_code >= 400:
-            request = httpx.Request(self._method, self._url or "https://lmarena.ai/")
+            request = httpx.Request(self._method, self._url or "https://arena.ai/")
             response = httpx.Response(self.status_code or 502, request=request, content=self._text.encode("utf-8"))
             raise httpx.HTTPStatusError(f"HTTP {self.status_code}", request=request, response=response)
 
@@ -255,7 +255,7 @@ class UserscriptProxyStreamResponse:
         self._headers: dict = {}
         self._timeout_seconds = int(timeout_seconds or 120)
         self._method = "POST"
-        self._url = "https://lmarena.ai/"
+        self._url = "https://arena.ai/"
 
     @property
     def status_code(self) -> int:
@@ -417,7 +417,7 @@ def _detect_arena_origin(url: Optional[str] = None) -> str:
     """
     text = str(url or "").strip()
     if not text:
-        return _LMARENA_ORIGIN
+        return _ARENA_ORIGIN
     try:
         parts = urlsplit(text)
     except Exception:
@@ -428,13 +428,13 @@ def _detect_arena_origin(url: Optional[str] = None) -> str:
         host = str(parts.netloc or "").split("@")[-1].split(":")[0].lower()
     if not host:
         host = text.split("/")[0].split("@")[-1].split(":")[0].lower()
-    return _ARENA_HOST_TO_ORIGIN.get(host, _LMARENA_ORIGIN)
+    return _ARENA_HOST_TO_ORIGIN.get(host, _ARENA_ORIGIN)
 
 
 def _arena_origin_candidates(url: Optional[str] = None) -> list[str]:
     """Return `[primary, secondary]` origins, preferring the detected origin but always including both."""
     primary = _detect_arena_origin(url)
-    secondary = _ARENA_ORIGIN if primary == _LMARENA_ORIGIN else _LMARENA_ORIGIN
+    secondary = _LMARENA_ORIGIN if primary == _ARENA_ORIGIN else _ARENA_ORIGIN
     return [primary, secondary]
 
 
@@ -469,40 +469,31 @@ def _provisional_user_id_cookie_specs(provisional_user_id: str, *, page_url: Opt
         # When using domain, do NOT include path - they're mutually exclusive in Playwright
         specs.append({"name": "provisional_user_id", "value": value, "domain": domain})
 
+    return specs
+
 
 async def _get_arena_context_cookies(context, *, page_url: Optional[str] = None) -> list[dict]:
     """
     Fetch cookies for both arena.ai and lmarena.ai from a Playwright/Camoufox browser context.
     """
     urls = _arena_origin_candidates(page_url)
-    try:
-        cookies = await context.cookies(urls)
-        return cookies if isinstance(cookies, list) else []
-    except Exception:
-        pass
-
-    merged: list[dict] = []
-    seen: set[tuple[str, str, str]] = set()
+    all_raw: list[dict] = []
     for url in urls:
         try:
             chunk = await context.cookies(url)
+            if isinstance(chunk, list):
+                all_raw.extend(chunk)
         except Exception:
-            chunk = []
-        if not isinstance(chunk, list):
+            pass
+    
+    seen: set[tuple[str, str, str]] = set()
+    merged: list[dict] = []
+    for c in all_raw:
+        key = (str(c.get("name") or ""), str(c.get("domain") or ""), str(c.get("path") or ""))
+        if key in seen:
             continue
-        for c in chunk:
-            try:
-                key = (
-                    str(c.get("name") or ""),
-                    str(c.get("domain") or ""),
-                    str(c.get("path") or ""),
-                )
-            except Exception:
-                continue
-            if key in seen:
-                continue
-            seen.add(key)
-            merged.append(c)
+        seen.add(key)
+        merged.append(c)
     return merged
 
 
@@ -510,8 +501,8 @@ def _normalize_userscript_proxy_url(url: str) -> str:
     """
     Convert LMArena absolute URLs into same-origin paths for in-page fetch.
 
-    The Camoufox proxy page can land on `arena.ai` while the backend constructs `https://lmarena.ai/...` URLs.
-    Absolute cross-origin URLs can cause browser fetch to reject with a generic NetworkError (CORS).
+    The proxy page may be on arena.ai (after redirect from lmarena.ai); absolute
+    cross-origin URLs can cause browser fetch to reject with a generic NetworkError (CORS).
     """
     text = str(url or "").strip()
     if not text:
@@ -634,18 +625,19 @@ async def fetch_lmarena_stream_via_chrome(
 
     desired_cookies: list[dict] = []
     # When using domain, do NOT include path - they're mutually exclusive in Playwright
-    if cf_clearance:
-        desired_cookies.append({"name": "cf_clearance", "value": cf_clearance, "domain": ".lmarena.ai"})
-    if cf_bm:
-        desired_cookies.append({"name": "__cf_bm", "value": cf_bm, "domain": ".lmarena.ai"})
-    if cfuvid:
-        desired_cookies.append({"name": "_cfuvid", "value": cfuvid, "domain": ".lmarena.ai"})
-    if provisional_user_id:
-        desired_cookies.append(
-            {"name": "provisional_user_id", "value": provisional_user_id, "domain": ".lmarena.ai"}
-        )
-    if grecaptcha_cookie:
-        desired_cookies.append({"name": "_GRECAPTCHA", "value": grecaptcha_cookie, "domain": ".lmarena.ai"})
+    # We define cookies for both domains for seamless migration
+    cookie_definitions = [
+        (cf_clearance, "cf_clearance"),
+        (cf_bm, "__cf_bm"),
+        (cfuvid, "_cfuvid"),
+        (provisional_user_id, "provisional_user_id"),
+        (grecaptcha_cookie, "_GRECAPTCHA"),
+    ]
+    for value, name in cookie_definitions:
+        if value:
+            for _domain in (".lmarena.ai", ".arena.ai"):
+                desired_cookies.append({"name": name, "value": value, "domain": _domain})
+    
     if auth_token:
         desired_cookies.extend(_arena_auth_cookie_specs(auth_token))
 
@@ -733,7 +725,7 @@ async def fetch_lmarena_stream_via_chrome(
                 marker="LMArenaBridge Chrome Fetch",
                 headless=bool(headless),
             )
-            await page.goto("https://lmarena.ai/?mode=direct", wait_until="domcontentloaded", timeout=120000)
+            await page.goto("https://arena.ai/?mode=direct", wait_until="domcontentloaded", timeout=120000)
 
             # Best-effort: if we land on a Cloudflare challenge page, try clicking Turnstile before minting tokens.
             try:
@@ -978,12 +970,29 @@ async def fetch_lmarena_stream_via_chrome(
                         continue
                 
                 if fetch_task.done() and meta is None:
+                    # Give a brief moment for meta chunk to arrive in the queue (race condition)
                     try:
-                        res = fetch_task.result()
-                        if isinstance(res, dict) and not res.get("__streaming"):
-                            result = res
+                        # Check if there's anything in the queue that might be the meta chunk
+                        try:
+                            item = lines_queue.get_nowait()
+                            if isinstance(item, str) and item.startswith('{"__type":"meta"'):
+                                meta = json.loads(item)
+                            else:
+                                # Put it back and use default meta
+                                await lines_queue.put(item)
+                                meta = {"status": 200, "headers": {}}
+                        except asyncio.QueueEmpty:
+                            # No items in queue, use default successful response
+                            meta = {"status": 200, "headers": {}}
+                        
+                        if meta:
+                            result = meta
                         else:
-                            result = {"status": 502, "text": "FETCH_DONE_WITHOUT_META"}
+                            res = fetch_task.result()
+                            if isinstance(res, dict) and not res.get("__streaming"):
+                                result = res
+                            else:
+                                result = {"status": 502, "text": "FETCH_DONE_WITHOUT_META"}
                     except Exception as e:
                         result = {"status": 502, "text": f"FETCH_EXCEPTION: {e}"}
                 elif meta:
@@ -1122,18 +1131,24 @@ async def fetch_lmarena_stream_via_camoufox(
 
     desired_cookies: list[dict] = []
     # When using domain, do NOT include path - they're mutually exclusive in Playwright
-    if cf_clearance:
-        desired_cookies.append({"name": "cf_clearance", "value": cf_clearance, "domain": ".lmarena.ai"})
-    if cf_bm:
-        desired_cookies.append({"name": "__cf_bm", "value": cf_bm, "domain": ".lmarena.ai"})
-    if cfuvid:
-        desired_cookies.append({"name": "_cfuvid", "value": cfuvid, "domain": ".lmarena.ai"})
-    if provisional_user_id:
-        desired_cookies.append(
-            {"name": "provisional_user_id", "value": provisional_user_id, "domain": ".lmarena.ai"}
-        )
-    if grecaptcha_cookie:
-        desired_cookies.append({"name": "_GRECAPTCHA", "value": grecaptcha_cookie, "domain": ".lmarena.ai"})
+    # We define cookies for both domains for seamless migration
+    cookie_definitions = [
+        (cf_clearance, "cf_clearance"),
+        (cf_bm, "__cf_bm"),
+        (cfuvid, "_cfuvid"),
+        (provisional_user_id, "provisional_user_id"),
+        (grecaptcha_cookie, "_GRECAPTCHA"),
+    ]
+    for value, name in cookie_definitions:
+        if value:
+            for _domain in (".lmarena.ai", ".arena.ai"):
+                desired_cookies.append({"name": name, "value": value, "domain": _domain})
+    
+    # If no auth token provided, try to get one from config/browser_cookies
+    if not auth_token:
+        # Check if we have an arena-auth cookie in browser_cookies
+        auth_token = config.get("browser_cookies", {}).get("arena-auth-prod-v1") or _m().EPHEMERAL_ARENA_AUTH_TOKEN or ""
+    
     if auth_token:
         desired_cookies.extend(_arena_auth_cookie_specs(auth_token))
     user_agent = _m().normalize_user_agent_value(config.get("user_agent"))
@@ -1183,10 +1198,10 @@ async def fetch_lmarena_stream_via_camoufox(
                 headless=headless,
             )
               
-            _m().debug_print(f"  🦊 Navigating to lmarena.ai...")
+            _m().debug_print(f" 🦊 Navigating to arena.ai...")
             try:
                 await asyncio.wait_for(
-                    page.goto("https://lmarena.ai/?mode=direct", wait_until="domcontentloaded", timeout=60000),
+                    page.goto("https://arena.ai/?mode=direct", wait_until="domcontentloaded", timeout=60000),
                     timeout=70.0,
                 )
             except Exception:
@@ -1202,6 +1217,169 @@ async def fetch_lmarena_stream_via_camoufox(
                     await asyncio.sleep(2)
             except Exception:
                 pass
+            
+            # Check for existing auth cookie
+            current_cookie = ""
+            try:
+                existing = await _get_arena_context_cookies(context, page_url=str(getattr(page, "url", "") or ""))
+                for c in existing or []:
+                    if str(c.get("name") or "") == "arena-auth-prod-v1":
+                        current_cookie = str(c.get("value") or "").strip()
+                        break
+            except Exception as e:
+                _m().debug_print(f"⚠️ Error checking for existing auth cookie: {e}")
+            
+            needs_signup = not current_cookie
+            
+            if not auth_token and needs_signup:
+                _m().debug_print(" 🦊 No auth cookie, attempting anonymous signup...")
+                provisional_user_id = str(config.get("provisional_user_id") or "").strip()
+                if not provisional_user_id:
+                    provisional_user_id = str(uuid.uuid4())
+                
+                turnstile_token = ""
+                widget_id = None
+                _m().debug_print(" 🦊 Rendering Turnstile widget...")
+                render_turnstile_js = """async ({ sitekey }) => {
+                  const w = (window.wrappedJSObject || window);
+                  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+                  const key = String(sitekey || '');
+                  const out = { ok: false, widgetId: null, stage: 'start', error: '' };
+                  if (!key) { out.stage = 'no_sitekey'; return out; }
+                  try {
+                    const prev = w.__LM_BRIDGE_TURNSTILE_WIDGET_ID;
+                    if (prev != null && w.turnstile && typeof w.turnstile.remove === 'function') {
+                      try { w.turnstile.remove(prev); } catch (e) {}
+                    }
+                  } catch (e) {}
+                  try {
+                    const old = w.document.getElementById('lm-bridge-turnstile');
+                    if (old) old.remove();
+                  } catch (e) {}
+                  async function ensureLoaded() {
+                    if (w.turnstile && typeof w.turnstile.render === 'function') return true;
+                    try {
+                      const h = w.document?.head;
+                      if (!h) return false;
+                      if (!w.__LM_BRIDGE_TURNSTILE_INJECTED) {
+                        w.__LM_BRIDGE_TURNSTILE_INJECTED = true;
+                        out.stage = 'inject_script';
+                        await Promise.race([
+                          new Promise((resolve) => {
+                            const s = w.document.createElement('script');
+                            s.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
+                            s.async = true;
+                            s.defer = true;
+                            s.onload = () => resolve(true);
+                            s.onerror = () => resolve(false);
+                            h.appendChild(s);
+                          }),
+                          sleep(12000).then(() => false),
+                        ]);
+                      }
+                    } catch (e) { out.error = String(e); }
+                    const start = Date.now();
+                    while ((Date.now() - start) < 15000) {
+                      if (w.turnstile && typeof w.turnstile.render === 'function') return true;
+                      await sleep(250);
+                    }
+                    return false;
+                  }
+                  const ok = await ensureLoaded();
+                  if (!ok || !(w.turnstile && typeof w.turnstile.render === 'function')) { out.stage = 'not_loaded'; return out; }
+                  out.stage = 'render';
+                  try {
+                    const el = w.document.createElement('div');
+                    el.id = 'lm-bridge-turnstile';
+                    el.style.cssText = 'position:fixed;left:20px;top:20px;z-index:2147483647;';
+                    (w.document.body || w.document.documentElement).appendChild(el);
+                    const params = new w.Object();
+                    params.sitekey = key;
+                    params.size = 'normal';
+                    params.appearance = 'interaction-only';
+                    params.callback = (tok) => { try { w.__LM_BRIDGE_TURNSTILE_TOKEN = String(tok || ''); } catch (e) {} };
+                    params['error-callback'] = () => { try { w.__LM_BRIDGE_TURNSTILE_TOKEN = ''; } catch (e) {} };
+                    params['expired-callback'] = () => { try { w.__LM_BRIDGE_TURNSTILE_TOKEN = ''; } catch (e) {} };
+                    const widgetId = w.turnstile.render(el, params);
+                    w.__LM_BRIDGE_TURNSTILE_WIDGET_ID = widgetId;
+                    out.ok = true;
+                    out.widgetId = widgetId;
+                    return out;
+                  } catch (e) {
+                    out.error = String(e);
+                    out.stage = 'render_error';
+                    return out;
+                  }
+                }"""
+                
+                poll_turnstile_js = """({ widgetId }) => {
+                  const w = (window.wrappedJSObject || window);
+                  try {
+                    const tok = w.__LM_BRIDGE_TURNSTILE_TOKEN;
+                    if (tok && String(tok).trim()) return String(tok);
+                    if (!w.turnstile || typeof w.turnstile.getResponse !== 'function') return '';
+                    return String(w.turnstile.getResponse(widgetId) || '');
+                  } catch (e) {
+                    return '';
+                  }
+                }"""
+                
+                try:
+                    mint_info = await asyncio.wait_for(
+                        page.evaluate(render_turnstile_js, {"sitekey": _m().TURNSTILE_SITEKEY}),
+                        timeout=30.0,
+                    )
+                except Exception as e:
+                    mint_info = {"ok": False, "stage": "evaluate_error", "error": str(e)}
+                
+                _m().debug_print(f" 🦊 Turnstile render result: ok={mint_info.get('ok')}, stage={mint_info.get('stage')}")
+                
+                if mint_info and mint_info.get("widgetId"):
+                    widget_id = mint_info.get("widgetId")
+                    _m().debug_print(f" 🦊 Clicking Turnstile widget to trigger challenge...")
+                    try:
+                        await _m().click_turnstile(page)
+                        await asyncio.sleep(2)
+                    except Exception as e:
+                        _m().debug_print(f" ⚠️ Click error: {e}")
+                    started = _m().time.monotonic()
+                    while (_m().time.monotonic() - started) < 130.0:
+                        try:
+                            cur = await asyncio.wait_for(
+                                page.evaluate(poll_turnstile_js, {"widgetId": widget_id}),
+                                timeout=5.0,
+                            )
+                        except Exception as e:
+                            _m().debug_print(f"⚠️ Turnstile poll error: {e}")
+                            cur = ""
+                        turnstile_token = str(cur or "").strip()
+                        if turnstile_token:
+                            break
+                        await asyncio.sleep(1.0)
+                
+                if turnstile_token:
+                    _m().debug_print(f" 🦊 Got Turnstile token, calling signup...")
+                    try:
+                        resp = await _m()._camoufox_proxy_signup_anonymous_user(
+                            page,
+                            turnstile_token=turnstile_token,
+                            provisional_user_id=provisional_user_id,
+                            recaptcha_sitekey=recaptcha_sitekey,
+                            recaptcha_action="sign_up",
+                        )
+                        if resp:
+                            _m().debug_print(f" 🦊 Signup response status: {resp.get('status')}")
+                            body_text = str(resp.get("body", ""))
+                            if body_text:
+                                derived = _m().maybe_build_arena_auth_cookie_from_signup_response_body(body_text)
+                                if derived and not _m().is_arena_auth_token_expired(derived, skew_seconds=0):
+                                    auth_token = derived
+                                    desired_cookies.extend(_arena_auth_cookie_specs(auth_token))
+                                    _m().debug_print(f" 🦊 Got auth token from signup!")
+                    except Exception as e:
+                        _m().debug_print(f" ⚠️ Signup failed: {e}")
+                else:
+                    _m().debug_print(" ⚠️ Turnstile token mint failed")
             
             # Persist cookies
             try:
@@ -1448,12 +1626,29 @@ async def fetch_lmarena_stream_via_camoufox(
                         continue
                 
                 if fetch_task.done() and meta is None:
+                    # Give a brief moment for meta chunk to arrive in the queue (race condition)
                     try:
-                        res = fetch_task.result()
-                        if isinstance(res, dict) and not res.get("__streaming"):
-                            result = res
+                        # Check if there's anything in the queue that might be the meta chunk
+                        try:
+                            item = lines_queue.get_nowait()
+                            if isinstance(item, str) and item.startswith('{"__type":"meta"'):
+                                meta = json.loads(item)
+                            else:
+                                # Put it back and use default meta
+                                await lines_queue.put(item)
+                                meta = {"status": 200, "headers": {}}
+                        except asyncio.QueueEmpty:
+                            # No items in queue, use default successful response
+                            meta = {"status": 200, "headers": {}}
+                        
+                        if meta:
+                            result = meta
                         else:
-                            result = {"status": 502, "text": "FETCH_DONE_WITHOUT_META"}
+                            res = fetch_task.result()
+                            if isinstance(res, dict) and not res.get("__streaming"):
+                                result = res
+                            else:
+                                result = {"status": 502, "text": "FETCH_DONE_WITHOUT_META"}
                     except Exception as e:
                         result = {"status": 502, "text": f"FETCH_EXCEPTION: {e}"}
                 elif meta:
@@ -1856,16 +2051,17 @@ async def camoufox_proxy_worker():
 
                 desired_cookies: list[dict] = []
                 # When using domain, do NOT include path - they're mutually exclusive in Playwright
-                if cf_clearance:
-                    desired_cookies.append({"name": "cf_clearance", "value": cf_clearance, "domain": ".lmarena.ai"})
-                if cf_bm:
-                    desired_cookies.append({"name": "__cf_bm", "value": cf_bm, "domain": ".lmarena.ai"})
-                if cfuvid:
-                    desired_cookies.append({"name": "_cfuvid", "value": cfuvid, "domain": ".lmarena.ai"})
-                if provisional_user_id:
-                    desired_cookies.append(
-                        {"name": "provisional_user_id", "value": provisional_user_id, "domain": ".lmarena.ai"}
-                    )
+                # Define cookies for BOTH domains since lmarena.ai 301-redirects to arena.ai
+                cookie_definitions = [
+                    (cf_clearance, "cf_clearance"),
+                    (cf_bm, "__cf_bm"),
+                    (cfuvid, "_cfuvid"),
+                    (provisional_user_id, "provisional_user_id"),
+                ]
+                for value, name in cookie_definitions:
+                    if value:
+                        for _domain in (".lmarena.ai", ".arena.ai"):
+                            desired_cookies.append({"name": name, "value": value, "domain": _domain})
                 if desired_cookies:
                     try:
                         existing_names: set[str] = set()
@@ -1963,8 +2159,8 @@ async def camoufox_proxy_worker():
                 )
 
                 try:
-                    _m().debug_print("🦊 Camoufox proxy: navigating to https://lmarena.ai/?mode=direct ...")
-                    await page.goto("https://lmarena.ai/?mode=direct", wait_until="domcontentloaded", timeout=120000)
+                    _m().debug_print("🦊 Camoufox proxy: navigating to https://arena.ai/?mode=direct ...")
+                    await page.goto("https://arena.ai/?mode=direct", wait_until="domcontentloaded", timeout=120000)
                     _m().debug_print("🦊 Camoufox proxy: navigation complete.")
                 except Exception as e:
                     _m().debug_print(f"⚠️ Navigation warning: {e}")
@@ -2144,7 +2340,7 @@ async def camoufox_proxy_worker():
                 except Exception:
                     pass
                 try:
-                    await page.goto("https://lmarena.ai/?mode=direct", wait_until="domcontentloaded", timeout=120000)
+                    await page.goto("https://arena.ai/?mode=direct", wait_until="domcontentloaded", timeout=120000)
                 except Exception:
                     pass
                 try:
@@ -2388,7 +2584,7 @@ async def camoufox_proxy_worker():
                             wait_loops = 40
                             try:
                                 await page.goto(
-                                    "https://lmarena.ai/?mode=direct",
+                                    "https://arena.ai/?mode=direct",
                                     wait_until="domcontentloaded",
                                     timeout=120000,
                                 )
@@ -2396,13 +2592,23 @@ async def camoufox_proxy_worker():
                                 pass
                     except Exception:
                         pass
-
                     for _ in range(int(wait_loops)):
-                        cur = await _get_auth_cookie_value()
-                        if cur and not _m().is_arena_auth_token_expired(cur, skew_seconds=0):
-                            _m().debug_print("🦊 Camoufox proxy: acquired arena-auth-prod-v1 cookie (anonymous user).")
-                            break
-                        await asyncio.sleep(0.5)
+                        cur = str(await _get_auth_cookie_value() or "").strip()
+                        if not cur or _m().is_arena_auth_token_expired(cur, skew_seconds=0):
+                            await asyncio.sleep(1.0)
+                            continue
+                        _m().debug_print("🦊 Camoufox proxy: acquired arena-auth-prod-v1 cookie (anonymous user).")
+                        # Save to browser_cookies so plain HTTP requests can use it without browser transport
+                        try:
+                            cfg = _m().get_config()
+                            if _m()._upsert_browser_session_into_config(cfg, [{"name": "arena-auth-prod-v1", "value": cur}]):
+                                _m().save_config(cfg)
+                                _m().debug_print("🦊 Camoufox proxy: saved arena-auth to browser_cookies for HTTP fallback.")
+                        except (IOError, json.JSONDecodeError) as e:
+                            _m().debug_print(f"🦊 Camoufox proxy: failed to save arena-auth to config: {e}")
+                        except Exception:
+                            pass
+                        break
                 except Exception:
                     pass
 

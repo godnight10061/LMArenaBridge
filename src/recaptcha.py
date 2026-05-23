@@ -103,9 +103,19 @@ def get_recaptcha_settings(config: Optional[dict] = None) -> tuple[str, str]:
         sitekey = _m().RECAPTCHA_SITEKEY
     
     if not action:
+        # Support both auth_tokens (list) and auth_token (legacy singular)
         auth_tokens = cfg.get("auth_tokens", []) if cfg else []
+        # Backward compatibility: also check for singular auth_token
+        singular_token = cfg.get("auth_token", "") if cfg else ""
+        if singular_token and isinstance(auth_tokens, list) and not auth_tokens:
+            auth_tokens = [singular_token]
         if isinstance(auth_tokens, list):
             auth_tokens = [str(t or "").strip() for t in auth_tokens if str(t or "").strip()]
+        
+        # Also check legacy auth_token field
+        legacy_token = str(cfg.get("auth_token") or "").strip() if cfg else ""
+        if legacy_token and legacy_token not in auth_tokens:
+            auth_tokens.append(legacy_token)
         
         has_valid_token = any(
             _m().is_probably_valid_arena_auth_token(t) 
@@ -305,8 +315,8 @@ async def _set_provisional_user_id_in_browser(page, context, *, provisional_user
     try:
         if context is not None:
             # Keep cookie variants in sync:
-            # - Some sessions store `provisional_user_id` as a domain cookie on `.lmarena.ai`
-            # - Others store it as a host-only cookie on `lmarena.ai` (via `url`)
+            # - Some sessions store `provisional_user_id` as a domain cookie on `.arena.ai`
+            # - Others store it as a host-only cookie on `arena.ai` (via `url`)
             # If the two disagree, upstream can reject /nextjs-api/sign-up with confusing errors.
             await context.add_cookies(_m()._provisional_user_id_cookie_specs(provisional_user_id))
     except Exception as e:
@@ -459,14 +469,14 @@ async def get_recaptcha_v3_token_with_chrome(config: dict) -> Optional[str]:
     cookies = []
     # When using domain, do NOT include path - they're mutually exclusive in Playwright
     if cf_clearance:
-        cookies.append({"name": "cf_clearance", "value": cf_clearance, "domain": ".lmarena.ai"})
+        cookies.append({"name": "cf_clearance", "value": cf_clearance, "domain": ".arena.ai"})
     if cf_bm:
-        cookies.append({"name": "__cf_bm", "value": cf_bm, "domain": ".lmarena.ai"})
+        cookies.append({"name": "__cf_bm", "value": cf_bm, "domain": ".arena.ai"})
     if cfuvid:
-        cookies.append({"name": "_cfuvid", "value": cfuvid, "domain": ".lmarena.ai"})
+        cookies.append({"name": "_cfuvid", "value": cfuvid, "domain": ".arena.ai"})
     if provisional_user_id:
         cookies.append(
-            {"name": "provisional_user_id", "value": provisional_user_id, "domain": ".lmarena.ai"}
+            {"name": "provisional_user_id", "value": provisional_user_id, "domain": ".arena.ai"}
         )
     async with async_playwright() as p:
         context = await p.chromium.launch_persistent_context(
@@ -534,7 +544,7 @@ async def get_recaptcha_v3_token_with_chrome(config: dict) -> Optional[str]:
                 marker="LMArenaBridge Chrome Fetch",
                 headless=False,
             )
-            await page.goto("https://lmarena.ai/?mode=direct", wait_until="domcontentloaded", timeout=120000)
+            await page.goto("https://arena.ai/?mode=direct", wait_until="domcontentloaded", timeout=120000)
 
             # Best-effort: if we land on a Cloudflare challenge page, try clicking Turnstile.
             try:
@@ -611,6 +621,7 @@ async def get_recaptcha_v3_token() -> Optional[str]:
     config = _m().get_config()
     cf_clearance = config.get("cf_clearance", "")
     recaptcha_sitekey, recaptcha_action = get_recaptcha_settings(config)
+    _m().debug_print(f"  🔑 Using sitekey: {recaptcha_sitekey[:20]}..., action: {recaptcha_action}")
     
     try:
         chrome_token = await _m().get_recaptcha_v3_token_with_chrome(config)
@@ -627,14 +638,14 @@ async def get_recaptcha_v3_token() -> Optional[str]:
                 await context.add_cookies([{
                     "name": "cf_clearance",
                     "value": cf_clearance,
-                    "domain": ".lmarena.ai",
+                    "domain": ".arena.ai",
                     "path": "/"
                 }])
 
             page = await context.new_page()
             
-            _m().debug_print("  🌐 Navigating to lmarena.ai...")
-            await page.goto("https://lmarena.ai/", wait_until="domcontentloaded")
+            _m().debug_print("  🌐 Navigating to arena.ai...")
+            await page.goto("https://arena.ai/", wait_until="domcontentloaded")
 
             # --- NEW: Cloudflare/Turnstile Pass-Through ---
             _m().debug_print("  🛡️  Checking for Cloudflare Turnstile...")
@@ -675,82 +686,117 @@ async def get_recaptcha_v3_token() -> Optional[str]:
                 page,
                 "() => { const w = window.wrappedJSObject || window; return !!(w.grecaptcha && w.grecaptcha.enterprise); }",
             )
+            _m().debug_print(f"  📦 Library ready: {lib_ready}")
             if not lib_ready:
-                _m().debug_print("  ⚠️ Library not found immediately. Waiting...")
-                await asyncio.sleep(3)
+                _m().debug_print("  ⚠️ Library not found. Checking basic grecaptcha...")
+                lib_ready = await _m().safe_page_evaluate(
+                    page,
+                    "() => { const w = window.wrappedJSObject || window; return !!(w.grecaptcha); }",
+                )
+                _m().debug_print(f"  📦 Basic grecaptcha ready: {lib_ready}")
+            if not lib_ready:
+                _m().debug_print("  ⚠️ Library not found. Injecting reCAPTCHA scripts...")
+                # Inject reCAPTCHA scripts since LMArena may not have them loaded
+                await _m().safe_page_evaluate(
+                    page,
+                    """() => {
+                        const w = window.wrappedJSObject || window;
+                        if (w.__LM_BRIDGE_RECAPTCHA_INJECTED) return true;
+                        w.__LM_BRIDGE_RECAPTCHA_INJECTED = true;
+                        const h = w.document?.head;
+                        if (!h) return false;
+                        const urls = [
+                            'https://www.google.com/recaptcha/enterprise.js?render=' + encodeURIComponent(recaptcha_sitekey),
+                            'https://www.google.com/recaptcha/api.js?render=' + encodeURIComponent(recaptcha_sitekey),
+                        ];
+                        for (const u of urls) {
+                            const s = w.document.createElement('script');
+                            s.src = u;
+                            s.async = true;
+                            s.defer = true;
+                            h.appendChild(s);
+                        }
+                        return true;
+                    }""",
+                    recaptcha_sitekey=recaptcha_sitekey,
+                )
+                # Wait for scripts to load
+                await asyncio.sleep(5)
                 lib_ready = await _m().safe_page_evaluate(
                     page,
                     "() => { const w = window.wrappedJSObject || window; return !!(w.grecaptcha && w.grecaptcha.enterprise); }",
                 )
                 if not lib_ready:
-                    _m().debug_print("❌ reCAPTCHA library never loaded.")
+                    _m().debug_print("❌ reCAPTCHA library still not loaded after injection.")
                     return None
 
-            # 3. SETUP: Initialize our global result variable
-            # We use a unique name to avoid conflicts
-            await _m().safe_page_evaluate(page, "() => { (window.wrappedJSObject || window).__token_result = 'PENDING'; }")
-
-            # 4. TRIGGER: Execute reCAPTCHA and write to the variable
-            # We do NOT await the result here. We just fire the process.
+            # 3. Execute reCAPTCHA using await (more reliable than Promise callbacks)
+            _m().debug_print(f"  🔑 Using sitekey: {recaptcha_sitekey[:20]}..., action: {recaptcha_action}")
             _m().debug_print("  🚀 Triggering reCAPTCHA execution...")
-            # Firefox Xray wrapper blocks inline objects - use new w.Object() pattern
-            trigger_script = f"""() => {{
+            
+            # Wait for page to stabilize before executing reCAPTCHA
+            # SPA navigation can destroy the execution context mid-evaluation
+            try:
+                await page.wait_for_load_state("networkidle", timeout=10000)
+            except Exception:
+                try:
+                    await page.wait_for_load_state("domcontentloaded")
+                except Exception:
+                    pass
+            await asyncio.sleep(1)
+            
+            mint_js = f"""async () => {{
                 const w = window.wrappedJSObject || window;
-                try {{
-                    // Pick the right grecaptcha (enterprise or regular)
+                const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+                
+                const pickG = () => {{
                     const ent = w?.grecaptcha?.enterprise;
-                    const g = (ent && typeof ent.execute === 'function') ? ent : w?.grecaptcha;
-                    if (!g || typeof g.execute !== 'function') {{
-                        w.__token_result = 'SYNC_ERROR: No valid grecaptcha found';
-                        return;
-                    }}
-                    // Firefox Xray wrappers: build params in the page compartment.
-                    const params = new w.Object();
-                    params.action = '{recaptcha_action}';
-                    g.execute('{recaptcha_sitekey}', params)
-                    .then(token => {{
-                        w.__token_result = token;
-                    }})
-                    .catch(err => {{
-                        w.__token_result = 'ERROR: ' + err.toString();
-                    }});
-                }} catch (e) {{
-                    w.__token_result = 'SYNC_ERROR: ' + e.toString();
+                    if (ent && typeof ent.execute === 'function') return ent;
+                    const g = w?.grecaptcha;
+                    if (g && typeof g.execute === 'function') return g;
+                    return null;
+                }};
+                
+                const g = pickG();
+                if (!g || typeof g.execute !== 'function') {{
+                    throw new Error('No valid grecaptcha found');
                 }}
+                
+                // Wait for ready (with timeout)
+                try {{
+                    await Promise.race([
+                        new Promise((resolve) => {{ try {{ g.ready(resolve); }} catch(e) {{ resolve(true); }} }}),
+                        sleep(5000),
+                    ]);
+                }} catch(e) {{}}
+                
+                // Firefox Xray wrappers: build params in the page compartment
+                const params = new w.Object();
+                params.action = '{recaptcha_action}';
+                
+                const token = await g.execute('{recaptcha_sitekey}', params);
+                return String(token || '');
             }}"""
             
-            await _m().safe_page_evaluate(page, trigger_script)
-
-            # 5. POLL: Watch the variable for changes
-            _m().debug_print("  👀 Polling for result...")
-            token = None
+            try:
+                token = await asyncio.wait_for(
+                    page.evaluate(mint_js),
+                    timeout=70.0,
+                )
+            except asyncio.TimeoutError:
+                _m().debug_print("❌ reCAPTCHA execute timed out.")
+                return None
+            except Exception as e:
+                _m().debug_print(f"❌ reCAPTCHA execute failed: {e}")
+                return None
             
-            for i in range(20): # Wait up to 20 seconds
-                # Read the global variable
-                result = await _m().safe_page_evaluate(page, "() => (window.wrappedJSObject || window).__token_result", retries=2)
-                
-                if result != 'PENDING':
-                    if result and result.startswith('ERROR'):
-                        _m().debug_print(f"❌ JS Execution Error: {result}")
-                        return None
-                    elif result and result.startswith('SYNC_ERROR'):
-                        _m().debug_print(f"❌ JS Sync Error: {result}")
-                        return None
-                    else:
-                        token = result
-                        _m().debug_print(f"✅ Token captured! ({len(token)} chars)")
-                        break
-                
-                if i % 2 == 0:
-                    _m().debug_print(f"    ... waiting ({i}s)")
-                await asyncio.sleep(1)
-
             if token:
+                _m().debug_print(f"✅ Token captured! ({len(token)} chars)")
                 _m().RECAPTCHA_TOKEN = token
                 _m().RECAPTCHA_EXPIRY = datetime.now(timezone.utc) + timedelta(seconds=110)
                 return token
             else:
-                _m().debug_print("❌ Timed out waiting for token variable to update.")
+                _m().debug_print("❌ No token returned from reCAPTCHA.")
                 return None
 
     except Exception as e:

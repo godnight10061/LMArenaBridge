@@ -7,11 +7,8 @@
 
 ### As featured in [FMHY](https://fmhy.net/ai#multiple-model-sites)
 
-### Check out my sister project [YuppBridge](https://github.com/cloudWaddie/yuppbridge) - A bridge to interact with Yupp Arena!
-
-
 > [!WARNING]
-> MAJOR REFACTORS ARE HAPPENING.
+> Due to LMArena crackdowns, this project is very hard to maintain. LMArena has cloudflare checkpoints, captchas and ReCAPTCHA enterprise protections on it.
 
 ## Description
 
