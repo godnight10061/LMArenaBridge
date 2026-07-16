@@ -15,6 +15,7 @@ import mimetypes
 import hashlib
 from collections import defaultdict
 from contextlib import asynccontextmanager, AsyncExitStack
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Dict, List
 from datetime import datetime, timezone, timedelta
@@ -39,6 +40,7 @@ import requests
 from playwright.async_api import async_playwright
 
 from . import account_recovery as _account_recovery
+from . import challenge_recovery as _challenge_recovery
 from .browser_window import (
     BrowserWindowMode,
     browser_window_mode,
@@ -707,10 +709,20 @@ conversation_tokens: Dict[str, str] = {}
 # Track failed tokens per request to avoid retrying with same token
 request_failed_tokens: Dict[str, set] = {}
 UI_BRIDGE_LOCK = asyncio.Lock()
+CHALLENGE_RECOVERY_LOCK = asyncio.Lock()
 _UPSTREAM_COOKIE_NAMES = {
     "arena-auth-prod-v1", "arena-auth-prod-v1.0", "arena-auth-prod-v1.1",
     "cf_clearance", "__cf_bm", "_cfuvid", "provisional_user_id",
 }
+
+
+@dataclass(frozen=True)
+class UIWorkerResult:
+    response: Optional[str]
+    attempts: int
+    stage: str
+    error_code: str
+    browser_mode: str
 
 # Ephemeral Arena auth cookie captured from browser sessions (not persisted unless enabled).
 EPHEMERAL_ARENA_AUTH_TOKEN: Optional[str] = None
@@ -788,6 +800,11 @@ def save_config(config, *, preserve_auth_tokens: bool = True):
     except Exception as e:
         debug_print(f"❌ Error saving config: {e}")
 
+
+def _save_managed_account_config(config: dict[str, Any]) -> None:
+    """Persist a verified managed token instead of restoring stale disk tokens."""
+    save_config(config, preserve_auth_tokens=False)
+
 def get_request_headers():
     """Get request headers with the first available auth token (for compatibility)"""
     config = get_config()
@@ -812,7 +829,10 @@ def get_request_headers():
 
 
 async def ensure_authenticated_account(
-    *, reason: str = "request", force_recovery: bool = False
+    *,
+    reason: str = "request",
+    force_recovery: bool = False,
+    force_signup: bool = False,
 ) -> _account_recovery.RecoveryResult:
     config = get_config()
     if not bool(config.get("auto_account_recovery", True)):
@@ -820,7 +840,11 @@ async def ensure_authenticated_account(
             False, "disabled", "none", False, False, "recovery_disabled"
         )
     return await _ensure_managed_authenticated_account(
-        get_config, save_config, reason=reason, force_recovery=force_recovery,
+        get_config,
+        _save_managed_account_config,
+        reason=reason,
+        force_recovery=force_recovery,
+        force_signup=force_signup,
         debug=lambda message: debug_print(redact_text(message)),
     )
 
@@ -1032,20 +1056,134 @@ def build_lmarena_cookie_header(token: str) -> str:
     return "; ".join(f"{name}={value}" for name, value in cookies.items() if value)
 
 
+def _persist_challenge_transition(
+    transition: _challenge_recovery.ChallengeTransition,
+) -> None:
+    if not transition.changed:
+        return
+    config = get_config()
+    if transition.state is None:
+        config.pop("challenge_recovery", None)
+    else:
+        config["challenge_recovery"] = transition.state
+    save_config(config)
+
+
+def _challenge_http_exception(
+    transition: _challenge_recovery.ChallengeTransition,
+    *,
+    detail: str | None = None,
+) -> HTTPException:
+    error_code = transition.error_code or "challenge_unresolved"
+    phase = transition.phase or "cooldown"
+    descriptions = {
+        "cooldown": "Arena challenge unresolved; retry after the bounded cooldown.",
+        "replacement_required": (
+            "Arena challenge remained unresolved after the same-account retry."
+        ),
+        "exhausted": "Arena challenge recovery budget is exhausted.",
+        "none": "Arena replacement signup is not available for this request.",
+    }
+    return HTTPException(
+        status_code=503,
+        detail=detail or descriptions.get(phase, "Arena challenge remains unresolved."),
+        headers={
+            "Retry-After": str(max(0, int(transition.retry_after))),
+            _challenge_recovery.CHALLENGE_ERROR_HEADER: error_code,
+            _challenge_recovery.CHALLENGE_PHASE_HEADER: phase,
+        },
+    )
+
+
 async def _browser_ui_api_response(
-    model_public_name: str, prompt: str, stream: bool
+    model_public_name: str,
+    prompt: str,
+    stream: bool,
+    *,
+    replace_account: bool = False,
 ):
-    recovery = await ensure_authenticated_account(reason="ui_request")
-    if not recovery.ok or not recovery.authenticated:
-        raise HTTPException(
-            status_code=503,
-            detail=f"Managed Arena authentication recovery failed at stage {recovery.stage}",
+    async with CHALLENGE_RECOVERY_LOCK:
+        now = time.time()
+        transition = _challenge_recovery.preflight(
+            get_config().get("challenge_recovery"),
+            model=model_public_name,
+            now=now,
+            replace_requested=replace_account,
         )
-    response_text = await _browser_ui_arena_response_worker(model_public_name, prompt)
-    if not response_text:
-        raise HTTPException(
-            status_code=503, detail="Browser UI transport returned no response."
+        _persist_challenge_transition(transition)
+        if transition.action == "respond":
+            raise _challenge_http_exception(transition)
+
+        force_signup = transition.action == "force_signup"
+        recovery = await ensure_authenticated_account(
+            reason="challenge_replacement" if force_signup else "ui_request",
+            force_signup=force_signup,
         )
+        if not recovery.ok or not recovery.authenticated:
+            if force_signup:
+                exhausted = _challenge_recovery.exhaust(
+                    get_config().get("challenge_recovery"),
+                    model=model_public_name,
+                    now=time.time(),
+                )
+                _persist_challenge_transition(exhausted)
+                raise _challenge_http_exception(
+                    _challenge_recovery.ChallengeTransition(
+                        action="respond",
+                        state=exhausted.state,
+                        error_code="account_replacement_failed",
+                        phase="exhausted",
+                        retry_after=0,
+                    ),
+                    detail=(
+                        "Managed Arena replacement signup failed at stage "
+                        f"{recovery.stage}."
+                    ),
+                )
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Managed Arena authentication recovery failed at stage "
+                    f"{recovery.stage}"
+                ),
+            )
+
+        worker_result = await _browser_ui_arena_response_worker(
+            model_public_name, prompt
+        )
+        response_text = worker_result.response
+        if response_text:
+            success = _challenge_recovery.record_success(
+                get_config().get("challenge_recovery"),
+                model=model_public_name,
+                now=time.time(),
+            )
+            _persist_challenge_transition(success)
+        elif worker_result.error_code == "challenge_unresolved":
+            challenged = _challenge_recovery.record_challenge(
+                get_config().get("challenge_recovery"),
+                model=model_public_name,
+                now=time.time(),
+            )
+            _persist_challenge_transition(challenged)
+            raise _challenge_http_exception(challenged)
+        else:
+            debug_print(
+                "Chrome UI request failed "
+                f"stage={redact_text(worker_result.stage)} "
+                f"error={redact_text(worker_result.error_code)} "
+                f"attempts={worker_result.attempts}"
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="Browser UI transport returned no response.",
+                headers={
+                    _challenge_recovery.CHALLENGE_ERROR_HEADER: (
+                        worker_result.error_code or "empty_ui_response"
+                    )
+                },
+            )
+
     completion_id = f"chatcmpl-{uuid.uuid4()}"
     created = int(time.time())
     if stream:
@@ -2385,6 +2523,7 @@ async def userscript_push(request: Request):
 
 # --- OpenAI Compatible API Endpoints ---
 
+@app.get("/v1/health")
 @app.get("/api/v1/health")
 async def health_check():
     """Health check endpoint for monitoring"""
@@ -2684,8 +2823,14 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
             raise HTTPException(status_code=400, detail=error_msg)
 
         if use_browser_ui:
+            replace_account = str(
+                request.headers.get(_challenge_recovery.REPLACE_ACCOUNT_HEADER) or ""
+            ).strip().lower() in {"1", "true", "yes", "on"}
             return await _browser_ui_api_response(
-                model_public_name, prompt, bool(stream)
+                model_public_name,
+                prompt,
+                bool(stream),
+                replace_account=replace_account,
             )
         
         # Use API key + conversation tracking
@@ -5398,7 +5543,7 @@ async def _browser_ui_arena_response_worker(
     model_public_name: str,
     prompt: str,
     timeout_seconds: int = 220,
-) -> Optional[str]:
+) -> UIWorkerResult:
     """Run the UI transport in an isolated short-lived Python process."""
     worker_path = Path(__file__).resolve().with_name("ui_bridge_worker.py")
     project_root = worker_path.parent.parent
@@ -5429,12 +5574,17 @@ async def _browser_ui_arena_response_worker(
             check=False,
         )
 
+    result = None
+    worker_error_code = ""
     try:
         async with UI_BRIDGE_LOCK:
             result = await asyncio.to_thread(_run_worker)
+    except subprocess.TimeoutExpired:
+        worker_error_code = "worker_timeout"
+        debug_print("Chrome UI worker timed out")
     except Exception as e:
-        debug_print(f"Chrome UI worker failed: {e}")
-        return None
+        worker_error_code = "worker_exception"
+        debug_print(f"Chrome UI worker failed: {type(e).__name__}")
     finally:
         result_text = ""
         try:
@@ -5450,18 +5600,29 @@ async def _browser_ui_arena_response_worker(
         payload = json.loads(result_text or "{}")
     except json.JSONDecodeError:
         payload = {}
-    response = payload.get("response") if isinstance(payload, dict) else None
-    if isinstance(response, str) and response.strip():
-        return response.strip()
-
-    stage = payload.get("stage") if isinstance(payload, dict) else None
-    error_code = payload.get("error_code") if isinstance(payload, dict) else None
-    debug_print(
-        "Chrome UI worker returned no response "
-        f"(exit={result.returncode}, stage={redact_text(stage)}, "
-        f"error={redact_text(error_code)})"
+    payload_dict = payload if isinstance(payload, dict) else {}
+    response = payload_dict.get("response")
+    response_text = response.strip() if isinstance(response, str) and response.strip() else None
+    try:
+        attempts = max(0, int(payload_dict.get("attempts") or 0))
+    except (TypeError, ValueError):
+        attempts = 0
+    stage = str(payload_dict.get("stage") or "worker")
+    error_code = str(payload_dict.get("error_code") or worker_error_code or "")
+    browser_mode = str(payload_dict.get("browser_mode") or "")
+    if not response_text:
+        debug_print(
+            "Chrome UI worker returned no response "
+            f"(exit={result.returncode if result is not None else 'none'}, "
+            f"stage={redact_text(stage)}, error={redact_text(error_code)})"
+        )
+    return UIWorkerResult(
+        response=response_text,
+        attempts=attempts,
+        stage=stage,
+        error_code=error_code or ("empty_ui_response" if not response_text else ""),
+        browser_mode=browser_mode,
     )
-    return None
 
 
 if __name__ == "__main__":

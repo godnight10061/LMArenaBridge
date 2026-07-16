@@ -78,6 +78,7 @@ def _apply_config_defaults(config: dict) -> None:
     config.setdefault("browser_window_mode", "background")
     config.setdefault("browser_ui_all_text_models", False)
     config.setdefault("model_catalog", {})
+    config.setdefault("challenge_recovery", {})
 
     # Normalize api_keys
     if isinstance(config.get("api_keys"), list):

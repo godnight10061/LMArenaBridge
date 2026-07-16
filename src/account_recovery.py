@@ -487,6 +487,29 @@ async def _current_context_auth(context: BrowserContext) -> tuple[str, AuthInspe
     return token, inspect_auth_cookie(token), cookies
 
 
+async def _clear_arena_auth_state(page: Page, context: BrowserContext) -> None:
+    """Remove Arena authentication state while retaining Cloudflare/browser state."""
+    auth_cookie_pattern = re.compile(r"^arena-auth-prod-v1(?:\.\d+)?$")
+    await context.clear_cookies(name=auth_cookie_pattern)
+
+    if not str(page.url or "").startswith(("https://arena.ai", "https://lmarena.ai")):
+        await page.goto("https://arena.ai/", wait_until="domcontentloaded", timeout=120000)
+    for candidate in list(context.pages):
+        if not str(candidate.url or "").startswith(
+            ("https://arena.ai", "https://lmarena.ai")
+        ):
+            continue
+        try:
+            await candidate.evaluate(
+                "() => { window.localStorage.clear(); window.sessionStorage.clear(); }"
+            )
+        except Exception:
+            continue
+    await context.clear_cookies(name=auth_cookie_pattern)
+    await page.goto("https://arena.ai/", wait_until="domcontentloaded", timeout=120000)
+    await page.wait_for_timeout(1000)
+
+
 async def _login(page: Page, context: BrowserContext, account: dict[str, Any]):
     email = str(account.get("address") or "")
     password = str(account.get("password") or "")
@@ -575,13 +598,14 @@ async def ensure_authenticated_account(
     *,
     reason: str = "request",
     force_recovery: bool = False,
+    force_signup: bool = False,
     debug: Optional[DebugFn] = None,
 ) -> RecoveryResult:
     log = debug or (lambda _message: None)
     async with _RECOVERY_LOCK:
         config = config_loader()
         token, inspection = inspect_config_auth(config)
-        if inspection.authenticated and not force_recovery:
+        if inspection.authenticated and not force_recovery and not force_signup:
             return RecoveryResult(True, "inspect", "reuse", False, True)
 
         if str(os.environ.get("LM_AUTO_ACCOUNT_RECOVERY", "1")).lower() in {"0", "false", "no"}:
@@ -639,47 +663,37 @@ async def ensure_authenticated_account(
                 try:
                     page = context.pages[0] if context.pages else await context.new_page()
 
-                    # Stage 1: allow the persistent profile/site to refresh its session.
-                    try:
-                        await page.goto(
-                            "https://arena.ai/",
-                            wait_until="domcontentloaded",
-                            timeout=120000,
-                        )
-                        await page.wait_for_timeout(1500)
-                        fresh_token, fresh_inspection, cookies = await _current_context_auth(context)
-                        if fresh_inspection.authenticated:
-                            _persist(
-                                config_loader,
-                                config_saver,
-                                token=fresh_token,
-                                cookies=cookies,
-                                profile_dir=profile_dir,
-                                executable=executable,
-                                account=config.get("managed_account"),
-                            )
-                            return RecoveryResult(
-                                True,
-                                "refresh",
-                                "refresh",
-                                False,
-                                True,
-                                browser_mode=browser_mode,
-                            )
-                    except Exception as exc:
-                        log(redact_text(f"Managed auth refresh failed: {exc}"))
-
-                    # Stage 2: re-login with the generated account.
-                    account = config.get("managed_account") or {}
-                    if account:
+                    if force_signup:
                         try:
-                            fresh_token, fresh_inspection, cookies = await _login(
-                                page, context, account
+                            await _clear_arena_auth_state(page, context)
+                            log("Managed auth state cleared for one-shot replacement signup")
+                        except Exception as exc:
+                            await capture_failure_artifact(
+                                page, "clear-auth-state", str(exc)
+                            )
+                            log(redact_text(f"Managed auth state clearing failed: {exc}"))
+                            return RecoveryResult(
+                                False,
+                                "clear_auth_state",
+                                "signup",
+                                True,
+                                False,
+                                "auth_state_clear_failed",
+                                browser_mode,
+                            )
+                    else:
+                        # Stage 1: allow the persistent profile/site to refresh its session.
+                        try:
+                            await page.goto(
+                                "https://arena.ai/",
+                                wait_until="domcontentloaded",
+                                timeout=120000,
+                            )
+                            await page.wait_for_timeout(1500)
+                            fresh_token, fresh_inspection, cookies = (
+                                await _current_context_auth(context)
                             )
                             if fresh_inspection.authenticated:
-                                updated = dict(account)
-                                updated["status"] = "active"
-                                updated["last_verified_at"] = int(time.time())
                                 _persist(
                                     config_loader,
                                     config_saver,
@@ -687,24 +701,55 @@ async def ensure_authenticated_account(
                                     cookies=cookies,
                                     profile_dir=profile_dir,
                                     executable=executable,
-                                    account=updated,
+                                    account=config.get("managed_account"),
                                 )
                                 return RecoveryResult(
                                     True,
-                                    "login",
-                                    "login",
+                                    "refresh",
+                                    "refresh",
                                     False,
                                     True,
                                     browser_mode=browser_mode,
                                 )
                         except Exception as exc:
-                            await capture_failure_artifact(
-                                page,
-                                "login",
-                                str(exc),
-                                str(account.get("address") or ""),
-                            )
-                            log(redact_text(f"Managed account login failed: {exc}"))
+                            log(redact_text(f"Managed auth refresh failed: {exc}"))
+
+                        # Stage 2: re-login with the generated account.
+                        account = config.get("managed_account") or {}
+                        if account:
+                            try:
+                                fresh_token, fresh_inspection, cookies = await _login(
+                                    page, context, account
+                                )
+                                if fresh_inspection.authenticated:
+                                    updated = dict(account)
+                                    updated["status"] = "active"
+                                    updated["last_verified_at"] = int(time.time())
+                                    _persist(
+                                        config_loader,
+                                        config_saver,
+                                        token=fresh_token,
+                                        cookies=cookies,
+                                        profile_dir=profile_dir,
+                                        executable=executable,
+                                        account=updated,
+                                    )
+                                    return RecoveryResult(
+                                        True,
+                                        "login",
+                                        "login",
+                                        False,
+                                        True,
+                                        browser_mode=browser_mode,
+                                    )
+                            except Exception as exc:
+                                await capture_failure_artifact(
+                                    page,
+                                    "login",
+                                    str(exc),
+                                    str(account.get("address") or ""),
+                                )
+                                log(redact_text(f"Managed account login failed: {exc}"))
 
                     # Stage 3: create a replacement account using ordered providers.
                     provider_errors: list[str] = []

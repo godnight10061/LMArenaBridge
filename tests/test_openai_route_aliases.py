@@ -49,6 +49,8 @@ class OpenAIRouteAliasTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(post_routes["/v1/chat/completions"], main.api_chat_completions)
         self.assertIs(get_routes["/v1/models"], get_routes["/api/v1/models"])
         self.assertIs(get_routes["/v1/models"], main.list_models)
+        self.assertIs(get_routes["/v1/health"], get_routes["/api/v1/health"])
+        self.assertIs(get_routes["/v1/health"], main.health_check)
 
     async def test_both_paths_reach_identical_handler_validation(self) -> None:
         transport = httpx.ASGITransport(app=main.app, raise_app_exceptions=False)

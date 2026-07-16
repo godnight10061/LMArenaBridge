@@ -72,8 +72,8 @@ def extract_verification_url(*parts: str) -> str:
     import re
 
     content = html.unescape("\n".join(str(part or "") for part in parts))
-    urls = re.findall(r"https?://[^\s\"'<>]+", content)
-    cleaned = [url.rstrip(".,);]}") for url in urls]
+    urls: list[str] = re.findall(r"https?://[^\s\"'<>]+", content)
+    cleaned: list[str] = [url.rstrip(".,);]}") for url in urls]
     preferred = (
         "arena.ai/nextjs-api/callback/email",
         "arena.ai/auth/set-password",
