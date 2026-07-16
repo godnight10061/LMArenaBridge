@@ -13,7 +13,7 @@ import os
 DEBUG = True
 
 # Port to run the server on
-PORT = 8000
+PORT = int(os.environ.get("PORT") or 8000)
 
 # Default config and models file paths
 CONFIG_FILE = os.environ.get("LM_CONFIG_FILE", "config.json")
@@ -23,14 +23,16 @@ MODELS_FILE = os.environ.get("LM_MODELS_FILE", "models.json")
 # HTTP STATUS CODES
 # ============================================================
 
+
 class HTTPStatus:
     """HTTP Status Codes"""
+
     # 1xx Informational
     CONTINUE = 100
     SWITCHING_PROTOCOLS = 101
     PROCESSING = 102
     EARLY_HINTS = 103
-    
+
     # 2xx Success
     OK = 200
     CREATED = 201
@@ -40,7 +42,7 @@ class HTTPStatus:
     RESET_CONTENT = 205
     PARTIAL_CONTENT = 206
     MULTI_STATUS = 207
-    
+
     # 3xx Redirection
     MULTIPLE_CHOICES = 300
     MOVED_PERMANENTLY = 301
@@ -50,7 +52,7 @@ class HTTPStatus:
     USE_PROXY = 305
     TEMPORARY_REDIRECT = 307
     PERMANENT_REDIRECT = 308
-    
+
     # 4xx Client Errors
     BAD_REQUEST = 400
     UNAUTHORIZED = 401
@@ -82,7 +84,7 @@ class HTTPStatus:
     TOO_MANY_REQUESTS = 429
     REQUEST_HEADER_FIELDS_TOO_LARGE = 431
     UNAVAILABLE_FOR_LEGAL_REASONS = 451
-    
+
     # 5xx Server Errors
     INTERNAL_SERVER_ERROR = 500
     NOT_IMPLEMENTED = 501
@@ -153,7 +155,7 @@ STATUS_MESSAGES = {
     504: "Gateway Timeout",
     505: "HTTP Version Not Supported",
     507: "Insufficient Storage",
-    511: "Network Authentication Required"
+    511: "Network Authentication Required",
 }
 
 # ============================================================
@@ -233,6 +235,7 @@ USERSCRIPT_PROXY_JOB_TTL_MAX_SECONDS = 600
 # BACKOFF SETTINGS
 # ============================================================
 
+
 # Exponential backoff for rate limit responses (429)
 def get_rate_limit_backoff_seconds(retry_after: str | None, attempt: int) -> int:
     """Compute backoff seconds for upstream 429 responses."""
@@ -243,27 +246,20 @@ def get_rate_limit_backoff_seconds(retry_after: str | None, attempt: int) -> int
             value = 0
         if value > 0:
             return min(value, 3600)
-    
+
     attempt = max(0, int(attempt))
-    return min(5 * (2 ** attempt), 300)
+    return min(5 * (2**attempt), 300)
 
 
 def get_general_backoff_seconds(attempt: int) -> int:
     """Compute general exponential backoff seconds."""
     attempt = max(0, int(attempt))
-    return min(2 * (2 ** attempt), 30)
+    return min(2 * (2**attempt), 30)
+
 
 # ============================================================
 # BROWSER SETTINGS
 # ============================================================
-
-# Default browser window modes
-DEFAULT_CAMOUFOX_PROXY_WINDOW_MODE = "hide"
-DEFAULT_CAMOUFOX_FETCH_WINDOW_MODE = "hide"
-DEFAULT_CHROME_FETCH_WINDOW_MODE = "hide"
-
-# Window mode valid values
-VALID_WINDOW_MODES = {"hide", "hidden", "minimize", "minimized", "offscreen", "off-screen", "moveoffscreen", "move-offscreen", "visible"}
 
 # Chrome/Edge executable paths (Windows)
 CHROME_PATH_CANDIDATES = [
@@ -329,11 +325,11 @@ CONTENT_TYPE_APPLICATION_JSON = "application/json"
 # ============================================================
 
 TURNSTILE_SELECTORS = [
-    '#lm-bridge-turnstile',
-    '#lm-bridge-turnstile iframe',
-    '#cf-turnstile', 
+    "#lm-bridge-turnstile",
+    "#lm-bridge-turnstile iframe",
+    "#cf-turnstile",
     'iframe[src*="challenges.cloudflare.com"]',
-    '[style*="display: grid"] iframe'
+    '[style*="display: grid"] iframe',
 ]
 
 TURNSTILE_INNER_SELECTORS = [

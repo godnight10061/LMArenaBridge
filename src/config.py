@@ -5,8 +5,7 @@ Handles loading, saving, and managing configuration.
 
 import json
 import os
-from typing import Optional, Dict, Any
-from collections import defaultdict
+from typing import Any, Dict
 
 from . import constants
 
@@ -35,13 +34,13 @@ def get_config() -> dict:
     Returns a dictionary with all configuration values.
     """
     global _current_token_index
-    
+
     # Reset token index if config file changed
     if _current_token_index != 0:
         global_state = _get_global_state()
         if global_state.get("_last_config_file") != _current_config_file:
             _current_token_index = 0
-    
+
     try:
         with open(_current_config_file, "r") as f:
             config = json.load(f)
@@ -52,12 +51,17 @@ def get_config() -> dict:
 
     # Ensure default keys exist
     _apply_config_defaults(config)
-    
+
     return config
 
 
 def _apply_config_defaults(config: dict) -> None:
     """Apply default values to config dictionary."""
+    for key in tuple(config):
+        if str(key).startswith("camoufox_"):
+            config.pop(key, None)
+    config.pop("chrome_fetch_window_mode", None)
+
     config.setdefault("password", "admin")
     config.setdefault("auth_token", "")
     config.setdefault("auth_tokens", [])
@@ -67,9 +71,6 @@ def _apply_config_defaults(config: dict) -> None:
     config.setdefault("usage_stats", {})
     config.setdefault("prune_invalid_tokens", False)
     config.setdefault("persist_arena_auth_cookie", True)
-    config.setdefault("camoufox_proxy_window_mode", constants.DEFAULT_CAMOUFOX_PROXY_WINDOW_MODE)
-    config.setdefault("camoufox_fetch_window_mode", constants.DEFAULT_CAMOUFOX_FETCH_WINDOW_MODE)
-    config.setdefault("chrome_fetch_window_mode", constants.DEFAULT_CHROME_FETCH_WINDOW_MODE)
     config.setdefault("managed_account", {})
     config.setdefault("managed_account_history", [])
     config.setdefault("auto_account_recovery", True)
@@ -77,7 +78,7 @@ def _apply_config_defaults(config: dict) -> None:
     config.setdefault("browser_window_mode", "background")
     config.setdefault("browser_ui_all_text_models", False)
     config.setdefault("model_catalog", {})
-    
+
     # Normalize api_keys
     if isinstance(config.get("api_keys"), list):
         normalized_keys = []
@@ -98,7 +99,7 @@ def _apply_config_defaults(config: dict) -> None:
 def save_config(config: dict, *, preserve_auth_tokens: bool = True) -> None:
     """
     Save configuration to file.
-    
+
     Args:
         config: Configuration dictionary to save
         preserve_auth_tokens: If True, don't overwrite auth tokens from disk
@@ -118,7 +119,7 @@ def save_config(config: dict, *, preserve_auth_tokens: bool = True) -> None:
                     config["auth_token"] = str(on_disk.get("auth_token") or "")
 
         # usage_stats will be set by the caller
-        
+
         target = os.path.abspath(_current_config_file)
         os.makedirs(os.path.dirname(target), exist_ok=True)
         tmp_path = f"{target}.{os.getpid()}.tmp"
@@ -152,6 +153,7 @@ def get_global_state(key: str, default: Any = None) -> Any:
 
 # === Model management ===
 
+
 def get_models() -> list:
     """Load models from file."""
     try:
@@ -180,6 +182,7 @@ def save_models(models: list) -> bool:
 
 # === Default config for startup ===
 
+
 def get_default_config() -> dict:
     """Get default configuration values."""
     return {
@@ -198,7 +201,6 @@ def get_default_config() -> dict:
         "usage_stats": {},
         "prune_invalid_tokens": False,
         "persist_arena_auth_cookie": True,
-        "camoufox_proxy_window_mode": constants.DEFAULT_CAMOUFOX_PROXY_WINDOW_MODE,
-        "camoufox_fetch_window_mode": constants.DEFAULT_CAMOUFOX_FETCH_WINDOW_MODE,
-        "chrome_fetch_window_mode": constants.DEFAULT_CHROME_FETCH_WINDOW_MODE,
+        "browser_window_mode": "background",
+        "browser_ui_all_text_models": False,
     }

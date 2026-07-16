@@ -886,7 +886,7 @@ def get_next_auth_token(exclude_tokens: set = None, *, allow_ephemeral_fallback:
     token = available_tokens[_m().current_token_index % len(available_tokens)]
     _m().current_token_index = (_m().current_token_index + 1) % len(auth_tokens)
     # If we selected a token we can conclusively determine is expired, prefer a valid in-memory token
-    # captured from the browser session (Camoufox/Chrome) rather than hammering upstream with 401s.
+    # captured from the Chrome session rather than hammering upstream with 401s.
     try:
         if token and is_arena_auth_token_expired(token, skew_seconds=0):
             candidate = str(_m().EPHEMERAL_ARENA_AUTH_TOKEN or "").strip()

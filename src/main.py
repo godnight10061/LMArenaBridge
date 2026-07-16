@@ -3,7 +3,6 @@ import builtins as _builtins
 import json
 import os
 import re
-import shutil
 import socket
 import subprocess
 import sys
@@ -19,10 +18,17 @@ from contextlib import asynccontextmanager, AsyncExitStack
 from pathlib import Path
 from typing import Any, Optional, Dict, List
 from datetime import datetime, timezone, timedelta
-from urllib.parse import urlsplit, urlparse, parse_qs
+from urllib.parse import parse_qs, urlparse
+
+if __name__ == "__main__":
+    if not __package__:
+        _repository_root = str(Path(__file__).resolve().parent.parent)
+        if _repository_root not in sys.path:
+            sys.path.insert(0, _repository_root)
+        __package__ = "src"
+    sys.modules["src.main"] = sys.modules[__name__]
 
 import uvicorn
-from camoufox.async_api import AsyncCamoufox
 from fastapi import FastAPI, HTTPException, Depends, status, Form, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.responses import HTMLResponse, RedirectResponse, StreamingResponse
@@ -50,28 +56,13 @@ capture_failure_artifact = _account_recovery.capture_failure_artifact
 from . import constants
 from . import config as _config_module
 from . import state as _state_module
-from .config import get_models, save_models
 from .browser_utils import (
-    _is_windows,
-    _normalize_camoufox_window_mode,
-    _windows_apply_window_mode_by_title_substring,
-    _maybe_apply_camoufox_window_mode,
     click_turnstile,
-    is_execution_context_destroyed_error,
-    safe_page_evaluate,
-    _consume_background_task_exception,
-    _cancel_background_task,
 )
 from .recaptcha import (
     extract_recaptcha_params_from_text,
     get_recaptcha_settings,
-    _mint_recaptcha_v3_token_in_page,
-    _camoufox_proxy_signup_anonymous_user,
-    _set_provisional_user_id_in_browser,
-    _maybe_inject_arena_auth_cookie_from_localstorage,
     find_chrome_executable,
-    get_recaptcha_v3_token_with_chrome,
-    get_recaptcha_v3_token,
     refresh_recaptcha_token,
     get_cached_recaptcha_token,
 )
@@ -116,10 +107,8 @@ from .transport import (
     _normalize_userscript_proxy_url,
     fetch_lmarena_stream_via_userscript_proxy,
     fetch_lmarena_stream_via_chrome,
-    fetch_lmarena_stream_via_camoufox,
     fetch_via_proxy_queue,
     push_proxy_chunk,
-    camoufox_proxy_worker,
 )
 
 # Aliases for backward compatibility
@@ -149,10 +138,6 @@ DEFAULT_USERSCRIPT_PROXY_POLL_TIMEOUT_SECONDS = constants.DEFAULT_USERSCRIPT_PRO
 DEFAULT_USERSCRIPT_PROXY_JOB_TTL_SECONDS = constants.DEFAULT_USERSCRIPT_PROXY_JOB_TTL_SECONDS
 USERSCRIPT_PROXY_ACTIVE_WINDOW_BUFFER_SECONDS = constants.USERSCRIPT_PROXY_ACTIVE_WINDOW_BUFFER_SECONDS
 USERSCRIPT_PROXY_JOB_TTL_MAX_SECONDS = constants.USERSCRIPT_PROXY_JOB_TTL_MAX_SECONDS
-DEFAULT_CAMOUFOX_PROXY_WINDOW_MODE = constants.DEFAULT_CAMOUFOX_PROXY_WINDOW_MODE
-DEFAULT_CAMOUFOX_FETCH_WINDOW_MODE = constants.DEFAULT_CAMOUFOX_FETCH_WINDOW_MODE
-DEFAULT_CHROME_FETCH_WINDOW_MODE = constants.DEFAULT_CHROME_FETCH_WINDOW_MODE
-VALID_WINDOW_MODES = constants.VALID_WINDOW_MODES
 CHROME_PATH_CANDIDATES = constants.CHROME_PATH_CANDIDATES
 EDGE_PATH_CANDIDATES = constants.EDGE_PATH_CANDIDATES
 DEFAULT_USER_AGENT = constants.DEFAULT_USER_AGENT
@@ -184,32 +169,23 @@ def get_general_backoff_seconds(attempt: int) -> int:
     return constants.get_general_backoff_seconds(attempt)
 
 
-def _camoufox_launch_options(*, headless: bool) -> dict[str, Any]:
-    options: dict[str, Any] = {"headless": headless, "main_world_eval": True}
-    try:
-        from camoufox.addons import DefaultAddons
-        options["exclude_addons"] = list(DefaultAddons)
-    except (ImportError, TypeError):
-        pass
-    return options
-
-
 def _find_chromium_executable() -> Optional[str]:
-    configured = str(os.environ.get("LM_CHROME_EXECUTABLE") or os.environ.get("CHROME_PATH") or "").strip()
-    if configured and Path(configured).is_file():
-        return configured
     try:
-        configured = str(get_config().get("chrome_fetch_executable") or "").strip()
+        config = get_config()
     except Exception:
-        configured = ""
-    if configured and Path(configured).is_file():
-        return configured
-    candidates = [
-        *(Path(path) for path in constants.CHROME_PATH_CANDIDATES),
-        *(Path(path) for path in constants.EDGE_PATH_CANDIDATES),
-        Path(os.environ.get("LOCALAPPDATA", "")) / "Google" / "Chrome" / "Application" / "chrome.exe",
-    ]
-    return next((str(candidate) for candidate in candidates if candidate.is_file()), None)
+        config = {}
+    return find_chrome_executable(config)
+
+
+def _configured_chrome_profile_dir(config: dict[str, Any]) -> Path:
+    configured = str(
+        os.environ.get("LM_CHROME_PROFILE_DIR")
+        or config.get("chrome_fetch_user_data_dir")
+        or ""
+    ).strip()
+    profile_dir = Path(configured) if configured else Path.cwd() / ".runtime" / "chrome-profile"
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    return profile_dir.resolve()
 
 
 def _reserve_loopback_port() -> int:
@@ -333,9 +309,6 @@ STREAM_CREATE_EVALUATION_PATH = "/nextjs-api/stream/create-evaluation"
 
 # LMArena occasionally changes the reCAPTCHA sitekey/action. We try to discover them from captured JS chunks on startup
 # and persist them into config.json; these helpers read and apply those values with safe fallbacks.
-
-# _is_windows, _normalize_camoufox_window_mode imported from browser_utils
-
 
 USERSCRIPT_PROXY_LAST_POLL_AT: float = 0.0
 _USERSCRIPT_PROXY_QUEUE: Optional[asyncio.Queue] = None
@@ -855,8 +828,11 @@ async def ensure_authenticated_account(
 def get_models():
     try:
         with open(MODELS_FILE, "r", encoding="utf-8-sig") as file:
-            return json.load(file)
-    except (FileNotFoundError, json.JSONDecodeError):
+            value = json.load(file)
+            if not isinstance(value, list):
+                return []
+            return [item for item in value if isinstance(item, dict)]
+    except (OSError, json.JSONDecodeError):
         return []
 
 
@@ -888,6 +864,55 @@ def _validate_live_model_catalog(value: Any) -> list[dict[str, Any]]:
     return models
 
 
+def _model_preference_key(model: dict[str, Any]) -> tuple:
+    capabilities = model.get("capabilities")
+    capabilities = capabilities if isinstance(capabilities, dict) else {}
+    inputs = capabilities.get("inputCapabilities")
+    inputs = inputs if isinstance(inputs, dict) else {}
+    outputs = capabilities.get("outputCapabilities")
+    outputs = outputs if isinstance(outputs, dict) else {}
+    capability_count = sum(bool(value) for value in inputs.values()) + sum(
+        bool(value) for value in outputs.values()
+    )
+    return (
+        model.get("userSelectable") is not False,
+        bool(model.get("organization")),
+        bool(outputs.get("text")),
+        bool(inputs.get("text")),
+        bool(model.get("provider")),
+        bool(model.get("name")),
+        capability_count,
+    )
+
+
+def _normalize_public_model_catalog(
+    models: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    selected: dict[str, dict[str, Any]] = {}
+    eligible_count = 0
+    for model in models:
+        public_name = str(model.get("publicName") or "").strip()
+        organization = str(model.get("organization") or "").strip()
+        if not public_name or not organization or model.get("userSelectable") is False:
+            continue
+        eligible_count += 1
+        current = selected.get(public_name)
+        if current is None or _model_preference_key(model) > _model_preference_key(current):
+            selected[public_name] = model
+    normalized = list(selected.values())
+    if len(normalized) < 5:
+        raise ValueError("Arena catalog has fewer than five selectable public models")
+    return normalized, eligible_count
+
+
+def _normalize_cached_model_catalog(
+    value: Any,
+) -> tuple[list[dict[str, Any]], int, int]:
+    raw_models = _validate_live_model_catalog(value)
+    public_models, eligible_count = _normalize_public_model_catalog(raw_models)
+    return public_models, len(raw_models), eligible_count
+
+
 def _extract_live_model_catalog(page_html: str) -> list[dict[str, Any]]:
     match = re.search(
         r'{\\"initialModels\\":(\[.*?\]),\\"initialModel[A-Z]Id',
@@ -901,19 +926,35 @@ def _extract_live_model_catalog(page_html: str) -> list[dict[str, Any]]:
 
 
 def _record_model_catalog_status(
-    *, fresh: bool, count: int, error_code: str = ""
+    *,
+    fresh: bool,
+    count: int,
+    error_code: str = "",
+    raw_count: int | None = None,
+    eligible_count: int | None = None,
+    source: str | None = None,
 ) -> dict[str, Any]:
     config = get_config()
     previous = config.get("model_catalog")
     catalog_status = dict(previous) if isinstance(previous, dict) else {}
     now = int(time.time())
-    catalog_status.update({
-        "fresh": fresh, "count": int(count),
-        "source": "arena_initial_models" if fresh else "validated_cache",
-        "last_attempt_at": now, "error_code": str(error_code or ""),
-    })
+    catalog_status.update(
+        {
+            "fresh": fresh,
+            "count": int(count),
+            "source": str(
+                source or ("arena_initial_models" if fresh else "validated_cache")
+            ),
+            "last_attempt_at": now,
+            "error_code": str(error_code or ""),
+        }
+    )
     if fresh:
         catalog_status["last_success_at"] = now
+    if raw_count is not None:
+        catalog_status["raw_count"] = int(raw_count)
+    if eligible_count is not None:
+        catalog_status["eligible_count"] = int(eligible_count)
     config["model_catalog"] = catalog_status
     save_config(config)
     return catalog_status
@@ -1101,243 +1142,160 @@ async def rate_limit_api_key(key: str = Depends(API_KEY_HEADER)):
 
 # --- Core Logic ---
 
-async def get_initial_data():
-    debug_print("Starting initial data retrieval...")
+
+async def get_initial_data() -> dict[str, Any]:
+    """Refresh Arena cookies, actions, and the normalized model cache via Chrome."""
+    cached_models = get_models()
+    captured_responses: list[dict[str, str]] = []
+    page = None
+    session = None
     try:
-        async with AsyncCamoufox(headless=True, main_world_eval=True) as browser:
-            page = await browser.new_page()
-            
-            # Set up route interceptor BEFORE navigating
-            debug_print("  🎯 Setting up route interceptor for JS chunks...")
-            captured_responses = []
-            
+        config = get_config()
+        profile_dir = _configured_chrome_profile_dir(config)
+        async with async_playwright() as playwright:
+            session = await _account_recovery._acquire_browser_session(
+                playwright, config, profile_dir=profile_dir, headless=False
+            )
+            config["chrome_fetch_user_data_dir"] = str(profile_dir)
+            config["chrome_fetch_executable"] = session.executable
+            save_config(config)
+            page = await session.context.new_page()
+
             async def capture_js_route(route):
-                """Intercept and capture JS chunk responses"""
                 url = route.request.url
-                if '/_next/static/chunks/' in url and '.js' in url:
-                    try:
-                        # Fetch the original response
-                        response = await route.fetch()
-                        # Get the response body
-                        body = await response.body()
-                        text = body.decode('utf-8')
-
-                        # debug_print(f"    📥 Captured JS chunk: {url.split('/')[-1][:50]}...")
-                        captured_responses.append({'url': url, 'text': text})
-                        
-                        # Continue with the original response (don't modify)
-                        await route.fulfill(response=response, body=body)
-                    except Exception as e:
-                        debug_print(f"    ⚠️  Error capturing response: {e}")
-                        # If something fails, just continue normally
-                        await route.continue_()
-                else:
-                    # Not a JS chunk, just continue normally
+                if "/_next/static/chunks/" not in url or ".js" not in url:
                     await route.continue_()
-            
-            # Register the route interceptor
-            await page.route('**/*', capture_js_route)
-            
-            debug_print("Navigating to arena.ai...")
-            await page.goto("https://arena.ai/", wait_until="domcontentloaded")
-
-            debug_print("Waiting for Cloudflare challenge to complete...")
-            challenge_passed = False
-            for i in range(12): # Up to 120 seconds
+                    return
                 try:
-                    title = await page.title()
-                except Exception:
-                    title = ""
-                
-                if "Just a moment" not in title:
-                    challenge_passed = True
-                    break
-                
-                debug_print(f"  ⏳ Waiting for Cloudflare challenge... (attempt {i+1}/12)")
-                await click_turnstile(page)
-                
-                try:
-                    await page.wait_for_function(
-                        "() => document.title.indexOf('Just a moment...') === -1", 
-                        timeout=10000
+                    response = await route.fetch()
+                    body = await response.body()
+                    captured_responses.append(
+                        {"url": url, "text": body.decode("utf-8", errors="ignore")}
                     )
-                    challenge_passed = True
+                    await route.fulfill(response=response, body=body)
+                except Exception:
+                    await route.continue_()
+
+            await page.route("**/*", capture_js_route)
+            await page.goto(
+                "https://arena.ai/text/direct",
+                wait_until="domcontentloaded",
+                timeout=120000,
+            )
+            for attempt in range(12):
+                title = str(await page.title() or "")
+                if "Just a moment" not in title:
                     break
-                except Exception:
-                    pass
-            
-            if challenge_passed:
-                debug_print("✅ Cloudflare challenge passed.")
+                debug_print(f"Chrome catalog waiting for challenge {attempt + 1}/12")
+                await click_turnstile(page)
+                await page.wait_for_timeout(1000)
             else:
-                debug_print("❌ Cloudflare challenge took too long or failed.")
-                # Even if the challenge didn't clear, persist any cookies we did get.
-                # Sometimes Cloudflare/BM cookies are still set and can help subsequent attempts.
-                try:
-                    cookies = await page.context.cookies()
-                    _capture_ephemeral_arena_auth_token_from_cookies(cookies)
-                    try:
-                        user_agent = await page.evaluate("() => navigator.userAgent")
-                    except Exception:
-                        user_agent = None
+                raise RuntimeError("Chrome catalog challenge remained unresolved")
 
-                    config = get_config()
-                    ua_for_config = None
-                    if not normalize_user_agent_value(config.get("user_agent")):
-                        ua_for_config = user_agent
-                    if _upsert_browser_session_into_config(config, cookies, user_agent=ua_for_config):
-                        save_config(config)
-                except Exception:
-                    pass
-                return
+            await page.wait_for_timeout(5000)
+            page_body = await page.content()
+            raw_models = _extract_live_model_catalog(page_body)
+            public_models, eligible_count = _normalize_public_model_catalog(raw_models)
+            if not save_models(public_models):
+                raise OSError("atomic model catalog write failed")
 
-            # Give it time to capture all JS responses
-            await asyncio.sleep(5)
-
-            # Persist cookies + UA for downstream httpx/chrome-fetch alignment.
-            cookies = await page.context.cookies()
+            cookies = await session.context.cookies()
             _capture_ephemeral_arena_auth_token_from_cookies(cookies)
-            try:
-                user_agent = await page.evaluate("() => navigator.userAgent")
-            except Exception:
-                user_agent = None
-
+            user_agent = str(await page.evaluate("() => navigator.userAgent") or "")
             config = get_config()
-            # Prefer keeping an existing UA (often set by Chrome contexts) instead of overwriting with Camoufox UA.
-            ua_for_config = None
-            if not normalize_user_agent_value(config.get("user_agent")):
-                ua_for_config = user_agent
-            if _upsert_browser_session_into_config(config, cookies, user_agent=ua_for_config):
+            config["cookie_jar"] = _simplify_cookie_jar(cookies)
+            if _upsert_browser_session_into_config(
+                config, cookies, user_agent=user_agent
+            ):
                 save_config(config)
 
-            if str(config.get("cf_clearance") or "").strip():
-                debug_print(f"✅ Saved cf_clearance token: {str(config.get('cf_clearance'))[:20]}...")
-            else:
-                debug_print("⚠️ Could not find cf_clearance cookie.")
+            action_pattern = (
+                r'\(0,[a-zA-Z_$][\w$]*\.createServerReference\)'
+                r'\(["\']([\w\d]*?)["\'],'
+                r'[a-zA-Z_$][\w$]*\.callServer,void 0,'
+                r'[a-zA-Z_$][\w$]*\.findSourceMapURL,["\'](\w+)["\']\)'
+            )
+            action_regex = "".join(action_pattern)
+            for item in captured_responses:
+                for action_id, action_name in re.findall(action_regex, item["text"]):
+                    _state_module.DISCOVERED_ACTIONS[action_name] = action_id
+            config = get_config()
+            if "generateUploadUrl" in _state_module.DISCOVERED_ACTIONS:
+                config["next_action_upload"] = _state_module.DISCOVERED_ACTIONS[
+                    "generateUploadUrl"
+                ]
+            if "getSignedUrl" in _state_module.DISCOVERED_ACTIONS:
+                config["next_action_signed_url"] = _state_module.DISCOVERED_ACTIONS[
+                    "getSignedUrl"
+                ]
 
-            page_body = ""
-
-            # Extract models
-            debug_print("Extracting models from page...")
-            try:
-                page_body = await page.content()
-                match = re.search(r'{\\"initialModels\\":(\[.*?\]),\\"initialModel[A-Z]Id', page_body, re.DOTALL)
-                if match:
-                    models_json = match.group(1).encode().decode('unicode_escape')
-                    models = json.loads(models_json)
-                    save_models(models)
-                    debug_print(f"✅ Saved {len(models)} models")
-                else:
-                    debug_print("⚠️ Could not find models in page")
-            except Exception as e:
-                debug_print(f"❌ Error extracting models: {e}")
-
-            # Extract Next-Action IDs from captured JavaScript responses (Aggressive Discovery)
-            debug_print(f"\nExtracting Next-Action IDs from {len(captured_responses)} captured JS responses...")
-            try:
-                if not captured_responses:
-                    debug_print("  ⚠️  No JavaScript responses were captured")
-                else:
-                    debug_print(f"  📦 Scanning {len(captured_responses)} JavaScript chunks for Server Actions...")
-                    # Regex pattern based on Next.js server-reference generation:
-                    # (0,a.createServerReference)("HASH",a.callServer,void 0,a.findSourceMapURL,"ACTION_NAME")
-                    action_pattern = r'\(0,[a-zA-Z_$][\w$]*\.createServerReference\)\(["\']([\w\d]*?)["\'],[a-zA-Z_$][\w$]*\.callServer,void 0,[a-zA-Z_$][\w$]*\.findSourceMapURL,["\'](\w+)["\']\)'
-                    
-                    found_count = 0
-                    for item in captured_responses:
-                        text = str(item.get('text', ''))
-                        matches = re.findall(action_pattern, text)
-                        for action_id, action_name in matches:
-                            if _state_module.DISCOVERED_ACTIONS.get(action_name) != action_id:
-                                _state_module.DISCOVERED_ACTIONS[action_name] = action_id
-                                found_count += 1
-                    
-                    if found_count > 0:
-                        debug_print(f"  ✅ Updated {found_count} Next-Action IDs in memory")
-                        if "generateUploadUrl" in _state_module.DISCOVERED_ACTIONS:
-                            config["next_action_upload"] = _state_module.DISCOVERED_ACTIONS["generateUploadUrl"]
-                        if "getSignedUrl" in _state_module.DISCOVERED_ACTIONS:
-                            config["next_action_signed_url"] = _state_module.DISCOVERED_ACTIONS["getSignedUrl"]
-                        save_config(config)
-                    
-                    if _state_module.DISCOVERED_ACTIONS:
-                        debug_print(f"✅ Discovered {len(_state_module.DISCOVERED_ACTIONS)} Server Actions (New/Updated: {found_count})")
-                    
-            except Exception as e:
-                debug_print(f"❌ Error during Server Action discovery: {e}")
-                debug_print("   This is optional - continuing without them")
-
-            # Extract reCAPTCHA sitekey/action from captured JS responses (helps keep up with LMArena changes).
-            debug_print(f"\nExtracting reCAPTCHA params from {len(captured_responses)} captured JS responses...")
-            try:
-                discovered_sitekey: Optional[str] = None
-                discovered_action: Optional[str] = None
-
-                for item in captured_responses or []:
-                    if not isinstance(item, dict):
-                        continue
-                    text = item.get("text")
-                    if not isinstance(text, str) or not text:
-                        continue
-                    sitekey, action = extract_recaptcha_params_from_text(text)
-                    if sitekey and not discovered_sitekey:
-                        discovered_sitekey = sitekey
-                    if action and not discovered_action:
-                        discovered_action = action
-                    if discovered_sitekey and discovered_action:
-                        break
-
-                # Fallback: try the HTML we already captured.
-                if (not discovered_sitekey or not discovered_action) and page_body:
-                    sitekey, action = extract_recaptcha_params_from_text(page_body)
-                    if sitekey and not discovered_sitekey:
-                        discovered_sitekey = sitekey
-                    if action and not discovered_action:
-                        discovered_action = action
-
-                if discovered_sitekey:
-                    config["recaptcha_sitekey"] = discovered_sitekey
-                if discovered_action:
-                    config["recaptcha_action"] = discovered_action
-
-                if discovered_sitekey or discovered_action:
-                    save_config(config)
-                    debug_print("✅ Saved reCAPTCHA params to config")
-                    if discovered_sitekey:
-                        debug_print(f"   Sitekey: {discovered_sitekey[:20]}...")
-                    if discovered_action:
-                        debug_print(f"   Action: {discovered_action}")
-                else:
-                    debug_print("⚠️ Could not extract reCAPTCHA params; using defaults")
-            except Exception as e:
-                debug_print(f"❌ Error extracting reCAPTCHA params: {e}")
-                debug_print("   This is optional - continuing without them")
-
-            # Extract Supabase anon key from captured JS responses (in-memory only).
-            # This enables refreshing expired `arena-auth-prod-v1` sessions without user interaction.
-            try:
+            texts = [item["text"] for item in captured_responses]
+            texts.append(page_body)
+            for text in texts:
+                sitekey, action = extract_recaptcha_params_from_text(text)
+                if sitekey and not config.get("recaptcha_sitekey"):
+                    config["recaptcha_sitekey"] = sitekey
+                if action and not config.get("recaptcha_action"):
+                    config["recaptcha_action"] = action
                 global SUPABASE_ANON_KEY
-                if not str(SUPABASE_ANON_KEY or "").strip():
-                    discovered_key: Optional[str] = None
-                    for item in captured_responses or []:
-                        if not isinstance(item, dict):
-                            continue
-                        text = item.get("text")
-                        if not isinstance(text, str) or not text:
-                            continue
-                        discovered_key = extract_supabase_anon_key_from_text(text)
-                        if discovered_key:
-                            break
-                    if (not discovered_key) and page_body:
-                        discovered_key = extract_supabase_anon_key_from_text(page_body)
-                    if discovered_key:
-                        SUPABASE_ANON_KEY = discovered_key
-                        debug_print(f"✅ Discovered Supabase anon key: {discovered_key[:16]}...")
+                if not SUPABASE_ANON_KEY:
+                    SUPABASE_ANON_KEY = extract_supabase_anon_key_from_text(text)
+            save_config(config)
+            status = _record_model_catalog_status(
+                fresh=True,
+                count=len(public_models),
+                raw_count=len(raw_models),
+                eligible_count=eligible_count,
+            )
+            debug_print(
+                "Chrome catalog refresh complete "
+                f"raw={len(raw_models)} eligible={eligible_count} "
+                f"public={len(public_models)} mode={session.mode}"
+            )
+            return status
+    except Exception as exc:
+        debug_print(f"Chrome catalog refresh failed: {type(exc).__name__}")
+        refresh_error = f"chrome_refresh_{type(exc).__name__.lower()}"
+        try:
+            public_models, raw_count, eligible_count = _normalize_cached_model_catalog(
+                cached_models
+            )
+            if public_models != cached_models and not save_models(public_models):
+                raise OSError("atomic cached catalog normalization failed")
+            return _record_model_catalog_status(
+                fresh=False,
+                count=len(public_models),
+                raw_count=raw_count,
+                eligible_count=eligible_count,
+                error_code=refresh_error,
+            )
+        except Exception as cache_exc:
+            debug_print(
+                "Cached model catalog unavailable "
+                f"reason={type(cache_exc).__name__}"
+            )
+            return _record_model_catalog_status(
+                fresh=False,
+                count=0,
+                raw_count=0,
+                eligible_count=0,
+                source="unavailable",
+                error_code=(
+                    f"{refresh_error}_cache_{type(cache_exc).__name__.lower()}"
+                ),
+            )
+    finally:
+        if page is not None:
+            try:
+                await page.close()
+            except Exception:
+                pass
+        if session is not None:
+            try:
+                await session.close()
             except Exception:
                 pass
 
-            debug_print("✅ Initial data retrieval complete")
-    except Exception as e:
-        debug_print(f"❌ An error occurred during initial data retrieval: {e}")
 
 async def periodic_refresh_task():
     """Background task to refresh cf_clearance and models every 30 minutes"""
@@ -1383,8 +1341,7 @@ async def startup_event():
         # We await this so we have the cookie BEFORE trying reCAPTCHA
         await get_initial_data() 
 
-        # Best-effort: if the user-configured auth cookies are expired base64 sessions, try to refresh one so the
-        # Camoufox proxy worker can start with a valid `arena-auth-prod-v1` cookie.
+        # Best-effort refresh of user-configured authenticated sessions.
         try:
             refreshed = await maybe_refresh_expired_auth_tokens()
         except Exception:
@@ -1392,21 +1349,8 @@ async def startup_event():
         if refreshed:
             debug_print("🔄 Refreshed arena-auth-prod-v1 session (startup).")
         
-        # 2. Do not prefetch reCAPTCHA at startup.
-        # The internal Camoufox userscript-proxy mints tokens in-page for strict models, and non-strict
-        # requests can refresh on-demand. Avoid launching extra browser instances at startup.
-
-        # 3. Start background tasks
+        # Start only the periodic Chrome-backed catalog refresh.
         asyncio.create_task(periodic_refresh_task())
-        
-        # Mark userscript proxy as active at startup to allow immediate delegation
-        # to the internal Camoufox proxy worker.
-        global last_userscript_poll, USERSCRIPT_PROXY_LAST_POLL_AT
-        now = time.time()
-        last_userscript_poll = now
-        USERSCRIPT_PROXY_LAST_POLL_AT = now
-        
-        asyncio.create_task(camoufox_proxy_worker())
         
     except Exception as e:
         debug_print(f"❌ Error during startup: {e}")
@@ -2467,6 +2411,13 @@ async def health_check():
                 "models_loaded": has_models,
                 "model_count": len(models),
                 "model_catalog_fresh": model_catalog_fresh,
+                "model_catalog_count": int(catalog_status.get("count") or 0),
+                "model_catalog_raw_count": int(
+                    catalog_status.get("raw_count") or 0
+                ),
+                "model_catalog_eligible_count": int(
+                    catalog_status.get("eligible_count") or 0
+                ),
                 "model_catalog_source": str(catalog_status.get("source") or "unknown"),
                 "model_catalog_last_success_at": catalog_status.get("last_success_at"),
                 "model_catalog_error_code": str(catalog_status.get("error_code") or ""),
@@ -3054,7 +3005,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                         yield ": keep-alive\n\n"
                         await asyncio.sleep(min(1.0, end_time - time.time()))
 
-                # Use browser transports (Userscript proxy / Chrome/Camoufox) proactively for:
+                # Use browser transports (userscript proxy / Chrome) proactively for:
                 #   - models known to be strict with reCAPTCHA
                 #   - any streaming request when no auth token is available (browser session may be able to sign up / reuse cookies)
                 disable_userscript_proxy_env = bool(os.environ.get("LM_BRIDGE_DISABLE_USERSCRIPT_PROXY"))
@@ -3065,14 +3016,13 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                     except Exception:
                         proxy_active_at_start = False
 
-                # If the userscript proxy is active (internal Camoufox worker / extension poller), route streaming
-                # through it immediately to avoid side-channel reCAPTCHA token minting (which can launch headful Chrome).
+                # If an external userscript proxy is active, avoid unnecessary side-channel
+                # reCAPTCHA token minting before the Chrome/proxy transport attempts.
                 use_browser_transports = (
                     force_browser_transports_in_stream
                     or (model_public_name in STRICT_BROWSER_FETCH_MODELS)
                     or proxy_active_at_start
                 )
-                prefer_chrome_transport = False
                 if use_browser_transports and (model_public_name in STRICT_BROWSER_FETCH_MODELS):
                     debug_print(f"🔐 Strict model detected ({model_public_name}), enabling browser fetch transport.")
                 elif use_browser_transports and force_browser_transports_in_stream:
@@ -3301,107 +3251,18 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                         debug_print(f"⚠️ Chrome fetch transport error: {e}")
                                         return None
 
-                                async def _try_camoufox_fetch() -> Optional[BrowserFetchStreamResponse]:
-                                    debug_print("🦊 Using Camoufox fetch transport for streaming...")
-                                    try:
-                                        auth_for_browser = str(current_token or "").strip()
+                                chrome_task = asyncio.create_task(_try_chrome_fetch())
+                                while True:
+                                    done, _ = await asyncio.wait({chrome_task}, timeout=1.0)
+                                    if chrome_task in done:
                                         try:
-                                            cand = str(EPHEMERAL_ARENA_AUTH_TOKEN or "").strip()
+                                            stream_context = chrome_task.result()
                                         except Exception:
-                                            cand = ""
-                                        if cand:
-                                            try:
-                                                if (
-                                                    is_probably_valid_arena_auth_token(cand)
-                                                    and not is_arena_auth_token_expired(cand, skew_seconds=0)
-                                                    and (
-                                                        (not auth_for_browser)
-                                                        or (not is_probably_valid_arena_auth_token(auth_for_browser))
-                                                        or is_arena_auth_token_expired(auth_for_browser, skew_seconds=0)
-                                                    )
-                                                ):
-                                                    auth_for_browser = cand
-                                            except Exception:
-                                                auth_for_browser = cand
-
-                                        try:
-                                            camoufox_outer_timeout = float(
-                                                get_config().get("camoufox_fetch_outer_timeout_seconds", 180)
-                                            )
-                                        except Exception:
-                                            camoufox_outer_timeout = 180.0
-                                        camoufox_outer_timeout = max(20.0, min(camoufox_outer_timeout, 300.0))
-
-                                        return await asyncio.wait_for(
-                                            fetch_lmarena_stream_via_camoufox(
-                                                http_method=http_method,
-                                                url=url,
-                                                payload=payload if isinstance(payload, dict) else {},
-                                                auth_token=auth_for_browser,
-                                                timeout_seconds=120,
-                                                max_recaptcha_attempts=browser_fetch_attempts,
-                                            ),
-                                            timeout=camoufox_outer_timeout,
-                                        )
-                                    except asyncio.TimeoutError:
-                                        debug_print("⚠️ Camoufox fetch transport timed out (launch/nav hang).")
-                                        return None
-                                    except Exception as e:
-                                        debug_print(f"⚠️ Camoufox fetch transport error: {e}")
-                                        return None
-
-                                if prefer_chrome_transport:
-                                    chrome_task = asyncio.create_task(_try_chrome_fetch())
-                                    while True:
-                                        done, _ = await asyncio.wait({chrome_task}, timeout=1.0)
-                                        if chrome_task in done:
-                                            try:
-                                                stream_context = chrome_task.result()
-                                            except Exception:
-                                                stream_context = None
-                                            break
-                                        yield ": keep-alive\n\n"
-                                    if stream_context is not None:
-                                        transport_used = "chrome"
-                                    if stream_context is None:
-                                        camoufox_task = asyncio.create_task(_try_camoufox_fetch())
-                                        while True:
-                                            done, _ = await asyncio.wait({camoufox_task}, timeout=1.0)
-                                            if camoufox_task in done:
-                                                try:
-                                                    stream_context = camoufox_task.result()
-                                                except Exception:
-                                                    stream_context = None
-                                                break
-                                            yield ": keep-alive\n\n"
-                                        if stream_context is not None:
-                                            transport_used = "camoufox"
-                                else:
-                                    camoufox_task = asyncio.create_task(_try_camoufox_fetch())
-                                    while True:
-                                        done, _ = await asyncio.wait({camoufox_task}, timeout=1.0)
-                                        if camoufox_task in done:
-                                            try:
-                                                stream_context = camoufox_task.result()
-                                            except Exception:
-                                                stream_context = None
-                                            break
-                                        yield ": keep-alive\n\n"
-                                    if stream_context is not None:
-                                        transport_used = "camoufox"
-                                    if stream_context is None:
-                                        chrome_task = asyncio.create_task(_try_chrome_fetch())
-                                        while True:
-                                            done, _ = await asyncio.wait({chrome_task}, timeout=1.0)
-                                            if chrome_task in done:
-                                                try:
-                                                    stream_context = chrome_task.result()
-                                                except Exception:
-                                                    stream_context = None
-                                                break
-                                            yield ": keep-alive\n\n"
-                                        if stream_context is not None:
-                                            transport_used = "chrome"
+                                            stream_context = None
+                                        break
+                                    yield ": keep-alive\n\n"
+                                if stream_context is not None:
+                                    transport_used = "chrome"
 
                             # Userscript proxy: backup transport after browser transports fail.
                             if stream_context is None and userscript_proxy_available and not disable_userscript_for_request:
@@ -3480,9 +3341,8 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                         proxy_status_timeout_seconds = 30.0
                                     proxy_status_timeout_seconds = max(5.0, min(proxy_status_timeout_seconds, 300.0))
 
-                                    # Time between pickup and the proxy actually starting the upstream fetch. When the
-                                    # Camoufox proxy needs to perform anonymous signup / Turnstile preflight, this can
-                                    # legitimately take much longer than the upstream-status timeout.
+                                    # Time between pickup and the proxy actually starting the upstream fetch. Browser
+                                    # signup or Turnstile preflight can legitimately take longer than the status timeout.
                                     try:
                                         proxy_preflight_timeout_seconds = float(
                                             get_config().get(
@@ -3594,7 +3454,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                                         f"⚠️ Userscript proxy did not report upstream status within {int(proxy_status_timeout_seconds)}s."
                                                     )
                                                     # Treat the proxy as unavailable for the rest of this request and fall back
-                                                    # to other transports (Chrome/Camoufox/httpx). Otherwise we'd keep queuing
+                                                    # to Chrome/httpx. Otherwise we'd keep queuing
                                                     # jobs that will never be picked up and stall for a long time.
                                                     disable_userscript_for_request = True
                                                     try:
@@ -3807,8 +3667,8 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                             and not proxy_done_event.is_set()
                                         ):
                                             # Important: do not enqueue a new proxy job while the current one is still
-                                            # running. The internal Camoufox worker is single-threaded and will not pick
-                                            # up new jobs until `page.evaluate()` returns.
+                                            # running. The browser helper may be single-flight and may not pick up a new
+                                            # job until its current in-page request returns.
                                             remaining_budget = float(stream_total_timeout_seconds) - float(
                                                 time.monotonic() - stream_started_at
                                             )
@@ -3926,7 +3786,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                                 recaptcha_403_consecutive = 1
                                                 recaptcha_403_last_transport = transport_used
 
-                                            if transport_used in ("chrome", "camoufox"):
+                                            if transport_used == "chrome":
                                                 try:
                                                     debug_print(
                                                         "Refreshing token/cookies (side-channel) after browser fetch 403..."
@@ -3959,10 +3819,9 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
 
                                             if recaptcha_403_consecutive >= 2 and transport_used == "chrome":
                                                 debug_print(
-                                                    "Switching to Camoufox-first after repeated Chrome reCAPTCHA failures."
+                                                    "Retrying Chrome fetch with a freshly minted token after repeated reCAPTCHA failures."
                                                 )
                                                 use_browser_transports = True
-                                                prefer_chrome_transport = False
                                                 recaptcha_403_consecutive = 0
                                                 recaptcha_403_last_transport = None
                                             elif recaptcha_403_consecutive >= 2 and transport_used != "chrome":
@@ -3970,7 +3829,6 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                                     "🌐 Switching to Chrome fetch transport after repeated reCAPTCHA failures."
                                                 )
                                                 use_browser_transports = True
-                                                prefer_chrome_transport = True
                                                 recaptcha_403_consecutive = 0
                                                 recaptcha_403_last_transport = None
 
@@ -4678,16 +4536,10 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                         )
                         
                         if response is None:
-                            debug_print(f"⚠️ Chrome fetch transport failed (attempt {chrome_attempt+1}). Trying Camoufox...")
-                            response = await fetch_lmarena_stream_via_camoufox(
-                                http_method=http_method,
-                                url=url,
-                                payload=payload if isinstance(payload, dict) else {},
-                                auth_token=current_token,
-                                timeout_seconds=120,
+                            debug_print(
+                                f"⚠️ Chrome fetch transport failed (attempt {chrome_attempt + 1})."
                             )
-                            if response is None:
-                                break # Critical error
+                            break
                         
                         if response.status_code == HTTPStatus.UNAUTHORIZED:
                             debug_print(f"🔒 Token {current_token[:20]}... expired in Chrome fetch (attempt {chrome_attempt+1})")
@@ -5612,6 +5464,12 @@ async def _browser_ui_arena_response_worker(
 
 
 if __name__ == "__main__":
+    _runtime_module = sys.modules[__name__]
+    if sys.modules.get("src.main") is not _runtime_module:
+        raise RuntimeError("Bridge entry point loaded duplicate main module state")
+    for _module_name in ("src.auth", "src.recaptcha", "src.transport"):
+        if sys.modules[_module_name]._m() is not _runtime_module:
+            raise RuntimeError(f"{_module_name} resolved duplicate main module state")
     # Avoid crashes on Windows consoles with non-UTF8 code pages (e.g., GBK) when printing emojis.
     try:
         import sys
