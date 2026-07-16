@@ -46,7 +46,7 @@ A bridge to interact with LM Arena. This project provides an OpenAI compatible A
 
 ### Userscript Proxy (optional)
 
-There is an optional **userscript proxy** path that can improve reliability for some strict models and reCAPTCHA flows. It is **not required** and the bridge can run without it using direct httpx + browser fetch (Chrome/Camoufox).
+There is an optional **userscript proxy** path that can improve reliability for some strict models and reCAPTCHA flows. It is **not required** and the bridge can run without it using direct httpx plus Chrome browser fetch.
 
 **Notes:**
 - The userscript is optional and only helpful in specific environments.
@@ -95,7 +95,8 @@ $env:LM_BROWSER_UI_ALL_TEXT_MODELS = "1"
 python src/live_gemini_check.py `
   --model gemini-3.5-flash `
   --minimum-model-successes 5 `
-  --model-candidate-limit 8
+  --model-candidate-limit 8 `
+  --request-delay 5
 ```
 
 This path uses the real browser, account flow, LM Arena UI, and Gemini response.
@@ -134,7 +135,9 @@ To use the LM Arena Bridge, you need to get your authentication token from the L
 
 ### 2. Configure the Application
 
-1.  Run the bridge: `python -m src.main`
+1.  Run the bridge with either supported entry point:
+    - `python -m src.main`
+    - `python src/main.py`
 2.  Open the admin portal at `http://localhost:8000/dashboard`
 3.  Login with the default password: `admin`
 4.  Add your `arena-auth-prod-v1` token to the list
@@ -146,6 +149,8 @@ Once you have configured your authentication token, you can run the application:
 
 ```bash
 python -m src.main
+# or
+python src/main.py
 ```
 
 The application will start a server on `localhost:8000`.
@@ -160,6 +165,8 @@ You can use this project as a backend for [OpenWebUI](https://openwebui.com/), a
     Make sure the `lmarenabridge` application is running.
     ```bash
     python -m src.main
+    # or
+    python src/main.py
     ```
 
 2.  **Open OpenWebUI:**
