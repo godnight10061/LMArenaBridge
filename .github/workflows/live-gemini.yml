@@ -46,7 +46,7 @@ jobs:
     name: live-gemini-windows
     if: github.event_name != 'pull_request'
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     env:
       PYTHONIOENCODING: utf-8
       PORT: "18080"
@@ -80,6 +80,15 @@ jobs:
       - name: Create isolated bridge configuration
         shell: pwsh
         run: |
+          $workspace = [IO.Path]::GetFullPath('${{ github.workspace }}')
+          $runtime = [IO.Path]::GetFullPath((Join-Path $workspace '.runtime'))
+          $workspacePrefix = $workspace + [IO.Path]::DirectorySeparatorChar
+          if (-not $runtime.StartsWith($workspacePrefix, [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'Runtime directory resolved outside the workspace.'
+          }
+          if (Test-Path -LiteralPath $runtime) {
+            Remove-Item -LiteralPath $runtime -Recurse -Force
+          }
           New-Item -ItemType Directory -Force .runtime, .runtime\artifacts, .runtime\chrome-profile | Out-Null
           @{
             password = 'ci-local-only'
@@ -88,6 +97,10 @@ jobs:
             browser_cookies = @{}
             cookie_jar = @()
             cf_clearance = ''
+            provisional_user_id = ''
+            managed_account = @{}
+            managed_account_history = @()
+            challenge_recovery = @{}
             auto_account_recovery = $true
             chrome_fetch_reuse_cdp = $true
             browser_window_mode = 'background'
@@ -119,14 +132,15 @@ jobs:
         shell: pwsh
         run: |
           python src/live_gemini_check.py `
-            --base-url http://127.0.0.1:18080/api/v1 `
+            --base-url http://127.0.0.1:18080/v1 `
             --model gemini-3.5-flash `
             --health-timeout 600 `
-            --request-timeout 420 `
+            --request-timeout 600 `
             --minimum-model-successes 5 `
             --model-candidate-limit 8 `
             --model-smoke-timeout 180 `
-            --request-delay 5
+            --request-delay 5 `
+            --require-clean-signup
 
       - name: Sanitize text artifacts
         if: failure()
