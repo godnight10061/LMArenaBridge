@@ -47,6 +47,7 @@ from .browser_window import (
     chrome_window_args,
     windows_startupinfo,
 )
+from .console_output import configure_standard_streams, render_for_encoding
 from .gemini_transcript import build_transcript as _build_gemini_transcript
 
 _ensure_managed_authenticated_account = _account_recovery.ensure_authenticated_account
@@ -247,7 +248,7 @@ def safe_print(*args, **kwargs) -> None:
         try:
             text = sep.join(str(a) for a in args) + end
             encoding = getattr(file, "encoding", None) or getattr(sys.stdout, "encoding", None) or "utf-8"
-            safe_text = text.encode(encoding, errors="backslashreplace").decode(encoding, errors="ignore")
+            safe_text = render_for_encoding(text, encoding)
             file.write(safe_text)
             if flush:
                 try:
@@ -267,6 +268,16 @@ def debug_print(*args, **kwargs):
     """Print debug messages only if DEBUG is True"""
     if DEBUG:
         print(*args, **kwargs)
+
+
+def _system_prompt_log_metadata(
+    system_messages: list[dict[str, Any]], system_prompt: str
+) -> str:
+    """Describe system instructions without logging their content."""
+    return (
+        f"System prompt messages={len(system_messages)} "
+        f"chars={len(str(system_prompt or ''))}"
+    )
 
 
 def get_status_emoji(status_code: int) -> str:
@@ -1102,11 +1113,16 @@ async def _browser_ui_api_response(
     *,
     replace_account: bool = False,
 ):
+    request_fingerprint = _challenge_recovery.fingerprint_request(
+        model=model_public_name,
+        prompt=prompt,
+    )
     async with CHALLENGE_RECOVERY_LOCK:
         now = time.time()
         transition = _challenge_recovery.preflight(
             get_config().get("challenge_recovery"),
             model=model_public_name,
+            request_fingerprint=request_fingerprint,
             now=now,
             replace_requested=replace_account,
         )
@@ -1124,6 +1140,7 @@ async def _browser_ui_api_response(
                 exhausted = _challenge_recovery.exhaust(
                     get_config().get("challenge_recovery"),
                     model=model_public_name,
+                    request_fingerprint=request_fingerprint,
                     now=time.time(),
                 )
                 _persist_challenge_transition(exhausted)
@@ -1156,6 +1173,7 @@ async def _browser_ui_api_response(
             success = _challenge_recovery.record_success(
                 get_config().get("challenge_recovery"),
                 model=model_public_name,
+                request_fingerprint=request_fingerprint,
                 now=time.time(),
             )
             _persist_challenge_transition(success)
@@ -1163,6 +1181,7 @@ async def _browser_ui_api_response(
             challenged = _challenge_recovery.record_challenge(
                 get_config().get("challenge_recovery"),
                 model=model_public_name,
+                request_fingerprint=request_fingerprint,
                 now=time.time(),
             )
             _persist_challenge_transition(challenged)
@@ -2768,7 +2787,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
         system_messages = [m for m in messages if m.get("role") == "system"]
         if system_messages:
             system_prompt = "\n\n".join([_coerce_message_content_to_text(m.get("content", "")) for m in system_messages])
-            debug_print(f"📋 System prompt found: {system_prompt[:100]}..." if len(system_prompt) > 100 else f"📋 System prompt: {system_prompt}")
+            debug_print(_system_prompt_log_metadata(system_messages, system_prompt))
         
         # Process last message content (may include images)
         try:
@@ -5632,14 +5651,7 @@ if __name__ == "__main__":
     for _module_name in ("src.auth", "src.recaptcha", "src.transport"):
         if sys.modules[_module_name]._m() is not _runtime_module:
             raise RuntimeError(f"{_module_name} resolved duplicate main module state")
-    # Avoid crashes on Windows consoles with non-UTF8 code pages (e.g., GBK) when printing emojis.
-    try:
-        import sys
-
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-    except Exception:
-        pass
+    configure_standard_streams(sys.stdout, sys.stderr)
 
     print("=" * 60)
     print("🚀 LMArena Bridge Server Starting...")

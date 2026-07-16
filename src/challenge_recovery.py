@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
+import re
 from dataclasses import dataclass
 from typing import Any, Literal
 
-CHALLENGE_STATE_SCHEMA = 1
+CHALLENGE_STATE_SCHEMA = 2
 CHALLENGE_COOLDOWN_SECONDS = 900
 CHALLENGE_STATE_TTL_SECONDS = 24 * 60 * 60
 CHALLENGE_ERROR_HEADER = "X-LMBridge-Error-Code"
@@ -29,6 +32,7 @@ _VALID_PHASES = {
     "final_attempt",
     "exhausted",
 }
+_FINGERPRINT_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 @dataclass(frozen=True)
@@ -39,6 +43,20 @@ class ChallengeTransition:
     phase: str = ""
     retry_after: int = 0
     changed: bool = False
+
+
+def fingerprint_request(*, model: str, prompt: str) -> str:
+    """Return a stable non-reversible identity for the rendered Arena request."""
+    canonical = json.dumps(
+        {
+            "model": str(model or "").strip(),
+            "prompt": str(prompt or ""),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
 
 
 def _as_timestamp(value: Any) -> int | None:
@@ -69,9 +87,15 @@ def _normalize(value: Any, *, now: float) -> tuple[dict[str, Any] | None, bool]:
 
     phase = str(value.get("phase") or "").strip()
     model = str(value.get("model") or "").strip()
+    request_fingerprint = str(value.get("request_fingerprint") or "").strip().lower()
     first_challenge_at = _as_timestamp(value.get("first_challenge_at"))
     retry_not_before = _as_timestamp(value.get("retry_not_before")) or 0
-    if phase not in _VALID_PHASES or not model or first_challenge_at is None:
+    if (
+        phase not in _VALID_PHASES
+        or not model
+        or not _FINGERPRINT_RE.fullmatch(request_fingerprint)
+        or first_challenge_at is None
+    ):
         return None, True
     if float(now) - first_challenge_at >= CHALLENGE_STATE_TTL_SECONDS:
         return None, True
@@ -80,6 +104,7 @@ def _normalize(value: Any, *, now: float) -> tuple[dict[str, Any] | None, bool]:
         "schema": CHALLENGE_STATE_SCHEMA,
         "phase": phase,
         "model": model,
+        "request_fingerprint": request_fingerprint,
         "first_challenge_at": first_challenge_at,
         "retry_not_before": retry_not_before,
         "replacement_used": _as_bool(value.get("replacement_used", False)),
@@ -95,6 +120,14 @@ def normalize_state(value: Any, *, now: float) -> dict[str, Any] | None:
 
 def _remaining_cooldown(state: dict[str, Any], *, now: float) -> int:
     return max(0, int(math.ceil(float(state["retry_not_before"]) - float(now))))
+
+
+def _matches_request(state: dict[str, Any], *, model: str, request_fingerprint: str) -> bool:
+    return (
+        str(state.get("model") or "").strip() == str(model or "").strip()
+        and str(state.get("request_fingerprint") or "").strip().lower()
+        == str(request_fingerprint or "").strip().lower()
+    )
 
 
 def _response(
@@ -119,12 +152,12 @@ def preflight(
     value: Any,
     *,
     model: str,
+    request_fingerprint: str,
     now: float,
     replace_requested: bool,
 ) -> ChallengeTransition:
     """Decide whether a request runs, waits, or consumes the replacement budget."""
     state, changed = _normalize(value, now=now)
-    requested_model = str(model or "").strip()
     if state is None:
         if replace_requested:
             return _response(
@@ -134,12 +167,16 @@ def preflight(
                 changed=changed,
             )
         return ChallengeTransition(action="run", state=None, changed=changed)
-    if state["model"] != requested_model:
+    if not _matches_request(
+        state,
+        model=model,
+        request_fingerprint=request_fingerprint,
+    ):
         if replace_requested:
             return _response(
                 state,
                 error_code="replacement_not_ready",
-                phase=str(state["phase"]),
+                phase="request_mismatch",
                 changed=changed,
             )
         return ChallengeTransition(action="run", state=state, changed=changed)
@@ -222,16 +259,28 @@ def preflight(
     )
 
 
-def record_challenge(value: Any, *, model: str, now: float) -> ChallengeTransition:
+def record_challenge(
+    value: Any,
+    *,
+    model: str,
+    request_fingerprint: str,
+    now: float,
+) -> ChallengeTransition:
     """Persist the next bounded phase after a real unresolved browser challenge."""
     state, changed = _normalize(value, now=now)
     requested_model = str(model or "").strip()
-    if state is None or state["model"] != requested_model:
+    requested_fingerprint = str(request_fingerprint or "").strip().lower()
+    if state is None or not _matches_request(
+        state,
+        model=requested_model,
+        request_fingerprint=requested_fingerprint,
+    ):
         timestamp = int(float(now))
         updated = {
             "schema": CHALLENGE_STATE_SCHEMA,
             "phase": "cooldown",
             "model": requested_model,
+            "request_fingerprint": requested_fingerprint,
             "first_challenge_at": timestamp,
             "retry_not_before": timestamp + CHALLENGE_COOLDOWN_SECONDS,
             "replacement_used": False,
@@ -286,10 +335,20 @@ def record_challenge(value: Any, *, model: str, now: float) -> ChallengeTransiti
     )
 
 
-def exhaust(value: Any, *, model: str, now: float) -> ChallengeTransition:
+def exhaust(
+    value: Any,
+    *,
+    model: str,
+    request_fingerprint: str,
+    now: float,
+) -> ChallengeTransition:
     """Consume the recovery budget after a terminal replacement/final-attempt failure."""
     state, changed = _normalize(value, now=now)
-    if state is None or state["model"] != str(model or "").strip():
+    if state is None or not _matches_request(
+        state,
+        model=model,
+        request_fingerprint=request_fingerprint,
+    ):
         return ChallengeTransition(action="respond", state=state, changed=changed)
     if state["phase"] == "exhausted":
         return _response(
@@ -310,9 +369,19 @@ def exhaust(value: Any, *, model: str, now: float) -> ChallengeTransition:
     )
 
 
-def record_success(value: Any, *, model: str, now: float) -> ChallengeTransition:
+def record_success(
+    value: Any,
+    *,
+    model: str,
+    request_fingerprint: str,
+    now: float,
+) -> ChallengeTransition:
     """Clear matching challenge metadata after a successful model response."""
     state, changed = _normalize(value, now=now)
-    if state is not None and state["model"] == str(model or "").strip():
+    if state is not None and _matches_request(
+        state,
+        model=model,
+        request_fingerprint=request_fingerprint,
+    ):
         return ChallengeTransition(action="run", state=None, changed=True)
     return ChallengeTransition(action="run", state=state, changed=changed)
