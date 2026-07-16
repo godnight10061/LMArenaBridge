@@ -51,6 +51,7 @@ jobs:
       PYTHONIOENCODING: utf-8
       PORT: "18080"
       LM_CONFIG_FILE: ${{ github.workspace }}\.runtime\config.json
+      LM_MODELS_FILE: ${{ github.workspace }}\.runtime\models.json
       LM_CHROME_PROFILE_DIR: ${{ github.workspace }}\.runtime\chrome-profile
       LM_RECOVERY_ARTIFACT_DIR: ${{ github.workspace }}\.runtime\artifacts
       LM_LIVE_ARTIFACT_DIR: ${{ github.workspace }}\.runtime\artifacts
@@ -124,7 +125,8 @@ jobs:
             --request-timeout 420 `
             --minimum-model-successes 5 `
             --model-candidate-limit 8 `
-            --model-smoke-timeout 180
+            --model-smoke-timeout 180 `
+            --request-delay 5
 
       - name: Sanitize text artifacts
         if: failure()

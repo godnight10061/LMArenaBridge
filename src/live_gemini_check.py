@@ -52,6 +52,16 @@ _MODEL_NAME_EXCLUSIONS = (
 )
 
 
+def _bounded_request_delay(value: float) -> float:
+    """Keep live request pacing bounded without weakening the matrix."""
+    return max(0.0, min(float(value), 30.0))
+
+
+def _pause_between_requests(seconds: float) -> None:
+    if seconds > 0:
+        time.sleep(seconds)
+
+
 def _load_api_key() -> str:
     configured = str(os.environ.get("LM_BRIDGE_API_KEY") or "").strip()
     if configured:
@@ -336,9 +346,7 @@ def _model_smoke(
         result["latency_seconds"] = round(time.monotonic() - started, 3)
 
 
-def _successful_candidate_models(
-    attempts: list[dict[str, Any]], *, primary_model: str
-) -> set[str]:
+def _successful_candidate_models(attempts: list[dict[str, Any]], *, primary_model: str) -> set[str]:
     """Return distinct passing smoke-test models, excluding mandatory Gemini."""
     return {
         str(attempt.get("model") or "")
@@ -358,7 +366,14 @@ def main() -> int:
     parser.add_argument("--minimum-model-successes", type=int, default=5)
     parser.add_argument("--model-candidate-limit", type=int, default=8)
     parser.add_argument("--model-smoke-timeout", type=float, default=180)
+    parser.add_argument(
+        "--request-delay",
+        type=float,
+        default=float(os.environ.get("LM_LIVE_REQUEST_DELAY_SECONDS") or 5),
+        help="Seconds to wait between real Arena requests (bounded to 0-30).",
+    )
     args = parser.parse_args()
+    request_delay = _bounded_request_delay(args.request_delay)
 
     base_url = args.base_url.rstrip("/")
     artifact_dir = Path(os.environ.get("LM_LIVE_ARTIFACT_DIR") or ".runtime/artifacts")
@@ -368,15 +383,14 @@ def main() -> int:
         "model": args.model,
         "started_at": int(time.time()),
         "status": "failed",
+        "request_delay_seconds": request_delay,
     }
     try:
         api_key = _load_api_key()
         headers = {"Authorization": f"Bearer {api_key}"}
         timeout = httpx.Timeout(args.request_timeout, connect=30)
         with httpx.Client(timeout=timeout) as client:
-            summary["health"] = _wait_for_health(
-                client, f"{base_url}/health", args.health_timeout
-            )
+            summary["health"] = _wait_for_health(client, f"{base_url}/health", args.health_timeout)
             if not bool((summary["health"].get("checks") or {}).get("model_catalog_fresh")):
                 raise LiveCheckFailure(
                     "model_refresh", "Bridge started without a fresh Arena model catalog"
@@ -399,9 +413,9 @@ def main() -> int:
             summary["non_streaming"] = _non_streaming(
                 client, completion_url, headers, args.model, nonce_a
             )
-            summary["streaming"] = _streaming(
-                client, completion_url, headers, args.model, nonce_b
-            )
+            _pause_between_requests(request_delay)
+            summary["streaming"] = _streaming(client, completion_url, headers, args.model, nonce_b)
+            _pause_between_requests(request_delay)
             nonce_c = "BRIDGE_CONTEXT_OK_" + uuid.uuid4().hex[:12].upper()
             summary["contextual"] = _contextual(
                 client, completion_url, headers, args.model, nonce_c
@@ -427,6 +441,7 @@ def main() -> int:
                 limit=max(0, args.model_candidate_limit),
             )
             for candidate in candidates:
+                _pause_between_requests(request_delay)
                 result = _model_smoke(
                     client,
                     completion_url,
@@ -440,9 +455,7 @@ def main() -> int:
                 )
                 if len(successful_candidates) >= args.minimum_model_successes:
                     break
-            successful_candidates = _successful_candidate_models(
-                matrix, primary_model=args.model
-            )
+            successful_candidates = _successful_candidate_models(matrix, primary_model=args.model)
             summary["model_matrix"] = {
                 "required_successes": args.minimum_model_successes,
                 "successful_models": len(successful_candidates),
