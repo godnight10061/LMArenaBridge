@@ -193,40 +193,16 @@ def normalize_user_agent_value(user_agent: object) -> str:
 def get_request_headers_with_token(token: str, recaptcha_v3_token: Optional[str] = None):
     """Get request headers with a specific auth token and optional reCAPTCHA v3 token"""
     config = _m().get_config()
-    cf_clearance = str(config.get("cf_clearance") or "").strip()
-    cf_bm = str(config.get("cf_bm") or "").strip()
-    cfuvid = str(config.get("cfuvid") or "").strip()
-    provisional_user_id = str(config.get("provisional_user_id") or "").strip()
-
-    cookie_store = config.get("browser_cookies")
-    if isinstance(cookie_store, dict):
-        if not cf_clearance:
-            cf_clearance = str(cookie_store.get("cf_clearance") or "").strip()
-        if not cf_bm:
-            cf_bm = str(cookie_store.get("__cf_bm") or "").strip()
-        if not cfuvid:
-            cfuvid = str(cookie_store.get("_cfuvid") or "").strip()
-        if not provisional_user_id:
-            provisional_user_id = str(cookie_store.get("provisional_user_id") or "").strip()
-
-    cookie_parts: list[str] = []
-
-    def _add_cookie(name: str, value: str) -> None:
-        value = str(value or "").strip()
-        if value:
-            cookie_parts.append(f"{name}={value}")
-
-    _add_cookie("cf_clearance", cf_clearance)
-    _add_cookie("__cf_bm", cf_bm)
-    _add_cookie("_cfuvid", cfuvid)
-    _add_cookie("provisional_user_id", provisional_user_id)
-    _add_cookie("arena-auth-prod-v1", token)
-
     headers: dict[str, str] = {
+        "Accept": "text/event-stream, application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
         "Content-Type": "text/plain;charset=UTF-8",
-        "Cookie": "; ".join(cookie_parts),
+        "Cookie": _m().build_lmarena_cookie_header(token),
         "Origin": "https://arena.ai",
         "Referer": "https://arena.ai/?mode=direct",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
     }
 
     user_agent = normalize_user_agent_value(config.get("user_agent"))
@@ -235,8 +211,7 @@ def get_request_headers_with_token(token: str, recaptcha_v3_token: Optional[str]
     
     if recaptcha_v3_token:
         headers["X-Recaptcha-Token"] = recaptcha_v3_token
-        _, recaptcha_action = _m().get_recaptcha_settings(config)
-        headers["X-Recaptcha-Action"] = recaptcha_action
+        headers["X-Recaptcha-Action"] = _m().RECAPTCHA_ACTION
     return headers
 
 
@@ -879,6 +854,8 @@ def get_next_auth_token(exclude_tokens: set = None, *, allow_ephemeral_fallback:
             token = str(cookie_store.get("arena-auth-prod-v1") or "").strip()
             if token and not is_arena_auth_token_expired(token):
                 auth_tokens = [token]
+                config["auth_tokens"] = auth_tokens
+                _m().save_config(config, preserve_auth_tokens=False)
                 _m().debug_print("🔑 Using arena-auth cookie from browser session (browser_cookies).")
     if not auth_tokens:
         raise HTTPException(status_code=500, detail="No auth tokens configured")

@@ -4,7 +4,10 @@ import json
 import os
 import re
 import shutil
+import socket
+import subprocess
 import sys
+import tempfile
 import uuid
 import time
 import secrets
@@ -14,7 +17,7 @@ import hashlib
 from collections import defaultdict
 from contextlib import asynccontextmanager, AsyncExitStack
 from pathlib import Path
-from typing import Optional, Dict, List
+from typing import Any, Optional, Dict, List
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlsplit, urlparse, parse_qs
 
@@ -27,6 +30,21 @@ from fastapi.security import APIKeyHeader
 
 import httpx
 import requests
+from playwright.async_api import async_playwright
+
+from . import account_recovery as _account_recovery
+from .browser_window import (
+    BrowserWindowMode,
+    browser_window_mode,
+    chrome_window_args,
+    windows_startupinfo,
+)
+from .gemini_transcript import build_transcript as _build_gemini_transcript
+
+_ensure_managed_authenticated_account = _account_recovery.ensure_authenticated_account
+inspect_config_auth = _account_recovery.inspect_config_auth
+redact_text = _account_recovery.redact_text
+capture_failure_artifact = _account_recovery.capture_failure_artifact
 
 # Import from modularized modules
 from . import constants
@@ -164,6 +182,75 @@ def get_rate_limit_sleep_seconds(retry_after: Optional[str], attempt: int) -> in
 
 def get_general_backoff_seconds(attempt: int) -> int:
     return constants.get_general_backoff_seconds(attempt)
+
+
+def _camoufox_launch_options(*, headless: bool) -> dict[str, Any]:
+    options: dict[str, Any] = {"headless": headless, "main_world_eval": True}
+    try:
+        from camoufox.addons import DefaultAddons
+        options["exclude_addons"] = list(DefaultAddons)
+    except (ImportError, TypeError):
+        pass
+    return options
+
+
+def _find_chromium_executable() -> Optional[str]:
+    configured = str(os.environ.get("LM_CHROME_EXECUTABLE") or os.environ.get("CHROME_PATH") or "").strip()
+    if configured and Path(configured).is_file():
+        return configured
+    try:
+        configured = str(get_config().get("chrome_fetch_executable") or "").strip()
+    except Exception:
+        configured = ""
+    if configured and Path(configured).is_file():
+        return configured
+    candidates = [
+        *(Path(path) for path in constants.CHROME_PATH_CANDIDATES),
+        *(Path(path) for path in constants.EDGE_PATH_CANDIDATES),
+        Path(os.environ.get("LOCALAPPDATA", "")) / "Google" / "Chrome" / "Application" / "chrome.exe",
+    ]
+    return next((str(candidate) for candidate in candidates if candidate.is_file()), None)
+
+
+def _reserve_loopback_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def _build_cdp_chrome_command(
+    executable: str, profile_dir: str, port: int, *,
+    window_mode: BrowserWindowMode = "background",
+) -> list[str]:
+    return [
+        executable, f"--remote-debugging-port={port}", "--remote-allow-origins=*",
+        f"--user-data-dir={profile_dir}", "--no-first-run",
+        "--no-default-browser-check", "--disable-session-crashed-bubble",
+        "--hide-crash-restore-bubble", "--new-window",
+        *chrome_window_args(window_mode), "--window-size=1280,900", "about:blank",
+    ]
+
+
+async def _wait_for_cdp(port: int, timeout_seconds: float = 20) -> bool:
+    deadline = asyncio.get_running_loop().time() + timeout_seconds
+    async with httpx.AsyncClient(timeout=1.0, trust_env=False) as client:
+        while asyncio.get_running_loop().time() < deadline:
+            try:
+                response = await client.get(f"http://127.0.0.1:{port}/json/version")
+                if response.status_code == 200:
+                    return True
+            except httpx.HTTPError:
+                pass
+            await asyncio.sleep(0.2)
+    return False
+
+
+def _should_use_browser_ui(
+    model_public_name: str, modality: str, *, all_text_models: bool,
+) -> bool:
+    return model_public_name in {"gemini-3.5-flash", "gemini-3.5-flash-high"} or (
+        all_text_models and modality == "chat"
+    )
 
 
 def safe_print(*args, **kwargs) -> None:
@@ -646,6 +733,11 @@ _LAST_CONFIG_FILE: Optional[str] = None
 conversation_tokens: Dict[str, str] = {}
 # Track failed tokens per request to avoid retrying with same token
 request_failed_tokens: Dict[str, set] = {}
+UI_BRIDGE_LOCK = asyncio.Lock()
+_UPSTREAM_COOKIE_NAMES = {
+    "arena-auth-prod-v1", "arena-auth-prod-v1.0", "arena-auth-prod-v1.1",
+    "cf_clearance", "__cf_bm", "_cfuvid", "provisional_user_id",
+}
 
 # Ephemeral Arena auth cookie captured from browser sessions (not persisted unless enabled).
 EPHEMERAL_ARENA_AUTH_TOKEN: Optional[str] = None
@@ -669,7 +761,7 @@ def get_config():
         _LAST_CONFIG_FILE = CONFIG_FILE
         current_token_index = 0
     try:
-        with open(CONFIG_FILE, "r") as f:
+        with open(CONFIG_FILE, "r", encoding="utf-8-sig") as f:
             config = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError) as e:
         debug_print(f"⚠️  Config file error: {e}, using defaults")
@@ -703,7 +795,7 @@ def save_config(config, *, preserve_auth_tokens: bool = True):
         # Background refreshes/cookie upserts shouldn't overwrite auth tokens that may have been added via the dashboard.
         if preserve_auth_tokens:
             try:
-                with open(CONFIG_FILE, "r") as f:
+                with open(CONFIG_FILE, "r", encoding="utf-8-sig") as f:
                     on_disk = json.load(f)
             except Exception:
                 on_disk = None
@@ -744,6 +836,215 @@ def get_request_headers():
             raise HTTPException(status_code=500, detail="Arena auth token not set in dashboard.")
     
     return get_request_headers_with_token(token)
+
+
+async def ensure_authenticated_account(
+    *, reason: str = "request", force_recovery: bool = False
+) -> _account_recovery.RecoveryResult:
+    config = get_config()
+    if not bool(config.get("auto_account_recovery", True)):
+        return _account_recovery.RecoveryResult(
+            False, "disabled", "none", False, False, "recovery_disabled"
+        )
+    return await _ensure_managed_authenticated_account(
+        get_config, save_config, reason=reason, force_recovery=force_recovery,
+        debug=lambda message: debug_print(redact_text(message)),
+    )
+
+
+def get_models():
+    try:
+        with open(MODELS_FILE, "r", encoding="utf-8-sig") as file:
+            return json.load(file)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def save_models(models) -> bool:
+    try:
+        target = Path(MODELS_FILE)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_name(
+            f".{target.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp"
+        )
+        with open(temporary, "w", encoding="utf-8") as file:
+            json.dump(models, file, indent=2)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temporary, target)
+        return True
+    except Exception as exc:
+        debug_print(f"Error saving model catalog: {type(exc).__name__}")
+        return False
+
+
+def _validate_live_model_catalog(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        raise ValueError("Arena initialModels payload is not a list")
+    models = [item for item in value if isinstance(item, dict)]
+    organized = [item for item in models if item.get("publicName") and item.get("organization")]
+    if len(organized) < 5:
+        raise ValueError("Arena initialModels payload has fewer than five organized models")
+    return models
+
+
+def _extract_live_model_catalog(page_html: str) -> list[dict[str, Any]]:
+    match = re.search(
+        r'{\\"initialModels\\":(\[.*?\]),\\"initialModel[A-Z]Id',
+        str(page_html or ""), re.DOTALL,
+    )
+    if not match:
+        raise ValueError("Arena page did not contain initialModels")
+    return _validate_live_model_catalog(
+        json.loads(match.group(1).encode().decode("unicode_escape"))
+    )
+
+
+def _record_model_catalog_status(
+    *, fresh: bool, count: int, error_code: str = ""
+) -> dict[str, Any]:
+    config = get_config()
+    previous = config.get("model_catalog")
+    catalog_status = dict(previous) if isinstance(previous, dict) else {}
+    now = int(time.time())
+    catalog_status.update({
+        "fresh": fresh, "count": int(count),
+        "source": "arena_initial_models" if fresh else "validated_cache",
+        "last_attempt_at": now, "error_code": str(error_code or ""),
+    })
+    if fresh:
+        catalog_status["last_success_at"] = now
+    config["model_catalog"] = catalog_status
+    save_config(config)
+    return catalog_status
+
+
+def _is_arena_cookie_domain(domain) -> bool:
+    normalized = str(domain or "").strip().lower().lstrip(".")
+    return normalized in {"arena.ai", "lmarena.ai"} or normalized.endswith(".arena.ai")
+
+
+def _simplify_cookie_jar(cookies) -> list:
+    simplified = []
+    if not isinstance(cookies, list):
+        return simplified
+    for cookie in cookies:
+        if not isinstance(cookie, dict):
+            continue
+        name = str(cookie.get("name") or "").strip()
+        domain = cookie.get("domain")
+        if (
+            name not in _UPSTREAM_COOKIE_NAMES
+            or name in {"arena-auth-prod-v1.0", "arena-auth-prod-v1.1"}
+            or (domain and not _is_arena_cookie_domain(domain))
+        ):
+            continue
+        if cookie.get("value") is None:
+            continue
+        entry = {"name": name, "value": str(cookie["value"])}
+        for key in ("domain", "path", "expires", "httpOnly", "secure", "sameSite"):
+            if key in cookie:
+                entry[key] = cookie[key]
+        simplified.append(entry)
+    combined = _combine_split_arena_auth_cookies(cookies)
+    if combined and not any(item["name"] == "arena-auth-prod-v1" for item in simplified):
+        simplified.append({"name": "arena-auth-prod-v1", "value": combined, "domain": ".arena.ai", "path": "/"})
+    return simplified
+
+
+def _cookie_pairs_from_config(cookie_jar) -> list[tuple[str, str]]:
+    pairs = []
+    if isinstance(cookie_jar, dict):
+        cookie_jar = [{"name": name, "value": value} for name, value in cookie_jar.items()]
+    if isinstance(cookie_jar, str):
+        cookie_jar = [part.strip() for part in cookie_jar.split(";")]
+    for item in cookie_jar if isinstance(cookie_jar, list) else []:
+        if isinstance(item, str) and "=" in item:
+            name, value = item.split("=", 1)
+            if name.strip() in _UPSTREAM_COOKIE_NAMES:
+                pairs.append((name.strip(), value))
+        elif isinstance(item, dict):
+            name = str(item.get("name") or item.get("Name") or "").strip()
+            domain = item.get("domain") or item.get("Domain")
+            value = item.get("value") if item.get("value") is not None else item.get("Value")
+            if name in _UPSTREAM_COOKIE_NAMES and value is not None and (not domain or _is_arena_cookie_domain(domain)):
+                pairs.append((name, str(value)))
+    return pairs
+
+
+def build_lmarena_cookie_header(token: str) -> str:
+    config = get_config()
+    cookies = dict(_cookie_pairs_from_config(config.get("cookie_jar")))
+    cf_clearance = str(config.get("cf_clearance") or "").strip()
+    if cf_clearance:
+        cookies["cf_clearance"] = cf_clearance
+    for config_name, cookie_name in (
+        ("cf_bm", "__cf_bm"),
+        ("cfuvid", "_cfuvid"),
+        ("provisional_user_id", "provisional_user_id"),
+    ):
+        value = str(config.get(config_name) or "").strip()
+        if value:
+            cookies[cookie_name] = value
+    if str(token or "").strip():
+        cookies["arena-auth-prod-v1"] = str(token).strip()
+    return "; ".join(f"{name}={value}" for name, value in cookies.items() if value)
+
+
+async def _browser_ui_api_response(
+    model_public_name: str, prompt: str, stream: bool
+):
+    recovery = await ensure_authenticated_account(reason="ui_request")
+    if not recovery.ok or not recovery.authenticated:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Managed Arena authentication recovery failed at stage {recovery.stage}",
+        )
+    response_text = await _browser_ui_arena_response_worker(model_public_name, prompt)
+    if not response_text:
+        raise HTTPException(
+            status_code=503, detail="Browser UI transport returned no response."
+        )
+    completion_id = f"chatcmpl-{uuid.uuid4()}"
+    created = int(time.time())
+    if stream:
+        async def generate():
+            chunk = {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model_public_name,
+                "choices": [{
+                    "index": 0,
+                    "delta": {"role": "assistant", "content": response_text},
+                    "finish_reason": None,
+                }],
+            }
+            yield f"data: {json.dumps(chunk)}\n\n"
+            chunk["choices"] = [{
+                "index": 0, "delta": {}, "finish_reason": "stop"
+            }]
+            yield f"data: {json.dumps(chunk)}\n\n"
+            yield "data: [DONE]\n\n"
+        return StreamingResponse(generate(), media_type="text/event-stream")
+    prompt_tokens = max(1, len(prompt) // 4)
+    completion_tokens = max(1, len(response_text) // 4)
+    return {
+        "id": completion_id,
+        "object": "chat.completion",
+        "created": created,
+        "model": model_public_name,
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": response_text},
+            "finish_reason": "stop",
+        }],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        },
+    }
 
 # --- Dashboard Authentication ---
 
@@ -2151,6 +2452,10 @@ async def health_check():
         has_cf_clearance = bool(config.get("cf_clearance"))
         has_models = len(models) > 0
         has_api_keys = len(config.get("api_keys", [])) > 0
+        _, auth_inspection = inspect_config_auth(config)
+        catalog = config.get("model_catalog")
+        catalog_status = catalog if isinstance(catalog, dict) else {}
+        model_catalog_fresh = bool(catalog_status.get("fresh"))
         
         status = "healthy" if (has_cf_clearance and has_models) else "degraded"
         
@@ -2161,7 +2466,12 @@ async def health_check():
                 "cf_clearance": has_cf_clearance,
                 "models_loaded": has_models,
                 "model_count": len(models),
-                "api_keys_configured": has_api_keys
+                "model_catalog_fresh": model_catalog_fresh,
+                "model_catalog_source": str(catalog_status.get("source") or "unknown"),
+                "model_catalog_last_success_at": catalog_status.get("last_success_at"),
+                "model_catalog_error_code": str(catalog_status.get("error_code") or ""),
+                "api_keys_configured": has_api_keys,
+                "authenticated_account": auth_inspection.authenticated,
             }
         }
     except Exception as e:
@@ -2204,30 +2514,31 @@ async def ollama_ps(api_key: dict = Depends(rate_limit_api_key)):
 async def ollama_version(api_key: dict = Depends(rate_limit_api_key)):
     return {"version": "0.1.0"}
 
+@app.get("/v1/models")
 @app.get("/api/v1/models")
 async def list_models(api_key: dict = Depends(rate_limit_api_key)):
     try:
         models = get_models()
         
-        # Filter for models with text OR search OR image output capability and an organization (exclude stealth models)
-        # Always include image models - no special key needed
-        valid_models = [m for m in models 
-                       if (m.get('capabilities', {}).get('outputCapabilities', {}).get('text')
-                           or m.get('capabilities', {}).get('outputCapabilities', {}).get('search')
-                           or m.get('capabilities', {}).get('outputCapabilities', {}).get('image'))
-                       and m.get('organization')]
-        
-        return {
-            "object": "list",
-            "data": [
-                {
-                    "id": model.get("publicName"),
-                    "object": "model",
-                    "created": int(time.time()),
-                    "owned_by": model.get("organization", "lmarena")
-                } for model in valid_models if model.get("publicName")
-            ]
-        }
+        valid_models = [
+            model for model in models
+            if model.get("publicName") and model.get("organization")
+        ]
+        created = int(time.time())
+        data = []
+        seen = set()
+        for model in valid_models:
+            public_name = model["publicName"]
+            if public_name in seen:
+                continue
+            seen.add(public_name)
+            data.append({
+                "id": public_name,
+                "object": "model",
+                "created": created,
+                "owned_by": model.get("organization", "lmarena"),
+            })
+        return {"object": "list", "data": data}
     except Exception as e:
         debug_print(f"❌ Error listing models: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to load models: {str(e)}")
@@ -2302,12 +2613,17 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
         model_org = None
         model_capabilities = {}
         
-        for m in models:
-            if m.get("publicName") == model_public_name:
-                model_id = m.get("id")
-                model_org = m.get("organization")
-                model_capabilities = m.get("capabilities", {})
-                break
+        matching_models = [
+            model for model in models if model.get("publicName") == model_public_name
+        ]
+        selected_model = next(
+            (model for model in matching_models if model.get("organization")),
+            matching_models[0] if matching_models else None,
+        )
+        if selected_model:
+            model_id = selected_model.get("id")
+            model_org = selected_model.get("organization")
+            model_capabilities = selected_model.get("capabilities", {})
         
         if not model_id:
             debug_print(f"❌ Model '{model_public_name}' not found in model list")
@@ -2336,6 +2652,14 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
         else:
             modality = "chat"
         debug_print(f"🔍 Model modality: {modality}")
+        all_text_ui = str(
+            os.environ.get("LM_BROWSER_UI_ALL_TEXT_MODELS")
+            or get_config().get("browser_ui_all_text_models")
+            or "0"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        use_browser_ui = _should_use_browser_ui(
+            model_public_name, modality, all_text_models=all_text_ui
+        )
 
         # Log usage
         try:
@@ -2359,15 +2683,27 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
         try:
             last_message_content = messages[-1].get("content", "")
             try:
-                prompt, experimental_attachments = await process_message_content(last_message_content, model_capabilities)
+                latest_prompt, experimental_attachments = await process_message_content(last_message_content, model_capabilities)
             except Exception as e:
                 debug_print(f"❌ Failed to process message content: {e}")
                 raise HTTPException(status_code=400, detail=f"Invalid message content: {str(e)}")
             
-            # If there's a system prompt and this is the first user message, prepend it
-            if system_prompt:
-                prompt = f"{system_prompt}\n\n{prompt}"
-                debug_print(f"✅ System prompt prepended to user message")
+            if use_browser_ui:
+                transcript = _build_gemini_transcript(
+                    messages, latest_content=latest_prompt, max_characters=113567
+                )
+                prompt = transcript.prompt
+                debug_print(
+                    "UI transcript "
+                    f"included={transcript.included_message_count} "
+                    f"omitted={transcript.omitted_message_count} "
+                    f"roles={json.dumps(transcript.included_role_counts, sort_keys=True)} "
+                    f"chars={transcript.rendered_characters}"
+                )
+            else:
+                prompt = latest_prompt
+                if system_prompt:
+                    prompt = f"{system_prompt}\n\n{prompt}"
         except Exception as e:
             debug_print(f"❌ Failed to process message content: {e}")
             raise HTTPException(
@@ -2385,7 +2721,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
         # Log prompt length for debugging character limit issues
         debug_print(f"📝 User prompt length: {len(prompt)} characters")
         debug_print(f"🖼️  Attachments: {len(experimental_attachments)} images")
-        debug_print(f"📝 User prompt preview: {prompt[:100]}..." if len(prompt) > 100 else f"📝 User prompt: {prompt}")
+        debug_print("User prompt body omitted from logs")
         
         # Check for reasonable character limit (LMArena appears to have limits)
         # Typical limit seems to be around 32K-64K characters based on testing
@@ -2394,6 +2730,11 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
             error_msg = f"Prompt too long ({len(prompt)} characters). LMArena has a character limit of approximately {MAX_PROMPT_LENGTH} characters. Please reduce the message size."
             debug_print(f"❌ {error_msg}")
             raise HTTPException(status_code=400, detail=error_msg)
+
+        if use_browser_ui:
+            return await _browser_ui_api_response(
+                model_public_name, prompt, bool(stream)
+            )
         
         # Use API key + conversation tracking
         api_key_str = api_key["key"]
@@ -4932,6 +5273,342 @@ async def anthropic_messages(request: AnthropicMessageRequest, raw_request: Requ
             "stop_reason": "end_turn",
             "usage": {"input_tokens": result.get("usage", {}).get("prompt_tokens", 0), "output_tokens": result.get("usage", {}).get("completion_tokens", len(content))}
         }
+
+
+async def _click_visible_recaptcha_v2(
+    page, timeout_ms: int = 10000
+) -> Optional[bool]:
+    """Return None when absent, True when solved, or False when a challenge remains."""
+    try:
+        iframe = page.locator(
+            "iframe[src*='recaptcha'][src*='size=normal']"
+        ).first
+        await iframe.wait_for(state="visible", timeout=timeout_ms)
+        handle = await iframe.element_handle()
+        frame = await handle.content_frame() if handle else None
+        if frame is None:
+            return False
+
+        anchor = frame.locator("#recaptcha-anchor")
+        await anchor.click(timeout=5000)
+        checked = None
+        for _ in range(10):
+            await page.wait_for_timeout(500)
+            checked = await anchor.get_attribute("aria-checked")
+            if checked == "true":
+                break
+        debug_print(f"Chrome UI stage=recaptcha_v2 clicked checked={checked!r}")
+        return checked == "true"
+    except Exception as e:
+        debug_print(f"Chrome UI stage=recaptcha_v2 not_handled reason={e}")
+        return None
+
+async def _visible_arena_ui_error(page) -> Optional[str]:
+    """Return Arena's rendered generation error, including a trace ID when available."""
+    try:
+        error = page.get_by_text("Something went wrong", exact=False).first
+        trace_button = page.get_by_role(
+            "button", name="Copy trace ID", exact=True
+        ).first
+        error_visible = bool(await error.count() and await error.is_visible())
+        trace_visible = bool(
+            await trace_button.count() and await trace_button.is_visible()
+        )
+        if not error_visible and not trace_visible:
+            return None
+
+        trace = page.get_by_text(
+            re.compile(r"Trace ID:\s*[a-f0-9]+", re.IGNORECASE)
+        ).first
+        if await trace.count() and await trace.is_visible():
+            return str(await trace.inner_text() or "").strip()
+        if error_visible:
+            return str(await error.inner_text() or "Something went wrong").strip()
+        return "Arena returned a response error with a trace ID."
+    except Exception:
+        return None
+
+class BrowserAuthRequired(RuntimeError):
+    """Raised by the UI transport when Arena renders its login state."""
+
+    code = "invalid_auth"
+
+class BrowserChallengeUnresolved(RuntimeError):
+    """Raised when the browser renders a challenge that remains unresolved."""
+
+    code = "challenge_unresolved"
+
+async def _browser_ui_arena_response(
+    model_public_name: str,
+    prompt: str,
+    timeout_seconds: int = 180,
+) -> Optional[str]:
+    """Submit through Arena's UI and return the rendered assistant response."""
+    config = get_config()
+    chromium_executable = _find_chromium_executable()
+    profile_dir = str(config.get("chrome_fetch_user_data_dir") or "").strip()
+    if not chromium_executable or not profile_dir:
+        return None
+
+    reuse_cdp = bool(config.get("chrome_fetch_reuse_cdp", True))
+    window_mode = browser_window_mode(config)
+    try:
+        configured_cdp_port = int(config.get("chrome_fetch_cdp_port") or 9333)
+    except (TypeError, ValueError):
+        configured_cdp_port = 9333
+
+    chrome_process = None
+    browser = None
+    try:
+        async with async_playwright() as p:
+            cdp_port = configured_cdp_port if reuse_cdp else _reserve_loopback_port()
+            cdp_ready = reuse_cdp and await _wait_for_cdp(
+                cdp_port, timeout_seconds=1
+            )
+            if not cdp_ready:
+                startupinfo = windows_startupinfo(window_mode)
+                chrome_process = subprocess.Popen(
+                    _build_cdp_chrome_command(
+                        chromium_executable,
+                        profile_dir,
+                        cdp_port,
+                        window_mode=window_mode,
+                    ),
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    startupinfo=startupinfo,
+                )
+                if not await _wait_for_cdp(cdp_port):
+                    raise RuntimeError("Chrome CDP endpoint did not become ready")
+                debug_print(f"Chrome UI stage=cdp launched port={cdp_port}")
+            else:
+                debug_print(f"Chrome UI stage=cdp reused port={cdp_port}")
+
+            browser = await p.chromium.connect_over_cdp(
+                f"http://127.0.0.1:{cdp_port}", timeout=30000
+            )
+            if not browser.contexts:
+                raise RuntimeError("Chrome CDP connection has no browser context")
+            context = browser.contexts[0]
+            try:
+                page = context.pages[-1] if context.pages else await context.new_page()
+                await page.goto(
+                    "https://arena.ai/text/direct",
+                    wait_until="domcontentloaded",
+                    timeout=120000,
+                )
+                debug_print(f"Chrome UI stage=navigate url={page.url}")
+
+                login_button = page.get_by_role("button", name="Log In", exact=True)
+                if await login_button.count() and await login_button.first.is_visible():
+                    raise BrowserAuthRequired("Arena UI requires an authenticated login")
+
+                mode_combobox = page.get_by_role("combobox").first
+                await mode_combobox.wait_for(state="visible", timeout=30000)
+                mode_text = str(await mode_combobox.inner_text() or "").strip()
+                debug_print(f"Chrome UI stage=mode current={mode_text!r}")
+                if not mode_text.startswith("Direct"):
+                    await mode_combobox.click(timeout=15000)
+                    direct_option = page.get_by_role(
+                        "option",
+                        name="Direct Chat with 1 model at a time",
+                        exact=True,
+                    )
+                    await direct_option.click(timeout=15000)
+                    debug_print("Chrome UI stage=mode switched_to_direct")
+
+                current_model = page.get_by_role(
+                    "button", name=model_public_name, exact=True
+                )
+                current_model_visible = bool(
+                    await current_model.count()
+                    and await current_model.first.is_visible()
+                )
+                if not current_model_visible:
+                    model_button = page.get_by_role("button", name="Max", exact=True)
+                    try:
+                        await model_button.first.wait_for(
+                            state="visible", timeout=15000
+                        )
+                    except Exception:
+                        return None
+                    await model_button.first.click(timeout=15000)
+                    option = page.get_by_role(
+                        "option", name=model_public_name, exact=True
+                    ).first
+                    try:
+                        await option.wait_for(state="visible", timeout=10000)
+                    except Exception:
+                        option = page.get_by_text(
+                            model_public_name, exact=True
+                        ).first
+                        try:
+                            await option.wait_for(state="visible", timeout=10000)
+                        except Exception:
+                            return None
+                    await option.click(timeout=15000)
+                debug_print(f"Chrome UI stage=model selected={model_public_name}")
+
+                textarea = page.locator("textarea:visible").first
+                await textarea.fill(str(prompt or ""), timeout=15000)
+                debug_print("Chrome UI stage=fill complete")
+                await page.get_by_role(
+                    "button", name="Send message", exact=True
+                ).click(timeout=15000)
+                debug_print("Chrome UI stage=send clicked")
+
+                try:
+                    agree = page.get_by_role("button", name="Agree", exact=True)
+                    await agree.first.wait_for(state="visible", timeout=5000)
+                    if await agree.first.is_visible():
+                        await agree.first.click(timeout=10000)
+                        debug_print("Chrome UI stage=terms agreed")
+                except Exception:
+                    pass
+
+                recaptcha_state = await _click_visible_recaptcha_v2(page)
+                if recaptcha_state is False:
+                    debug_print("Chrome UI stage=recaptcha_v2 unresolved")
+                    managed = get_config().get("managed_account") or {}
+                    await capture_failure_artifact(
+                        page,
+                        "ui-recaptcha",
+                        "Visible reCAPTCHA challenge remained unresolved",
+                        str(managed.get("address") or ""),
+                    )
+                    raise BrowserChallengeUnresolved(
+                        "Visible reCAPTCHA challenge remained unresolved"
+                    )
+
+                response_locator = page.locator("div.prose.prose-base.body-base")
+                deadline = asyncio.get_running_loop().time() + float(timeout_seconds)
+                last_response = ""
+                stable_ticks = 0
+                poll_count = 0
+                while asyncio.get_running_loop().time() < deadline:
+                    error_detail = await _visible_arena_ui_error(page)
+                    if error_detail:
+                        debug_print(
+                            f"Chrome UI stage=arena_error visible detail={error_detail!r}"
+                        )
+                        return None
+
+                    texts = [
+                        str(text or "").strip()
+                        for text in await response_locator.all_inner_texts()
+                    ]
+                    candidates = [
+                        text
+                        for text in texts
+                        if text and text != str(prompt or "").strip()
+                    ]
+                    current_response = candidates[0] if candidates else ""
+                    poll_count += 1
+                    if poll_count == 1 or poll_count % 10 == 0:
+                        debug_print(
+                            f"Chrome UI stage=poll count={len(texts)} "
+                            f"candidates={len(candidates)} response_len={len(current_response)}"
+                        )
+                    if current_response:
+                        if current_response == last_response:
+                            stable_ticks += 1
+                        else:
+                            last_response = current_response
+                            stable_ticks = 0
+                        if stable_ticks >= 2:
+                            return current_response
+                    await asyncio.sleep(1)
+                return last_response or None
+            finally:
+                if not reuse_cdp:
+                    await browser.close()
+    except BrowserAuthRequired:
+        raise
+    except BrowserChallengeUnresolved:
+        raise
+    except Exception as e:
+        debug_print(f"Chrome UI fallback failed: {e}")
+        return None
+    finally:
+        if (
+            not reuse_cdp
+            and chrome_process is not None
+            and chrome_process.poll() is None
+        ):
+            chrome_process.terminate()
+            try:
+                chrome_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                chrome_process.kill()
+
+async def _browser_ui_arena_response_worker(
+    model_public_name: str,
+    prompt: str,
+    timeout_seconds: int = 220,
+) -> Optional[str]:
+    """Run the UI transport in an isolated short-lived Python process."""
+    worker_path = Path(__file__).resolve().with_name("ui_bridge_worker.py")
+    project_root = worker_path.parent.parent
+    request_json = json.dumps({
+        "model": model_public_name,
+        "prompt": prompt,
+        "timeout_seconds": timeout_seconds,
+    })
+    result_file = tempfile.NamedTemporaryFile(
+        prefix="lmarena-ui-result-", suffix=".json", delete=False
+    )
+    result_path = Path(result_file.name)
+    result_file.close()
+    worker_env = dict(os.environ)
+    worker_env["LM_UI_RESULT_PATH"] = str(result_path)
+    worker_env["PYTHONUNBUFFERED"] = "1"
+
+    def _run_worker():
+        return subprocess.run(
+            [sys.executable, str(worker_path)],
+            input=request_json,
+            text=True,
+            cwd=str(project_root),
+            timeout=timeout_seconds + 30,
+            creationflags=0,
+            close_fds=True,
+            env=worker_env,
+            check=False,
+        )
+
+    try:
+        async with UI_BRIDGE_LOCK:
+            result = await asyncio.to_thread(_run_worker)
+    except Exception as e:
+        debug_print(f"Chrome UI worker failed: {e}")
+        return None
+    finally:
+        result_text = ""
+        try:
+            result_text = result_path.read_text(encoding="utf-8")
+        except OSError:
+            pass
+        try:
+            result_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    try:
+        payload = json.loads(result_text or "{}")
+    except json.JSONDecodeError:
+        payload = {}
+    response = payload.get("response") if isinstance(payload, dict) else None
+    if isinstance(response, str) and response.strip():
+        return response.strip()
+
+    stage = payload.get("stage") if isinstance(payload, dict) else None
+    error_code = payload.get("error_code") if isinstance(payload, dict) else None
+    debug_print(
+        "Chrome UI worker returned no response "
+        f"(exit={result.returncode}, stage={redact_text(stage)}, "
+        f"error={redact_text(error_code)})"
+    )
+    return None
 
 
 if __name__ == "__main__":

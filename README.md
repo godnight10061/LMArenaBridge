@@ -1,4 +1,4 @@
-# LM Arena Bridge
+﻿# LM Arena Bridge
 
 <a href="https://www.drips.network/app/projects/github/CloudWaddie/LMArenaBridge" target="_blank"><img src="https://www.drips.network/api/embed/project/https%3A%2F%2Fgithub.com%2FCloudWaddie%2FLMArenaBridge/support.png?background=light&style=drips&text=project&stat=support" alt="Support LMArenaBridge on drips.network" height="32"></a>
 
@@ -50,11 +50,76 @@ There is an optional **userscript proxy** path that can improve reliability for 
 
 **Notes:**
 - The userscript is optional and only helpful in specific environments.
-- If you don’t want to use it, you can ignore it entirely.
+- If you don鈥檛 want to use it, you can ignore it entirely.
 - When enabled, it acts as a helper to send requests via a browser tab and can improve reCAPTCHA success rates.
 
-If you want this documented more deeply, let us know what environment you’re on and we’ll add step-by-step instructions.
+If you want this documented more deeply, let us know what environment you鈥檙e on and we鈥檒l add step-by-step instructions.
 
+
+### Managed account self-healing
+
+The bridge can maintain an authenticated Arena account automatically. When no
+verified account is available, it tries the following recovery ladder:
+
+1. refresh the existing browser session;
+2. sign in again with the locally generated account;
+3. create and verify a replacement account through a temporary mailbox.
+
+The default temporary-mail order is `mail.tm,guerrillamail`, so the normal path
+requires no mailbox configuration. Generated credentials, browser state, and
+diagnostics stay under ignored local configuration/runtime paths. Anonymous
+Arena cookies are not accepted as successful recovery.
+
+Optional environment overrides:
+
+```powershell
+$env:LM_TEMP_MAIL_PROVIDERS = "mail.tm,guerrillamail"
+$env:LM_CHROME_EXECUTABLE = "C:\path\to\chrome.exe"
+$env:LM_CHROME_PROFILE_DIR = "C:\path\to\isolated-profile"
+$env:LM_AUTO_ACCOUNT_RECOVERY = "1"
+$env:LM_BROWSER_WINDOW_MODE = "background" # headed, minimized, and off-screen
+```
+
+Use `LM_BROWSER_WINDOW_MODE=visible` when you want to inspect the managed Chrome
+window. Background mode remains headed; it does not enable Chromium headless
+mode.
+
+### Real Gemini 3.5 Flash check
+
+With the bridge running, execute the real non-streaming and streaming smoke
+test through the OpenAI-compatible API boundary:
+
+```powershell
+$env:LM_BRIDGE_API_KEY = "YOUR_LOCAL_BRIDGE_KEY"
+$env:LM_BROWSER_UI_ALL_TEXT_MODELS = "1"
+python src/live_gemini_check.py `
+  --model gemini-3.5-flash `
+  --minimum-model-successes 5 `
+  --model-candidate-limit 8
+```
+
+This path uses the real browser, account flow, LM Arena UI, and Gemini response.
+It validates single-turn non-streaming, streaming, and a multi-turn transcript in
+which the final answer depends on an earlier tool result. Gemini is mandatory,
+and five additional distinct models must pass nonce-bearing checks from a larger
+provider-diverse candidate pool.
+
+At startup the bridge refreshes Arena's current catalog and atomically updates
+`models.json` as a cache. `/v1/models` and `/api/v1/models` expose the full
+deduplicated organized catalog. Local startup may use the last validated cache
+when refresh fails, but health reports `model_catalog_fresh=false`; the required
+live job accepts only a fresh Arena catalog.
+
+For Gemini UI requests, the incoming OpenAI `messages` array is rendered in
+order with system/developer/user/assistant/tool boundaries. Provider-specific
+reasoning fields are omitted. If the Arena character bound is exceeded, the
+bridge retains instructions and newest complete turns while dropping the oldest
+turns first; tool calls and their results stay together.
+
+Failure summaries and redacted browser diagnostics are written to
+`.runtime/artifacts/`. The `Live Gemini Bridge` GitHub Actions workflow runs the
+same check on Windows on a schedule; configure `live-gemini-gate` as the branch
+protection check.
 
 ### 1. Get your Authentication Token
 

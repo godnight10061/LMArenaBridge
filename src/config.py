@@ -62,6 +62,7 @@ def _apply_config_defaults(config: dict) -> None:
     config.setdefault("auth_token", "")
     config.setdefault("auth_tokens", [])
     config.setdefault("cf_clearance", "")
+    config.setdefault("cookie_jar", [])
     config.setdefault("api_keys", [])
     config.setdefault("usage_stats", {})
     config.setdefault("prune_invalid_tokens", False)
@@ -69,6 +70,13 @@ def _apply_config_defaults(config: dict) -> None:
     config.setdefault("camoufox_proxy_window_mode", constants.DEFAULT_CAMOUFOX_PROXY_WINDOW_MODE)
     config.setdefault("camoufox_fetch_window_mode", constants.DEFAULT_CAMOUFOX_FETCH_WINDOW_MODE)
     config.setdefault("chrome_fetch_window_mode", constants.DEFAULT_CHROME_FETCH_WINDOW_MODE)
+    config.setdefault("managed_account", {})
+    config.setdefault("managed_account_history", [])
+    config.setdefault("auto_account_recovery", True)
+    config.setdefault("chrome_fetch_reuse_cdp", True)
+    config.setdefault("browser_window_mode", "background")
+    config.setdefault("browser_ui_all_text_models", False)
+    config.setdefault("model_catalog", {})
     
     # Normalize api_keys
     if isinstance(config.get("api_keys"), list):
@@ -111,10 +119,14 @@ def save_config(config: dict, *, preserve_auth_tokens: bool = True) -> None:
 
         # usage_stats will be set by the caller
         
-        tmp_path = f"{_current_config_file}.tmp"
-        with open(tmp_path, "w") as f:
+        target = os.path.abspath(_current_config_file)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        tmp_path = f"{target}.{os.getpid()}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(config, f, indent=4)
-        os.replace(tmp_path, _current_config_file)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, target)
     except Exception as e:
         print(f"Error saving config: {e}")
 
@@ -143,21 +155,27 @@ def get_global_state(key: str, default: Any = None) -> Any:
 def get_models() -> list:
     """Load models from file."""
     try:
-        with open(constants.MODELS_FILE, "r") as f:
+        with open(constants.MODELS_FILE, "r", encoding="utf-8-sig") as f:
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         return []
 
 
-def save_models(models: list) -> None:
+def save_models(models: list) -> bool:
     """Save models to file."""
     try:
-        tmp_path = f"{constants.MODELS_FILE}.tmp"
-        with open(tmp_path, "w") as f:
+        target = os.path.abspath(constants.MODELS_FILE)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        tmp_path = f"{target}.{os.getpid()}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(models, f, indent=2)
-        os.replace(tmp_path, constants.MODELS_FILE)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, target)
+        return True
     except Exception as e:
         print(f"Error saving models: {e}")
+        return False
 
 
 # === Default config for startup ===

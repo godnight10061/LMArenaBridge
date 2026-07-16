@@ -1,0 +1,177 @@
+name: Live Gemini Bridge
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+  pull_request:
+    branches: [main, master]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  live-gemini-gate:
+    name: live-gemini-gate
+    if: github.event_name == 'pull_request'
+    runs-on: windows-latest
+    steps:
+      - name: Require a recent successful live run
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          $runs = gh api `
+            -H "Accept: application/vnd.github+json" `
+            "/repos/$env:GH_REPO/actions/workflows/live-gemini.yml/runs?status=completed&per_page=30" |
+            ConvertFrom-Json
+          $cutoff = [DateTimeOffset]::UtcNow.AddHours(-36)
+          $success = $runs.workflow_runs |
+            Where-Object {
+              $_.conclusion -eq 'success' -and
+              $_.event -in @('schedule', 'workflow_dispatch') -and
+              $_.head_branch -eq $env:DEFAULT_BRANCH -and
+              [DateTimeOffset]::Parse($_.created_at) -ge $cutoff
+            } |
+            Select-Object -First 1
+          if (-not $success) {
+            throw 'No successful scheduled/manual Live Gemini Bridge run exists within the last 36 hours.'
+          }
+          Write-Host "Using live run $($success.html_url) from $($success.created_at)."
+
+  live-gemini-windows:
+    name: live-gemini-windows
+    if: github.event_name != 'pull_request'
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      PYTHONIOENCODING: utf-8
+      PORT: "18080"
+      LM_CONFIG_FILE: ${{ github.workspace }}\.runtime\config.json
+      LM_CHROME_PROFILE_DIR: ${{ github.workspace }}\.runtime\chrome-profile
+      LM_RECOVERY_ARTIFACT_DIR: ${{ github.workspace }}\.runtime\artifacts
+      LM_LIVE_ARTIFACT_DIR: ${{ github.workspace }}\.runtime\artifacts
+      LM_AUTO_ACCOUNT_RECOVERY: "1"
+      LM_BROWSER_HEADLESS: "0"
+      LM_BROWSER_WINDOW_MODE: background
+      LM_BROWSER_UI_ALL_TEXT_MODELS: "1"
+      LM_UI_MAX_ATTEMPTS: "2"
+      LM_SIGNUP_EMAIL_TIMEOUT: "240"
+      LM_BRIDGE_API_KEY: live-ci-key
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install bridge and browser dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pytest
+          python -m playwright install chromium
+
+      - name: Create isolated bridge configuration
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force .runtime, .runtime\artifacts, .runtime\chrome-profile | Out-Null
+          @{
+            password = 'ci-local-only'
+            auth_token = ''
+            auth_tokens = @()
+            browser_cookies = @{}
+            cookie_jar = @()
+            cf_clearance = ''
+            auto_account_recovery = $true
+            chrome_fetch_reuse_cdp = $true
+            browser_window_mode = 'background'
+            browser_ui_all_text_models = $true
+            api_keys = @(
+              @{
+                name = 'Live CI'
+                key = $env:LM_BRIDGE_API_KEY
+                rpm = 20
+                created = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+              }
+            )
+            usage_stats = @{}
+          } | ConvertTo-Json -Depth 8 | Set-Content -Encoding utf8 $env:LM_CONFIG_FILE
+
+      - name: Start bridge
+        shell: pwsh
+        run: |
+          $process = Start-Process python `
+            -ArgumentList 'src/main.py' `
+            -WorkingDirectory '${{ github.workspace }}' `
+            -WindowStyle Hidden `
+            -RedirectStandardOutput '.runtime\bridge.stdout.log' `
+            -RedirectStandardError '.runtime\bridge.stderr.log' `
+            -PassThru
+          $process.Id | Set-Content .runtime\bridge.pid
+
+      - name: Run real Gemini and five-model check
+        shell: pwsh
+        run: |
+          python src/live_gemini_check.py `
+            --base-url http://127.0.0.1:18080/api/v1 `
+            --model gemini-3.5-flash `
+            --health-timeout 600 `
+            --request-timeout 420 `
+            --minimum-model-successes 5 `
+            --model-candidate-limit 8 `
+            --model-smoke-timeout 180
+
+      - name: Sanitize text artifacts
+        if: failure()
+        shell: pwsh
+        run: |
+          @'
+          import pathlib
+          import sys
+          sys.path.insert(0, 'src')
+          from account_recovery import redact_text
+          root = pathlib.Path('.runtime')
+          for path in root.rglob('*'):
+              if path.is_file() and path.suffix.lower() in {'.log', '.json', '.txt'}:
+                  try:
+                      path.write_text(redact_text(path.read_text(encoding='utf-8', errors='replace')), encoding='utf-8')
+                  except OSError:
+                      pass
+          '@ | python -
+
+      - name: Upload redacted failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-gemini-windows-diagnostics
+          path: |
+            .runtime/artifacts/**
+            .runtime/bridge.stdout.log
+            .runtime/bridge.stderr.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Stop bridge and remove secret state
+        if: always()
+        shell: pwsh
+        run: |
+          if (Test-Path .runtime\bridge.pid) {
+            $bridgePid = Get-Content .runtime\bridge.pid | Select-Object -First 1
+            Stop-Process -Id $bridgePid -Force -ErrorAction SilentlyContinue
+          }
+          Remove-Item -LiteralPath $env:LM_CONFIG_FILE -Force -ErrorAction SilentlyContinue
+          $workspace = [IO.Path]::GetFullPath('${{ github.workspace }}')
+          $profile = [IO.Path]::GetFullPath($env:LM_CHROME_PROFILE_DIR)
+          if ($profile.StartsWith($workspace + [IO.Path]::DirectorySeparatorChar)) {
+            Get-CimInstance Win32_Process |
+              Where-Object { $_.Name -eq 'chrome.exe' -and $_.CommandLine -like "*$profile*" } |
+              ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+            Remove-Item -LiteralPath $profile -Recurse -Force -ErrorAction SilentlyContinue
+          } else {
+            throw "Refusing to remove browser profile outside the workspace."
+          }

@@ -3,6 +3,8 @@ Constants for LMArenaBridge.
 All hardcoded values should be defined here.
 """
 
+import os
+
 # ============================================================
 # APPLICATION CONFIGURATION
 # ============================================================
@@ -14,8 +16,8 @@ DEBUG = True
 PORT = 8000
 
 # Default config and models file paths
-CONFIG_FILE = "config.json"
-MODELS_FILE = "models.json"
+CONFIG_FILE = os.environ.get("LM_CONFIG_FILE", "config.json")
+MODELS_FILE = os.environ.get("LM_MODELS_FILE", "models.json")
 
 # ============================================================
 # HTTP STATUS CODES
