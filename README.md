@@ -111,6 +111,10 @@ deduplicated organized catalog. Local startup may use the last validated cache
 when refresh fails, but health reports `model_catalog_fresh=false`; the required
 live job accepts only a fresh Arena catalog.
 
+The standard OpenAI paths `/v1/models` and `/v1/chat/completions` are supported
+directly. The compatibility paths `/api/v1/models` and
+`/api/v1/chat/completions` use the same handlers and remain supported.
+
 For Gemini UI requests, the incoming OpenAI `messages` array is rendered in
 order with system/developer/user/assistant/tool boundaries. Provider-specific
 reasoning fields are omitted. If the Arena character bound is exceeded, the
@@ -180,7 +184,7 @@ You can use this project as a backend for [OpenWebUI](https://openwebui.com/), a
     - Modify the **OpenAI connection**.
 
 4.  **Set the API Base URL:**
-    - In the OpenAI connection settings, set the **API Base URL** to the URL of the LM Arena Bridge API, which is `http://localhost:8000/api/v1`.
+    - In the OpenAI connection settings, set the **API Base URL** to `http://localhost:8000/v1`. The legacy-compatible `http://localhost:8000/api/v1` base URL also remains supported.
     - You can leave the **API Key** field empty or enter any value. It is not used for authentication by the bridge itself.
 
 5.  **Start Chatting:**

@@ -2505,6 +2505,7 @@ async def debug_stream(api_key: dict = Depends(rate_limit_api_key)):  # noqa: AR
 
     return StreamingResponse(_gen(), media_type="text/event-stream")
 
+@app.post("/v1/chat/completions")
 @app.post("/api/v1/chat/completions")
 async def api_chat_completions(request: Request, api_key: dict = Depends(rate_limit_api_key)):
     debug_print("\n" + "="*80)
