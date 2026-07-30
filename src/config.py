@@ -5,6 +5,7 @@ Handles loading, saving, and managing configuration.
 
 import json
 import os
+import sys
 from typing import Optional, Dict, Any
 from collections import defaultdict
 
@@ -29,6 +30,25 @@ def set_config_file(path: str) -> None:
         _current_token_index = 0
 
 
+def read_raw_config(path: str) -> Optional[dict]:
+    """Read and parse config from disk, returning None on failure."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            value = json.load(f)
+        if isinstance(value, dict):
+            return value
+        print(f"Warning: config file at '{path}' did not contain a JSON object.", file=sys.stderr)
+        return None
+    except FileNotFoundError:
+        return None
+    except json.JSONDecodeError as e:
+        print(f"Warning: could not parse config from disk (invalid JSON): {e}", file=sys.stderr)
+        return None
+    except OSError as e:
+        print(f"Warning: could not read config from disk: {e}", file=sys.stderr)
+        return None
+
+
 def get_config() -> dict:
     """
     Load configuration from file with defaults.
@@ -42,18 +62,17 @@ def get_config() -> dict:
         if global_state.get("_last_config_file") != _current_config_file:
             _current_token_index = 0
     
-    try:
-        with open(_current_config_file, "r") as f:
-            config = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        config = {}
-    except Exception:
-        config = {}
+    config = read_raw_config(_current_config_file) or {}
 
     # Ensure default keys exist
     _apply_config_defaults(config)
     
     return config
+
+
+def apply_config_defaults(config: dict) -> None:
+    """Apply default values to config dictionary in-place."""
+    _apply_config_defaults(config)
 
 
 def _apply_config_defaults(config: dict) -> None:
@@ -87,36 +106,46 @@ def _apply_config_defaults(config: dict) -> None:
         config["api_keys"] = normalized_keys
 
 
-def save_config(config: dict, *, preserve_auth_tokens: bool = True) -> None:
+def _preserve_list_from_disk(config_dict: dict, on_disk_config: dict, key: str) -> None:
+    value_on_disk = on_disk_config.get(key)
+    if isinstance(value_on_disk, list):
+        config_dict[key] = list(value_on_disk)
+
+
+def save_config(
+    config: dict,
+    *,
+    preserve_auth_tokens: bool = True,
+    preserve_api_keys: bool = True,
+) -> None:
     """
     Save configuration to file.
     
     Args:
         config: Configuration dictionary to save
         preserve_auth_tokens: If True, don't overwrite auth tokens from disk
+        preserve_api_keys: If True, don't overwrite API keys from disk
     """
     try:
-        if preserve_auth_tokens:
-            try:
-                with open(_current_config_file, "r") as f:
-                    on_disk = json.load(f)
-            except Exception:
-                on_disk = None
+        if preserve_auth_tokens or preserve_api_keys:
+            on_disk = read_raw_config(_current_config_file)
 
             if isinstance(on_disk, dict):
-                if "auth_tokens" in on_disk and isinstance(on_disk.get("auth_tokens"), list):
-                    config["auth_tokens"] = list(on_disk.get("auth_tokens") or [])
-                if "auth_token" in on_disk:
-                    config["auth_token"] = str(on_disk.get("auth_token") or "")
+                if preserve_auth_tokens:
+                    _preserve_list_from_disk(config, on_disk, "auth_tokens")
+                    if "auth_token" in on_disk:
+                        config["auth_token"] = str(on_disk.get("auth_token") or "")
+                if preserve_api_keys:
+                    _preserve_list_from_disk(config, on_disk, "api_keys")
 
         # usage_stats will be set by the caller
         
         tmp_path = f"{_current_config_file}.tmp"
-        with open(tmp_path, "w") as f:
+        with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(config, f, indent=4)
         os.replace(tmp_path, _current_config_file)
-    except Exception as e:
-        print(f"Error saving config: {e}")
+    except (OSError, TypeError):
+        raise
 
 
 # Global state storage (for cross-module state)
