@@ -172,6 +172,21 @@ def get_general_backoff_seconds(attempt: int) -> int:
     return constants.get_general_backoff_seconds(attempt)
 
 
+async def read_response_body(response) -> bytes:
+    """
+    Return the full body of an LMArena response.
+
+    The non-streaming path receives either a sync `requests.Response` (direct cloudscraper
+    transport) or an async response object exposing `aread()` (browser fetch / userscript
+    proxy transports). Reading the body with the wrong accessor crashed the request even
+    after a successful upstream response.
+    """
+    if isinstance(response, requests.Response):
+        content = response.content
+        return content if isinstance(content, (bytes, bytearray)) else b""
+    return await response.aread()
+
+
 def safe_print(*args, **kwargs) -> None:
     """
     Print without crashing on Windows console encoding issues (e.g., GBK can't encode emoji).
@@ -2610,6 +2625,9 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
         async def make_request_with_retry(url, payload, http_method, max_retries=3):
             nonlocal current_token, headers, failed_tokens, recaptcha_token
 
+            # Remember the real auth failure so we never mask it with a generic 503.
+            last_auth_error: Optional[HTTPException] = None
+
             for attempt in range(max_retries):
                 try:
                     import cloudscraper as _cs
@@ -2663,16 +2681,66 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                         failed_tokens.add(current_token)
                         debug_print(f"📝 Failed tokens so far: {len(failed_tokens)}")
 
-                        if attempt < max_retries - 1:
+                        # A 401 usually means the session was invalidated server-side, not that the token
+                        # string is permanently dead: LMArena rotates `arena-auth-prod-v1` via Set-Cookie when
+                        # the old session cookie is presented. Try to refresh before rotating/giving up.
+                        # (Mirrors the mid-stream 401 handling; without this, a single 401'd token surfaced
+                        # as a misleading "503: Max retries exceeded".)
+                        last_auth_error = HTTPException(
+                            status_code=HTTPStatus.UNAUTHORIZED,
+                            detail=(
+                                "Unauthorized: LMArena auth token is invalid or expired, "
+                                "and token refresh failed."
+                            ),
+                        )
+
+                        refreshed_token: Optional[str] = None
+                        if current_token.startswith("base64-"):
+                            # Strategy 1: refresh an expired session from the pool (in-memory only).
                             try:
-                                current_token = get_next_auth_token(exclude_tokens=failed_tokens)
-                                headers = get_request_headers_with_token(current_token, recaptcha_token)
-                                debug_print(f"🔄 Retrying with next token: {current_token[:20]}...")
-                                await asyncio.sleep(1)
-                                continue
-                            except HTTPException as e:
-                                debug_print(f"❌ No more tokens available: {e.detail}")
-                                break
+                                refreshed_token = await maybe_refresh_expired_auth_tokens(
+                                    exclude_tokens=failed_tokens
+                                )
+                            except Exception:
+                                refreshed_token = None
+                            # Strategy 2: directly refresh the current token via LMArena HTTP; works even
+                            # when the token has not yet expired locally (server-side session rotation).
+                            if not refreshed_token:
+                                try:
+                                    refreshed_token = await refresh_arena_auth_token_via_lmarena_http(
+                                        current_token
+                                    )
+                                except Exception:
+                                    refreshed_token = None
+                            # Strategy 3: Supabase refresh_token grant as a last resort.
+                            if not refreshed_token:
+                                try:
+                                    refreshed_token = await refresh_arena_auth_token_via_supabase(
+                                        current_token
+                                    )
+                                except Exception:
+                                    refreshed_token = None
+
+                        if refreshed_token:
+                            global EPHEMERAL_ARENA_AUTH_TOKEN
+                            EPHEMERAL_ARENA_AUTH_TOKEN = refreshed_token
+                            current_token = refreshed_token
+                            failed_tokens.discard(current_token)
+                            headers = get_request_headers_with_token(current_token, recaptcha_token)
+                            debug_print("✅ Token refreshed after 401, retrying...")
+                            await asyncio.sleep(1)
+                            continue
+
+                        # Refresh failed: fall back to the next configured token (if any).
+                        try:
+                            current_token = get_next_auth_token(exclude_tokens=failed_tokens)
+                            headers = get_request_headers_with_token(current_token, recaptcha_token)
+                            debug_print(f"🔄 Retrying with next token: {current_token[:20]}...")
+                            await asyncio.sleep(1)
+                            continue
+                        except HTTPException as e:
+                            debug_print(f"❌ No more tokens available: {e.detail}")
+                            break
 
                     response.raise_for_status()
                     return response
@@ -2684,6 +2752,8 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                     if attempt == max_retries - 1:
                         raise
 
+            if last_auth_error is not None:
+                raise last_auth_error
             raise HTTPException(status_code=503, detail="Max retries exceeded")
 
         if stream:
@@ -4390,7 +4460,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
             log_http_status(response.status_code, "LMArena API Response")
             
             # Use aread() to ensure we buffer streaming-capable responses (like BrowserFetchStreamResponse)
-            response_bytes = await response.aread()
+            response_bytes = await read_response_body(response)
             response_text_body = response_bytes.decode("utf-8", errors="replace")
             
             debug_print(f"📏 Response length: {len(response_text_body)} characters")
@@ -4726,6 +4796,21 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                 }
             }
         
+        except HTTPException as e:
+            print(f"\n❌ LMArena REQUEST ERROR")
+            print(f"📛 Error type: {type(e).__name__}")
+            print(f"📛 Error message: {e.detail}")
+            print(f"📤 Request URL: {url}")
+            print("="*80 + "\n")
+            # Return OpenAI-compatible error response (matches the stream path's error chunk shape).
+            return {
+                "error": {
+                    "message": e.detail,
+                    "type": "authentication_error" if e.status_code == HTTPStatus.UNAUTHORIZED else "internal_error",
+                    "code": e.status_code,
+                }
+            }
+
         except Exception as e:
             print(f"\n❌ UNEXPECTED ERROR IN HTTP CLIENT")
             print(f"📛 Error type: {type(e).__name__}")
